@@ -98,12 +98,7 @@ impl Language {
     pub fn is_parseable(self) -> bool {
         matches!(
             self,
-            Self::Rust
-                | Self::TypeScript
-                | Self::Tsx
-                | Self::Python
-                | Self::Kotlin
-                | Self::Prisma
+            Self::Rust | Self::TypeScript | Self::Tsx | Self::Python | Self::Kotlin | Self::Prisma
         )
     }
 

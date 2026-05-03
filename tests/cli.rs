@@ -152,7 +152,10 @@ fn search_finds_match() {
         results.keys().any(|key| key.contains("auth.ts")),
         "expected an auth.ts entry, got {results:?}"
     );
-    assert!(value.get("truncated").is_none(), "truncated hidden when false");
+    assert!(
+        value.get("truncated").is_none(),
+        "truncated hidden when false"
+    );
 }
 
 #[test]
@@ -187,7 +190,10 @@ fn search_with_snippet_appends_matched_line() {
         .and_then(|arr| arr.first())
         .and_then(|s| s.as_str())
         .expect("expected at least one result entry");
-    assert!(entry.contains(" :: "), "snippet separator missing in {entry}");
+    assert!(
+        entry.contains(" :: "),
+        "snippet separator missing in {entry}"
+    );
     assert!(entry.contains("TOKEN_DUP"), "snippet should contain match");
 }
 
@@ -205,6 +211,65 @@ fn search_truncated_flag_set_when_limit_hit() {
 }
 
 #[test]
+fn search_exact_limit_single_file_does_not_report_truncated() {
+    let value = run(&[
+        "search",
+        "MobileButton",
+        "--limit",
+        "1",
+        "packages/mobile/src/components/Button.tsx",
+    ]);
+    let entries: Vec<&str> = value["results"]
+        .as_object()
+        .unwrap()
+        .values()
+        .flat_map(|v| v.as_array().unwrap().iter().map(|s| s.as_str().unwrap()))
+        .collect();
+    assert_eq!(entries, vec!["MobileButton(function) @L1"]);
+    assert!(
+        value.get("truncated").is_none(),
+        "truncated hidden when the scan completes exactly at the limit"
+    );
+}
+
+#[test]
+fn search_limit_preserves_requested_path_order() {
+    let mobile_first = run(&[
+        "search",
+        "Button",
+        "--limit",
+        "1",
+        "packages/mobile/src/components/Button.tsx",
+        "apps/desktop/src/components/Button.tsx",
+    ]);
+    let mobile_entries: Vec<&str> = mobile_first["results"]
+        .as_object()
+        .unwrap()
+        .values()
+        .flat_map(|v| v.as_array().unwrap().iter().map(|s| s.as_str().unwrap()))
+        .collect();
+    assert_eq!(mobile_entries, vec!["MobileButton(function) @L1"]);
+    assert_eq!(mobile_first["truncated"], true);
+
+    let desktop_first = run(&[
+        "search",
+        "Button",
+        "--limit",
+        "1",
+        "apps/desktop/src/components/Button.tsx",
+        "packages/mobile/src/components/Button.tsx",
+    ]);
+    let desktop_entries: Vec<&str> = desktop_first["results"]
+        .as_object()
+        .unwrap()
+        .values()
+        .flat_map(|v| v.as_array().unwrap().iter().map(|s| s.as_str().unwrap()))
+        .collect();
+    assert_eq!(desktop_entries, vec!["DesktopButton(function) @L1"]);
+    assert_eq!(desktop_first["truncated"], true);
+}
+
+#[test]
 fn read_emits_full_file_by_default() {
     let value = run(&["read", "src/auth.ts"]);
     assert_eq!(value["language"], "typescript");
@@ -212,7 +277,10 @@ fn read_emits_full_file_by_default() {
         .as_str()
         .unwrap()
         .contains("class AuthService"));
-    assert!(value.get("lines").is_none(), "lines hidden when not slicing");
+    assert!(
+        value.get("lines").is_none(),
+        "lines hidden when not slicing"
+    );
     assert!(value.get("total_lines").is_none());
 }
 
@@ -296,10 +364,72 @@ fn find_truncates_with_limit() {
 }
 
 #[test]
+fn find_exact_limit_single_file_does_not_report_truncated() {
+    let value = run(&[
+        "find",
+        "MobileButton",
+        "--limit",
+        "1",
+        "packages/mobile/src/components/Button.tsx",
+    ]);
+    let matches = value["matches"].as_array().unwrap();
+    assert_eq!(matches.len(), 1);
+    assert_eq!(
+        matches[0]["path"],
+        "packages/mobile/src/components/Button.tsx"
+    );
+    assert_eq!(matches[0]["qualname"], "MobileButton");
+    assert!(
+        value.get("truncated").is_none(),
+        "truncated hidden when the scan completes exactly at the limit"
+    );
+}
+
+#[test]
+fn find_limit_preserves_requested_path_order() {
+    let mobile_first = run(&[
+        "find",
+        "Button",
+        "--limit",
+        "1",
+        "packages/mobile/src/components/Button.tsx",
+        "apps/desktop/src/components/Button.tsx",
+    ]);
+    let mobile_matches = mobile_first["matches"].as_array().unwrap();
+    assert_eq!(mobile_matches.len(), 1);
+    assert_eq!(
+        mobile_matches[0]["path"],
+        "packages/mobile/src/components/Button.tsx"
+    );
+    assert_eq!(mobile_matches[0]["qualname"], "MobileButton");
+    assert_eq!(mobile_first["truncated"], true);
+
+    let desktop_first = run(&[
+        "find",
+        "Button",
+        "--limit",
+        "1",
+        "apps/desktop/src/components/Button.tsx",
+        "packages/mobile/src/components/Button.tsx",
+    ]);
+    let desktop_matches = desktop_first["matches"].as_array().unwrap();
+    assert_eq!(desktop_matches.len(), 1);
+    assert_eq!(
+        desktop_matches[0]["path"],
+        "apps/desktop/src/components/Button.tsx"
+    );
+    assert_eq!(desktop_matches[0]["qualname"], "DesktopButton");
+    assert_eq!(desktop_first["truncated"], true);
+}
+
+#[test]
 fn find_reports_searched_files_count() {
     let value = run(&["find", "AuthService"]);
     let count = value["searched_files"].as_u64().unwrap();
-    assert!(count >= 1, "searched_files should be at least 1, got {count}");
+    assert!(
+        count >= 1,
+        "searched_files should be at least 1, got {count}"
+    );
 }
 
 #[test]
@@ -381,7 +511,9 @@ fn files_accepts_multiple_globs() {
         .collect();
     assert!(files.iter().any(|f| f.ends_with(".ts")));
     assert!(files.iter().any(|f| f.ends_with(".prisma")));
-    assert!(files.iter().all(|f| f.ends_with(".ts") || f.ends_with(".prisma")));
+    assert!(files
+        .iter()
+        .all(|f| f.ends_with(".ts") || f.ends_with(".prisma")));
 }
 
 #[test]
@@ -407,8 +539,18 @@ fn files_exclude_filters_out_matches() {
 fn search_exclude_filters_files() {
     let with = run(&["search", "Button"]);
     let without = run(&["search", "Button", "--exclude", "apps"]);
-    let with_keys: Vec<&str> = with["results"].as_object().unwrap().keys().map(|k| k.as_str()).collect();
-    let without_keys: Vec<&str> = without["results"].as_object().unwrap().keys().map(|k| k.as_str()).collect();
+    let with_keys: Vec<&str> = with["results"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(|k| k.as_str())
+        .collect();
+    let without_keys: Vec<&str> = without["results"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(|k| k.as_str())
+        .collect();
     assert!(
         with_keys.iter().any(|k| k.contains("apps")),
         "baseline should include an apps/ entry, got {with_keys:?}"
@@ -507,7 +649,6 @@ fn find_terse_with_snippet_appends_signature() {
     assert!(s.contains(" :: "));
     assert!(s.contains("AuthService") || s.contains("class"));
 }
-
 
 #[test]
 fn pretty_flag_indents_output() {

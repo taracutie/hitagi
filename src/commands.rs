@@ -74,11 +74,7 @@ struct LoadedParsed {
     parsed: ParsedFile,
 }
 
-pub fn outline(
-    repo: &RepoRoot,
-    path: &str,
-    opts: OutlineOptions,
-) -> AppResult<OutlineResponse> {
+pub fn outline(repo: &RepoRoot, path: &str, opts: OutlineOptions) -> AppResult<OutlineResponse> {
     let resolved = repo.resolve_file(path)?;
     let loaded = load_parsed(&resolved)?;
 
@@ -124,7 +120,12 @@ pub fn symbol(
 
     let resolved = repo.resolve_file(path)?;
     let loaded = load_parsed(&resolved)?;
-    let detail = symbol_detail(&loaded.parsed, &loaded.content, qualname, MAX_RESPONSE_BYTES)?;
+    let detail = symbol_detail(
+        &loaded.parsed,
+        &loaded.content,
+        qualname,
+        MAX_RESPONSE_BYTES,
+    )?;
 
     Ok(SymbolResponse {
         language: loaded.language.as_str().to_string(),
@@ -142,17 +143,30 @@ pub fn search(repo: &RepoRoot, query: &str, opts: SearchOptions) -> AppResult<Se
     }
 
     let exclude_set = build_exclude_set(&opts.excludes)?;
-    let files = apply_excludes(repo.collect_search_files(&opts.paths)?, exclude_set.as_ref());
-    let mut total = 0usize;
+    let files = apply_excludes(
+        repo.collect_search_files(&opts.paths)?,
+        exclude_set.as_ref(),
+    );
+    search_resolved_files(files, query, opts.limit, opts.snippet)
+}
+
+fn search_resolved_files(
+    files: Vec<ResolvedPath>,
+    query: &str,
+    limit: usize,
+    snippet: bool,
+) -> AppResult<SearchResponse> {
     let mut raw_results: Vec<(String, Vec<String>)> = Vec::new();
+    let mut total = 0usize;
     let mut truncated = false;
 
     for resolved in files {
-        if total >= opts.limit {
+        if total >= limit {
             truncated = true;
             break;
         }
-        let remaining = opts.limit - total;
+        let remaining = limit - total;
+        let file_limit = remaining.saturating_add(1);
 
         let loaded = match load_source(&resolved) {
             Ok(value) => value,
@@ -160,21 +174,26 @@ pub fn search(repo: &RepoRoot, query: &str, opts: SearchOptions) -> AppResult<Se
             Err(error) => return Err(error),
         };
 
-        let matches: Vec<String> = match loaded.language.filter(|l| l.is_parseable()) {
+        let mut matches: Vec<String> = match loaded.language.filter(|l| l.is_parseable()) {
             Some(language) => match parse_source(language, &loaded.content) {
                 Ok(parsed) => search_file(
                     &parsed,
                     &loaded.content,
                     &resolved.relative_path,
                     query,
-                    remaining,
-                    opts.snippet,
+                    file_limit,
+                    snippet,
                 ),
                 Err(AppError::Parse(_)) | Err(AppError::Unsupported(_)) => continue,
                 Err(error) => return Err(error),
             },
-            None => search_file_plain(&loaded.content, query, remaining, opts.snippet),
+            None => search_file_plain(&loaded.content, query, file_limit, snippet),
         };
+
+        if matches.len() > remaining {
+            matches.truncate(remaining);
+            truncated = true;
+        }
 
         if matches.is_empty() {
             continue;
@@ -182,6 +201,9 @@ pub fn search(repo: &RepoRoot, query: &str, opts: SearchOptions) -> AppResult<Se
 
         total += matches.len();
         raw_results.push((resolved.relative_path.clone(), matches));
+        if truncated {
+            break;
+        }
     }
 
     let result_paths: Vec<String> = raw_results.iter().map(|(p, _)| p.clone()).collect();
@@ -200,11 +222,7 @@ pub fn search(repo: &RepoRoot, query: &str, opts: SearchOptions) -> AppResult<Se
     })
 }
 
-pub fn read_file(
-    repo: &RepoRoot,
-    path: &str,
-    opts: ReadOptions,
-) -> AppResult<ReadFileResponse> {
+pub fn read_file(repo: &RepoRoot, path: &str, opts: ReadOptions) -> AppResult<ReadFileResponse> {
     let resolved = repo.resolve_file(path)?;
     let loaded = load_source(&resolved)?;
 
@@ -279,16 +297,34 @@ pub fn find(repo: &RepoRoot, query: &str, opts: FindOptions) -> AppResult<FindRe
     if opts.limit == 0 {
         return Err(AppError::bad_request("--limit must be at least 1"));
     }
-    let needle = query.to_lowercase();
 
     let exclude_set = build_exclude_set(&opts.excludes)?;
-    let files = apply_excludes(repo.collect_search_files(&opts.paths)?, exclude_set.as_ref());
-    let mut matches = Vec::new();
+    let files = apply_excludes(
+        repo.collect_search_files(&opts.paths)?,
+        exclude_set.as_ref(),
+    );
+    find_resolved_files(files, query, opts)
+}
+
+fn find_resolved_files(
+    files: Vec<ResolvedPath>,
+    query: &str,
+    opts: FindOptions,
+) -> AppResult<FindResponse> {
+    let needle = query.to_lowercase();
+    let limit = opts.limit;
+
+    let mut matches: Vec<FindMatch> = Vec::new();
     let mut truncated = false;
     let mut searched_files = 0usize;
     let mut all_kinds: BTreeSet<String> = BTreeSet::new();
 
     'outer: for resolved in files {
+        if matches.len() >= limit {
+            truncated = true;
+            break;
+        }
+
         let loaded = match load_source(&resolved) {
             Ok(value) => value,
             Err(AppError::TooLarge(_)) | Err(AppError::InvalidUtf8(_)) => continue,
@@ -309,7 +345,7 @@ pub fn find(repo: &RepoRoot, query: &str, opts: FindOptions) -> AppResult<FindRe
         searched_files += 1;
 
         for symbol in parsed.symbols {
-            if matches.len() >= opts.limit {
+            if matches.len() >= limit {
                 truncated = true;
                 break 'outer;
             }
@@ -339,7 +375,6 @@ pub fn find(repo: &RepoRoot, query: &str, opts: FindOptions) -> AppResult<FindRe
             }
         }
     }
-
     let available_kinds = if !opts.kinds.is_empty() && matches.is_empty() && !all_kinds.is_empty() {
         Some(all_kinds.into_iter().collect())
     } else {
@@ -409,9 +444,7 @@ pub fn files(repo: &RepoRoot, opts: FilesOptions) -> AppResult<FilesResponse> {
     }
 
     let note = if truncated {
-        Some(
-            "response truncated; pass globs (e.g. \"**/*.rs\") or --limit N to refine".to_string(),
-        )
+        Some("response truncated; pass globs (e.g. \"**/*.rs\") or --limit N to refine".to_string())
     } else {
         None
     };
@@ -464,7 +497,11 @@ pub fn langs(repo: &RepoRoot) -> AppResult<LangsResponse> {
             parseable,
         })
         .collect();
-    summaries.sort_by(|a, b| b.files.cmp(&a.files).then_with(|| a.language.cmp(&b.language)));
+    summaries.sort_by(|a, b| {
+        b.files
+            .cmp(&a.files)
+            .then_with(|| a.language.cmp(&b.language))
+    });
 
     Ok(LangsResponse {
         languages: summaries,
@@ -649,4 +686,105 @@ fn common_prefix(paths: &[String]) -> String {
 
 fn strip_prefix(path: &str, prefix: &str) -> String {
     path.strip_prefix(prefix).unwrap_or(path).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use super::*;
+
+    struct TempRepo {
+        root: PathBuf,
+    }
+
+    impl TempRepo {
+        fn new(name: &str) -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root =
+                std::env::temp_dir().join(format!("hitagi-{name}-{}-{unique}", std::process::id()));
+            fs::create_dir_all(&root).unwrap();
+            Self { root }
+        }
+
+        fn resolved(&self, relative_path: &str) -> ResolvedPath {
+            ResolvedPath {
+                repo_root: self.root.clone(),
+                relative_path: relative_path.to_string(),
+                full_path: self.root.join(relative_path),
+            }
+        }
+    }
+
+    impl Drop for TempRepo {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn search_stops_loading_files_when_global_limit_is_filled() {
+        let repo = TempRepo::new("search-limit");
+        fs::write(repo.root.join("first.txt"), "needle\n").unwrap();
+
+        let response = search_resolved_files(
+            vec![repo.resolved("first.txt"), repo.resolved("missing.txt")],
+            "needle",
+            1,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(response.results.get("first.txt").unwrap(), &vec!["@L1"]);
+        assert_eq!(response.truncated, true);
+    }
+
+    #[test]
+    fn search_reports_truncated_when_single_file_exceeds_limit() {
+        let repo = TempRepo::new("search-file-limit");
+        fs::write(repo.root.join("first.txt"), "needle\nneedle\n").unwrap();
+
+        let response =
+            search_resolved_files(vec![repo.resolved("first.txt")], "needle", 1, false).unwrap();
+
+        assert_eq!(response.results.get("first.txt").unwrap(), &vec!["@L1"]);
+        assert_eq!(response.truncated, true);
+    }
+
+    #[test]
+    fn find_stops_loading_files_when_global_limit_is_filled() {
+        let repo = TempRepo::new("find-limit");
+        fs::write(repo.root.join("first.rs"), "pub struct AuthService {}\n").unwrap();
+
+        let response = find_resolved_files(
+            vec![repo.resolved("first.rs"), repo.resolved("missing.rs")],
+            "Auth",
+            FindOptions {
+                paths: Vec::new(),
+                excludes: Vec::new(),
+                kinds: Vec::new(),
+                limit: 1,
+                bytes: false,
+                snippet: false,
+                terse: false,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(response.truncated, true);
+        assert_eq!(response.searched_files, 1);
+        let FindMatches::Full(matches) = response.matches else {
+            panic!("expected full find matches");
+        };
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].path, "first.rs");
+        assert_eq!(matches[0].qualname, "AuthService");
+    }
 }

@@ -329,7 +329,10 @@ pub fn run() -> AppResult<()> {
             bytes,
         } => {
             let opts = SymbolOptions { bytes };
-            print_json(&commands::symbol(&repo, &path, &qualname, opts)?, cli.pretty)
+            print_json(
+                &commands::symbol(&repo, &path, &qualname, opts)?,
+                cli.pretty,
+            )
         }
         Commands::Search {
             query,

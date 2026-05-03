@@ -1,3 +1,7 @@
+use std::cell::RefCell;
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
+
 use tree_sitter::Node;
 
 use crate::{
@@ -12,19 +16,32 @@ pub struct ParsedFile {
     pub symbols: Vec<SymbolInfo>,
 }
 
+thread_local! {
+    static PARSERS: RefCell<HashMap<Language, tree_sitter::Parser>> =
+        RefCell::new(HashMap::new());
+}
+
 pub fn parse_source(language: Language, source: &str) -> AppResult<ParsedFile> {
-    let tree_sitter_language = language.tree_sitter_language().ok_or_else(|| {
-        AppError::unsupported(format!("no parser for {}", language.as_str()))
+    let tree_sitter_language = language
+        .tree_sitter_language()
+        .ok_or_else(|| AppError::unsupported(format!("no parser for {}", language.as_str())))?;
+
+    let tree = PARSERS.with(|cell| -> AppResult<tree_sitter::Tree> {
+        let mut map = cell.borrow_mut();
+        let parser = match map.entry(language) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(e) => {
+                let mut p = tree_sitter::Parser::new();
+                p.set_language(&tree_sitter_language).map_err(|error| {
+                    AppError::parse(format!("failed to configure parser: {error}"))
+                })?;
+                e.insert(p)
+            }
+        };
+        parser
+            .parse(source, None)
+            .ok_or_else(|| AppError::parse("tree-sitter failed to parse source"))
     })?;
-
-    let mut parser = tree_sitter::Parser::new();
-    parser
-        .set_language(&tree_sitter_language)
-        .map_err(|error| AppError::parse(format!("failed to configure parser: {error}")))?;
-
-    let tree = parser
-        .parse(source, None)
-        .ok_or_else(|| AppError::parse("tree-sitter failed to parse source"))?;
 
     let mut symbols = Vec::new();
     let root = tree.root_node();
@@ -36,10 +53,12 @@ pub fn parse_source(language: Language, source: &str) -> AppResult<ParsedFile> {
         Language::Kotlin => visit_kotlin(root, source, &mut symbols, None, false),
         Language::Prisma => visit_prisma(root, source, &mut symbols, None),
         // Recognized but not parseable ~ already filtered by callers, but be defensive.
-        _ => return Err(AppError::unsupported(format!(
-            "no parser for {}",
-            language.as_str()
-        ))),
+        _ => {
+            return Err(AppError::unsupported(format!(
+                "no parser for {}",
+                language.as_str()
+            )))
+        }
     }
 
     Ok(ParsedFile { language, symbols })
@@ -395,8 +414,7 @@ export interface UserConfig {
 }
 "#;
         let parsed = parse_source(Language::TypeScript, source).unwrap();
-        let qualnames: Vec<&str> =
-            parsed.symbols.iter().map(|s| s.qualname.as_str()).collect();
+        let qualnames: Vec<&str> = parsed.symbols.iter().map(|s| s.qualname.as_str()).collect();
         assert!(qualnames.contains(&"UserConfig"));
         assert!(qualnames.contains(&"UserConfig.name"));
         assert!(qualnames.contains(&"UserConfig.age"));
@@ -422,8 +440,7 @@ pub enum Color {
 }
 "#;
         let parsed = parse_source(Language::Rust, source).unwrap();
-        let qualnames: Vec<&str> =
-            parsed.symbols.iter().map(|s| s.qualname.as_str()).collect();
+        let qualnames: Vec<&str> = parsed.symbols.iter().map(|s| s.qualname.as_str()).collect();
         assert!(qualnames.contains(&"Color"));
         assert!(qualnames.contains(&"Color.Red"));
         assert!(qualnames.contains(&"Color.Green"));

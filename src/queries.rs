@@ -169,7 +169,11 @@ fn format_match(parsed: &ParsedFile, source: &str, start_byte: usize, snippet: b
 
 fn line_at_byte(source: &str, byte_offset: usize) -> usize {
     let cap = byte_offset.min(source.len());
-    source.as_bytes()[..cap].iter().filter(|b| **b == b'\n').count() + 1
+    source.as_bytes()[..cap]
+        .iter()
+        .filter(|b| **b == b'\n')
+        .count()
+        + 1
 }
 
 pub fn snippet_at_byte(source: &str, byte_offset: usize) -> String {
@@ -263,10 +267,7 @@ fn ambiguous_symbol_message(query: &str, candidates: &[&SymbolInfo]) -> String {
         .collect();
     let extra = candidates.len().saturating_sub(shown.len());
     if extra == 0 {
-        format!(
-            "symbol is ambiguous: {query} matched: {}",
-            shown.join(", ")
-        )
+        format!("symbol is ambiguous: {query} matched: {}", shown.join(", "))
     } else {
         format!(
             "symbol is ambiguous: {query} matched: {} (+{extra} more)",
