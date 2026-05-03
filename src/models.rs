@@ -102,6 +102,8 @@ pub enum FindMatches {
 
 #[derive(Debug, Serialize)]
 pub struct FindResponse {
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub prefix: String,
     pub matches: FindMatches,
     #[serde(skip_serializing_if = "is_false")]
     pub truncated: bool,

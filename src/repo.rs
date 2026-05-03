@@ -7,6 +7,9 @@ use ignore::WalkBuilder;
 
 use crate::error::{AppError, AppResult};
 
+const AMBIGUOUS_DISPLAY_CAP: usize = 10;
+const AMBIGUOUS_COLLECT_CAP: usize = 50;
+
 #[derive(Debug, Clone)]
 pub struct ResolvedPath {
     pub repo_root: PathBuf,
@@ -141,6 +144,7 @@ fn resolve_path_by_suffix(
 ) -> AppResult<ResolvedPath> {
     let requested_components = requested_components(relative_path);
     let mut matches = Vec::new();
+    let mut matches_truncated = false;
 
     let walker = WalkBuilder::new(repo_root)
         .hidden(false)
@@ -166,6 +170,10 @@ fn resolve_path_by_suffix(
         };
 
         if path_ends_with_components(&candidate_relative, &requested_components) {
+            if matches.len() == AMBIGUOUS_COLLECT_CAP {
+                matches_truncated = true;
+                break;
+            }
             matches.push(candidate_relative);
         }
     }
@@ -182,6 +190,7 @@ fn resolve_path_by_suffix(
         return Err(AppError::bad_request(ambiguous_path_message(
             relative_path,
             &matches,
+            matches_truncated,
         )));
     }
 
@@ -238,11 +247,25 @@ fn path_ends_with_components(candidate_relative: &str, requested_components: &[S
         .eq(requested_components.iter().map(String::as_str))
 }
 
-fn ambiguous_path_message(relative_path: &str, candidates: &[String]) -> String {
-    let shown: Vec<&str> = candidates.iter().take(10).map(String::as_str).collect();
+fn ambiguous_path_message(
+    relative_path: &str,
+    candidates: &[String],
+    candidates_truncated: bool,
+) -> String {
+    let shown: Vec<&str> = candidates
+        .iter()
+        .take(AMBIGUOUS_DISPLAY_CAP)
+        .map(String::as_str)
+        .collect();
     let remaining = candidates.len().saturating_sub(shown.len());
 
-    if remaining == 0 {
+    if candidates_truncated {
+        format!(
+            "path is ambiguous: {relative_path} matched more than {AMBIGUOUS_COLLECT_CAP} repo paths; showing {} sampled paths: {}",
+            shown.len(),
+            shown.join(", ")
+        )
+    } else if remaining == 0 {
         format!(
             "path is ambiguous: {relative_path} matched multiple repo paths: {}",
             shown.join(", ")
@@ -353,6 +376,58 @@ mod tests {
             error.to_string(),
             "path is ambiguous: src/components/Button.tsx matched multiple repo paths: apps/desktop/src/components/Button.tsx, packages/mobile/src/components/Button.tsx"
         );
+    }
+
+    #[test]
+    fn rejects_ambiguous_suffix_matches_in_ignored_paths() {
+        let root = std::env::temp_dir().join(format!(
+            "hitagi-ignored-ambiguous-paths-{}",
+            std::process::id()
+        ));
+        if root.exists() {
+            std::fs::remove_dir_all(&root).unwrap();
+        }
+        std::fs::create_dir_all(root.join("ignored/src")).unwrap();
+        std::fs::create_dir_all(root.join("visible/src")).unwrap();
+        std::fs::write(root.join(".gitignore"), "ignored/\n").unwrap();
+        std::fs::write(root.join("ignored/src/config.txt"), "").unwrap();
+        std::fs::write(root.join("visible/src/config.txt"), "").unwrap();
+
+        let registry = RepoRoot::new(std::fs::canonicalize(&root).unwrap());
+        let error = registry.resolve_file("src/config.txt").unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("path is ambiguous: src/config.txt"));
+        assert!(message.contains("ignored/src/config.txt"));
+        assert!(message.contains("visible/src/config.txt"));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reports_truncated_ambiguous_suffix_matches_as_sampled() {
+        let root =
+            std::env::temp_dir().join(format!("hitagi-ambiguous-paths-{}", std::process::id()));
+        if root.exists() {
+            std::fs::remove_dir_all(&root).unwrap();
+        }
+        std::fs::create_dir_all(&root).unwrap();
+
+        for index in 0..=super::AMBIGUOUS_COLLECT_CAP {
+            let path = root.join(format!("pkg-{index:03}")).join("index.ts");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "").unwrap();
+        }
+
+        let registry = RepoRoot::new(std::fs::canonicalize(&root).unwrap());
+        let error = registry.resolve_file("index.ts").unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("matched more than 50 repo paths"));
+        assert!(message.contains("showing 10 sampled paths"));
+        assert!(!message.contains("(+41 more)"));
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

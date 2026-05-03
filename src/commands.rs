@@ -390,6 +390,14 @@ fn find_resolved_files(
         None
     };
 
+    let path_list: Vec<String> = matches.iter().map(|m| m.path.clone()).collect();
+    let prefix = common_prefix(&path_list);
+    if !prefix.is_empty() {
+        for m in &mut matches {
+            m.path = strip_prefix(&m.path, &prefix);
+        }
+    }
+
     let matches = if opts.terse {
         FindMatches::Terse(matches.into_iter().map(format_terse_match).collect())
     } else {
@@ -397,6 +405,7 @@ fn find_resolved_files(
     };
 
     Ok(FindResponse {
+        prefix,
         matches,
         truncated,
         searched_files,
@@ -470,6 +479,10 @@ pub fn langs(repo: &RepoRoot) -> AppResult<LangsResponse> {
             continue;
         }
 
+        if first_chunk_has_nul(Path::new(&resolved.full_path)) {
+            continue;
+        }
+
         let (label, parseable) = match Language::detect(Path::new(&resolved.full_path)) {
             Ok(lang) => (lang.as_str().to_string(), lang.is_parseable()),
             Err(_) => ("plaintext".to_string(), false),
@@ -527,6 +540,19 @@ fn to_output_symbol_detail(s: SymbolDetail, include_bytes: bool) -> OutputSymbol
         lines: [s.range.start_line, s.range.end_line],
         bytes: include_bytes.then_some([s.range.start_byte, s.range.end_byte]),
     }
+}
+
+fn first_chunk_has_nul(path: &Path) -> bool {
+    use std::io::Read;
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut buf = Vec::with_capacity(8192);
+    if file.take(8192).read_to_end(&mut buf).is_err() {
+        return false;
+    }
+    buf.contains(&0)
 }
 
 fn load_source(resolved: &ResolvedPath) -> AppResult<LoadedSource> {
@@ -666,20 +692,21 @@ fn common_prefix(paths: &[String]) -> String {
         return String::new();
     }
 
-    let first = &paths[0];
-    let mut end = first.len();
+    let mut prefix = paths[0].as_str();
 
     for path in &paths[1..] {
-        end = first[..end]
-            .char_indices()
-            .take_while(|&(i, c)| path.as_bytes().get(i) == Some(&(c as u8)))
-            .last()
-            .map(|(i, c)| i + c.len_utf8())
-            .unwrap_or(0);
+        let mut end = 0;
+        for ((i, left), (_, right)) in prefix.char_indices().zip(path.char_indices()) {
+            if left != right {
+                break;
+            }
+            end = i + left.len_utf8();
+        }
+        prefix = &prefix[..end];
     }
 
-    match first[..end].rfind('/') {
-        Some(i) => first[..=i].to_string(),
+    match prefix.rfind('/') {
+        Some(i) => prefix[..=i].to_string(),
         None => String::new(),
     }
 }
@@ -786,5 +813,36 @@ mod tests {
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].path, "first.rs");
         assert_eq!(matches[0].qualname, "AuthService");
+    }
+
+    #[test]
+    fn find_prefix_handles_unicode_path_components() {
+        let repo = TempRepo::new("find-unicode-prefix");
+        fs::create_dir_all(repo.root.join("a/仩")).unwrap();
+        fs::create_dir_all(repo.root.join("a/重")).unwrap();
+        fs::write(repo.root.join("a/仩/one.rs"), "pub struct OneThing {}\n").unwrap();
+        fs::write(repo.root.join("a/重/two.rs"), "pub struct TwoThing {}\n").unwrap();
+
+        let response = find_resolved_files(
+            vec![repo.resolved("a/仩/one.rs"), repo.resolved("a/重/two.rs")],
+            "Thing",
+            FindOptions {
+                paths: Vec::new(),
+                excludes: Vec::new(),
+                kinds: Vec::new(),
+                limit: 10,
+                bytes: false,
+                snippet: false,
+                terse: false,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(response.prefix, "a/");
+        let FindMatches::Full(matches) = response.matches else {
+            panic!("expected full find matches");
+        };
+        let paths: Vec<&str> = matches.iter().map(|m| m.path.as_str()).collect();
+        assert_eq!(paths, vec!["仩/one.rs", "重/two.rs"]);
     }
 }

@@ -374,10 +374,8 @@ fn find_exact_limit_single_file_does_not_report_truncated() {
     ]);
     let matches = value["matches"].as_array().unwrap();
     assert_eq!(matches.len(), 1);
-    assert_eq!(
-        matches[0]["path"],
-        "packages/mobile/src/components/Button.tsx"
-    );
+    assert_eq!(value["prefix"], "packages/mobile/src/components/");
+    assert_eq!(matches[0]["path"], "Button.tsx");
     assert_eq!(matches[0]["qualname"], "MobileButton");
     assert!(
         value.get("truncated").is_none(),
@@ -397,10 +395,8 @@ fn find_limit_preserves_requested_path_order() {
     ]);
     let mobile_matches = mobile_first["matches"].as_array().unwrap();
     assert_eq!(mobile_matches.len(), 1);
-    assert_eq!(
-        mobile_matches[0]["path"],
-        "packages/mobile/src/components/Button.tsx"
-    );
+    assert_eq!(mobile_first["prefix"], "packages/mobile/src/components/");
+    assert_eq!(mobile_matches[0]["path"], "Button.tsx");
     assert_eq!(mobile_matches[0]["qualname"], "MobileButton");
     assert_eq!(mobile_first["truncated"], true);
 
@@ -414,10 +410,8 @@ fn find_limit_preserves_requested_path_order() {
     ]);
     let desktop_matches = desktop_first["matches"].as_array().unwrap();
     assert_eq!(desktop_matches.len(), 1);
-    assert_eq!(
-        desktop_matches[0]["path"],
-        "apps/desktop/src/components/Button.tsx"
-    );
+    assert_eq!(desktop_first["prefix"], "apps/desktop/src/components/");
+    assert_eq!(desktop_matches[0]["path"], "Button.tsx");
     assert_eq!(desktop_matches[0]["qualname"], "DesktopButton");
     assert_eq!(desktop_first["truncated"], true);
 }
@@ -447,8 +441,10 @@ fn find_with_paths_scopes_walk() {
     let value = run(&["find", "AuthService", "src"]);
     let matches = value["matches"].as_array().unwrap();
     assert!(!matches.is_empty());
+    let prefix = value["prefix"].as_str().unwrap_or("");
     for m in matches {
-        assert!(m["path"].as_str().unwrap().starts_with("src/"));
+        let full = format!("{prefix}{}", m["path"].as_str().unwrap());
+        assert!(full.starts_with("src/"));
     }
 }
 
