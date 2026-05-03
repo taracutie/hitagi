@@ -230,6 +230,58 @@ fn enclosing_symbol<'a>(parsed: &'a ParsedFile, byte_offset: usize) -> Option<&'
         .min_by_key(|symbol| symbol.range.end_byte - symbol.range.start_byte)
 }
 
+/// Symbols whose line range intersects `[lo, hi]` (1-indexed, inclusive on both ends).
+///
+/// Used by `hitagi diff` to attach the enclosing symbol to each hunk. The
+/// `primary` is the innermost symbol that fully contains the target range; if
+/// no symbol contains it (e.g. a hunk straddles two top-level functions),
+/// fall back to the smallest range that merely overlaps. `overlapping` is the
+/// full intersection set, sorted by `start_line` for stable output.
+pub struct SymbolSpan<'a> {
+    pub primary: Option<&'a SymbolInfo>,
+    pub overlapping: Vec<&'a SymbolInfo>,
+}
+
+pub fn symbols_for_line_range<'a>(
+    symbols: &'a [SymbolInfo],
+    lo: usize,
+    hi: usize,
+) -> SymbolSpan<'a> {
+    let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
+    let mut overlapping: Vec<&SymbolInfo> = symbols
+        .iter()
+        .filter(|s| s.range.start_line <= hi && s.range.end_line >= lo)
+        .collect();
+
+    // Prefer the smallest symbol that fully contains [lo, hi]; fall back to
+    // the smallest one that merely overlaps (e.g. a hunk on the seam between
+    // two functions).
+    let primary = overlapping
+        .iter()
+        .filter(|s| s.range.start_line <= lo && s.range.end_line >= hi)
+        .min_by_key(|s| s.range.end_line - s.range.start_line)
+        .copied()
+        .or_else(|| {
+            overlapping
+                .iter()
+                .min_by_key(|s| s.range.end_line - s.range.start_line)
+                .copied()
+        });
+
+    overlapping.sort_by(|a, b| {
+        a.range
+            .start_line
+            .cmp(&b.range.start_line)
+            .then_with(|| a.range.end_line.cmp(&b.range.end_line))
+            .then_with(|| a.qualname.cmp(&b.qualname))
+    });
+
+    SymbolSpan {
+        primary,
+        overlapping,
+    }
+}
+
 fn content_for_range(source: &str, range: &RangeInfo, max_bytes: usize) -> AppResult<String> {
     if range.end_byte > source.len() || range.start_byte > range.end_byte {
         return Err(AppError::internal("invalid byte range"));
@@ -291,9 +343,28 @@ fn suggest_symbols(parsed: &ParsedFile, query: &str, max: usize) -> Vec<String> 
 mod tests {
     use std::path::PathBuf;
 
-    use crate::{lang::Language, parser::parse_source};
+    use crate::{
+        lang::Language,
+        models::{RangeInfo, SymbolInfo},
+        parser::parse_source,
+    };
 
-    use super::{resolve_symbol, search_file, symbol_detail};
+    use super::{resolve_symbol, search_file, symbol_detail, symbols_for_line_range};
+
+    fn sym(qualname: &str, start: usize, end: usize) -> SymbolInfo {
+        SymbolInfo {
+            kind: "function".to_string(),
+            name: qualname.split('.').last().unwrap_or(qualname).to_string(),
+            qualname: qualname.to_string(),
+            range: RangeInfo {
+                start_byte: 0,
+                end_byte: 0,
+                start_line: start,
+                end_line: end,
+            },
+            parent: None,
+        }
+    }
 
     fn sample_source() -> String {
         std::fs::read_to_string(
@@ -372,5 +443,48 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert!(results[0].contains(" :: "));
         assert!(results[0].contains("TOKEN_DUP"));
+    }
+
+    #[test]
+    fn symbols_for_line_range_picks_innermost() {
+        let symbols = vec![
+            sym("Outer", 1, 100),
+            sym("Outer.Inner", 10, 50),
+            sym("Outer.Inner.Leaf", 20, 30),
+            sym("Sibling", 60, 90),
+        ];
+        let span = symbols_for_line_range(&symbols, 22, 25);
+        let primary = span.primary.expect("expected an enclosing symbol");
+        assert_eq!(primary.qualname, "Outer.Inner.Leaf");
+        let names: Vec<&str> = span.overlapping.iter().map(|s| s.qualname.as_str()).collect();
+        assert_eq!(names, vec!["Outer", "Outer.Inner", "Outer.Inner.Leaf"]);
+    }
+
+    #[test]
+    fn symbols_for_line_range_collects_overlapping_when_multi_symbol_hunk() {
+        let symbols = vec![sym("Foo", 1, 10), sym("Bar", 11, 20)];
+        let span = symbols_for_line_range(&symbols, 8, 14);
+        // Neither fully contains [8, 14], so primary falls back to the
+        // smaller-range overlapping match (both have width 9, take first
+        // by tie-break ~ start_line).
+        let primary = span.primary.expect("primary should fall back to overlap");
+        assert_eq!(primary.qualname, "Foo");
+        let names: Vec<&str> = span.overlapping.iter().map(|s| s.qualname.as_str()).collect();
+        assert_eq!(names, vec!["Foo", "Bar"]);
+    }
+
+    #[test]
+    fn symbols_for_line_range_no_overlap_returns_empty() {
+        let symbols = vec![sym("Foo", 1, 10), sym("Bar", 50, 60)];
+        let span = symbols_for_line_range(&symbols, 20, 30);
+        assert!(span.primary.is_none());
+        assert!(span.overlapping.is_empty());
+    }
+
+    #[test]
+    fn symbols_for_line_range_handles_single_line_anchor() {
+        let symbols = vec![sym("Outer", 1, 100), sym("Outer.Inner", 10, 20)];
+        let span = symbols_for_line_range(&symbols, 15, 15);
+        assert_eq!(span.primary.unwrap().qualname, "Outer.Inner");
     }
 }

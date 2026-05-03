@@ -155,6 +155,117 @@ pub struct LangSummary {
     pub parseable: bool,
 }
 
+// ~~ Diff (uncommitted-change review) ~~
+
+#[derive(Debug, Serialize)]
+pub struct DiffOverviewResponse {
+    /// Common path prefix stripped from `files[].path` (matches find/search).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub prefix: String,
+    pub files: Vec<DiffFileSummary>,
+    /// Comparing against this ref. Omitted when default `HEAD`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub against: Option<String>,
+    /// "staged" or "unstaged" when `--staged`/`--unstaged` was passed.
+    /// Omitted (empty) for the default combined view.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub scope: String,
+    /// True when no diff entries and no untracked files were found ~ lets the
+    /// consumer short-circuit a pre-commit review.
+    #[serde(skip_serializing_if = "is_false")]
+    pub clean: bool,
+    /// Hint emitted when the hitagi repo root is a subdir of a larger git
+    /// toplevel and changes outside it were silently filtered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DiffFileSummary {
+    pub path: String,
+    /// One of: "M", "A", "D", "R", "C", "T", "?" (untracked).
+    pub status: String,
+    /// Pre-rename path when `status == "R"` or `status == "C"` AND both
+    /// endpoints fall inside the hitagi repo subtree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_path: Option<String>,
+    /// Lines added (numstat). Omitted for binary files (numstat returns `-`),
+    /// untracked files, and cross-subtree-rename synthesized entries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub added: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub removed: Option<usize>,
+    /// Set in the default combined scope when this file has staged content.
+    #[serde(skip_serializing_if = "is_false")]
+    pub staged: bool,
+    /// Set in the default combined scope when this file has unstaged content.
+    #[serde(skip_serializing_if = "is_false")]
+    pub unstaged: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    pub binary: bool,
+    /// Per-file context. Currently used to flag cross-subtree renames that
+    /// were synthesized into A/D from this subtree's perspective ~ the note
+    /// names the toplevel-relative path of the other endpoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DiffFileResponse {
+    pub path: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_path: Option<String>,
+    /// Aggregate counts for the file (mirrors numstat).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub added: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub removed: Option<usize>,
+    /// Language label for the file's working-tree side (or HEAD-side for
+    /// deletions). Useful for the consumer to know whether `symbol`/`spans`
+    /// will be populated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// Set when `--raw` was passed: the unified diff text verbatim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw: Option<String>,
+    /// Set when `--raw` was NOT passed: structured per-hunk data.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hunks: Option<Vec<DiffHunk>>,
+    /// Hint emitted when the diff was suppressed (size cap, submodule, etc.).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    #[serde(skip_serializing_if = "is_false")]
+    pub binary: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DiffHunk {
+    /// Old-side line range [start, end_inclusive].
+    pub old_lines: [usize; 2],
+    /// New-side line range [start, end_inclusive]. For pure deletions this is
+    /// a 1-line anchor at the deletion point.
+    pub new_lines: [usize; 2],
+    pub added: usize,
+    pub removed: usize,
+    /// Innermost enclosing symbol's qualname. Only set for parseable files
+    /// where the symbol parser found an overlap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
+    /// Innermost enclosing symbol's kind. Same emission rules as `symbol`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Other overlapping symbols (qualnames). Empty/absent in the typical
+    /// single-symbol case.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub spans: Vec<String>,
+    /// Hunk body (line-prefixed `+`/`-`/space). Suppressed only via the
+    /// per-file size-cap fallback; in that case `note` on the file response
+    /// explains.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct CacheStatusResponse {
     pub enabled: bool,

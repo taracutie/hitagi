@@ -5,7 +5,8 @@ use serde::Serialize;
 
 use crate::{
     commands::{
-        self, FilesOptions, FindOptions, OutlineOptions, ReadOptions, SearchOptions, SymbolOptions,
+        self, DiffFileOptions, DiffOptions, DiffScope, FilesOptions, FindOptions, OutlineOptions,
+        ReadOptions, SearchOptions, SymbolOptions,
     },
     error::{AppError, AppResult},
     repo::RepoRoot,
@@ -35,6 +36,7 @@ RECOMMENDED WORKFLOW
   5. symbol <FILE> <Q>     read one symbol's body in isolation
   6. search <STR>          substring search with scope + match-line annotation
   7. read <FILE>           dump a file (use --lines to slice big files)
+  8. diff [FILE]           review uncommitted changes (overview, then drill)
 
 SUPPORTED LANGUAGES
   PARSEABLE (full outline / symbol / find): Rust (.rs), TypeScript (.ts), TSX \
@@ -126,6 +128,34 @@ TIPS
     drop the current repo's cache, `hitagi cache clear --all` to nuke all of
     them.
 
+  Uncommitted changes (`diff`)
+    `diff` (no PATH) prints a per-file overview ~ status code (M/A/D/R/C/?),
+    ±line counts, staged/unstaged flags. Untracked files appear as `?` with no
+    counts (drilldown not supported; use `read` for content). `diff <PATH>`
+    prints structured hunks with the enclosing symbol annotated; pass --raw for
+    the unified diff text instead. `--symbol Q` filters hunks to those
+    overlapping one symbol (uses the same qualname/leaf semantics as `symbol`).
+    `--staged` / `--unstaged` narrow the scope; default combines both. Use
+    `--against REF` to compare against something other than HEAD (e.g. main).
+    Deleted files get their HEAD-side blob parsed in-memory so `symbol`
+    annotations still appear. The structured-hunks response degrades to ranges
+    + symbols (no `body`) when one file's diff exceeds the size cap; a top-
+    level `note` explains. Subprocess overhead is small (a few `git diff`
+    invocations).
+
+  Monorepo / repo-subdir scoping
+    `diff` only ever surfaces changes inside the hitagi `--repo` subtree. When
+    `--repo` is itself a subdir of a larger git toplevel (e.g. monorepo with
+    sibling projects), changes outside that subtree are silently filtered, and
+    a top-level `note` reports the count. Cross-subtree renames are surfaced
+    symmetrically: the destination subtree sees the file as `A` (added) with a
+    per-file `note` naming the toplevel-relative origin; the source subtree
+    sees a synthesized `D` (deleted) entry with a `note` naming the
+    toplevel-relative destination. Both halves are drillable. PATH resolution
+    in drilldown matches against the diff's own file list (not a filesystem
+    walk), so suffix shorthand works (`hitagi diff Button.tsx`) and deleted
+    files resolve fine.
+
 COMMON PATTERNS
 
   What languages are here?        hitagi langs
@@ -142,6 +172,11 @@ COMMON PATTERNS
   Find inside one subtree         hitagi find Network --kind struct src/nnue
   Cheap top-level orientation     hitagi outline FILE --depth 1
   Cheap sweep across the repo     hitagi find X --terse --limit 200
+  What's uncommitted?             hitagi diff
+  Hunks for one file?             hitagi diff src/foo.rs
+  Diff for one symbol?            hitagi diff src/foo.rs --symbol Foo.bar
+  Just staged changes             hitagi diff --staged
+  Compare against main            hitagi diff --against main
 
 ANTI-PATTERNS (token waste)
 
@@ -171,6 +206,16 @@ OUTPUT SHAPES (compact form ~ omitted optional fields appear only when set)
   files     {\"files\":[\"a\",\"b\",...],\"truncated\":bool,\"note\":\"...\"?}
   langs     {\"languages\":[{\"language\":\"rust\",\"files\":N,\"lines\":N,
             \"parseable\":bool},...]}
+  diff      overview: {\"prefix\":\"...\"?,\"files\":[{\"path\":\"...\",
+            \"status\":\"M|A|D|R|C|?\",\"old_path\":\"...\"?,\"added\":N?,
+            \"removed\":N?,\"staged\":bool?,\"unstaged\":bool?,\"binary\":
+            bool?,\"note\":\"...\"?},...],\"against\":\"...\"?,
+            \"scope\":\"staged|unstaged\"?,\"clean\":bool?,\"note\":\"...\"?}
+            drilldown: {\"path\":\"...\",\"status\":\"...\",\"old_path\":\"...\"?,
+            \"added\":N?,\"removed\":N?,\"language\":\"...\"?,\"hunks\":
+            [{\"old_lines\":[s,e],\"new_lines\":[s,e],\"added\":N,\"removed\":N,
+            \"symbol\":\"...\"?,\"kind\":\"...\"?,\"spans\":[\"...\"]?,\"body\":
+            \"...\"?}],\"raw\":\"...\"?,\"binary\":bool?,\"note\":\"...\"?}
 
   find --terse override:
     matches becomes a flat list of strings like
@@ -322,6 +367,40 @@ enum Commands {
         #[command(subcommand)]
         action: Option<CacheAction>,
     },
+    /// Show uncommitted changes (working tree vs HEAD by default).
+    ///
+    /// With no PATH, prints a one-entry-per-file overview (status, ±line counts,
+    /// staged/unstaged flags, untracked files). With PATH, prints structured
+    /// hunks annotated by enclosing symbol; pass --raw for the unified diff text
+    /// instead. Untracked files appear in the overview but cannot be drilled
+    /// into ~ use `read` for their content.
+    Diff {
+        /// Optional file path. Repo-relative; suffix resolution operates against
+        /// the diff's own file list (so `Button.tsx` resolves like `outline`,
+        /// and deleted files resolve too). Omit to print the overview.
+        path: Option<String>,
+        /// Narrow drilldown to hunks overlapping one symbol (qualname or unique
+        /// leaf). Requires PATH. Mutually exclusive with --raw.
+        #[arg(long, value_name = "QUALNAME", conflicts_with = "raw")]
+        symbol: Option<String>,
+        /// Drilldown only: emit raw unified diff text instead of structured
+        /// hunks. Requires PATH.
+        #[arg(long)]
+        raw: bool,
+        /// Show only staged changes (index vs the base ref).
+        #[arg(long, conflicts_with = "unstaged")]
+        staged: bool,
+        /// Show only unstaged changes (working tree vs index).
+        #[arg(long)]
+        unstaged: bool,
+        /// Compare against this ref instead of HEAD (e.g. `--against main`).
+        #[arg(long, value_name = "REF", default_value = "HEAD")]
+        against: String,
+        /// Glob patterns to exclude files in the overview (repeatable). Bare
+        /// names like `vendor` exclude that directory at any depth.
+        #[arg(long, value_name = "PATTERN")]
+        exclude: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -433,6 +512,35 @@ pub fn run() -> AppResult<()> {
                 print_json(&commands::cache_clear(&repo, all)?, cli.pretty)
             }
         },
+        Commands::Diff {
+            path,
+            symbol,
+            raw,
+            staged,
+            unstaged,
+            against,
+            exclude,
+        } => {
+            let scope = if staged {
+                DiffScope::Staged
+            } else if unstaged {
+                DiffScope::Unstaged
+            } else {
+                DiffScope::All
+            };
+            let opts = DiffOptions {
+                scope,
+                against,
+                excludes: exclude,
+            };
+            match path {
+                None => print_json(&commands::diff_overview(&repo, opts)?, cli.pretty),
+                Some(p) => {
+                    let drill = DiffFileOptions { symbol, raw };
+                    print_json(&commands::diff_file(&repo, &p, opts, drill)?, cli.pretty)
+                }
+            }
+        }
     }
 }
 

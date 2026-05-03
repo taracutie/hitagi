@@ -2,6 +2,7 @@ mod cache;
 mod cli;
 mod commands;
 mod error;
+mod git;
 mod lang;
 mod models;
 mod parser;

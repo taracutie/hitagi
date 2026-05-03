@@ -22,6 +22,7 @@ Commands:
 - `find <QUERY> [PATHS...]` ~ locate symbols across the repo by qualname substring (case-insensitive).
 - `files [GLOBS...]` ~ list files in the repo (gitignore-aware), optionally filtered by globs.
 - `langs` ~ summarise languages present in the repo (file count + line count per language).
+- `diff [PATH]` ~ review uncommitted changes; overview by default, structured hunks with enclosing-symbol annotation when a path is given.
 - `cache [status|path|clear]` ~ inspect or manage the on-disk parse cache.
 
 Supported languages:
@@ -228,6 +229,75 @@ hitagi langs --pretty
 ```
 
 One-shot orientation: walks the repo and tallies file count + line count per detected language. Sorted by file count descending. The `parseable` flag tells you which entries support `outline`/`symbol`/`find` (Rust, TypeScript, TSX, Python, Kotlin, Prisma) ~ the rest are recognised by extension but only respond to `search` and `read`.
+
+### `diff [PATH]`
+
+Review uncommitted changes (working tree vs `HEAD` by default). Shells out to `git` ~ requires a git repo. With no `PATH`, prints a one-entry-per-file overview; with a `PATH`, prints structured hunks annotated by enclosing symbol.
+
+```bash
+hitagi diff --pretty
+```
+
+```json
+{
+  "files": [
+    { "path": "src/cli.rs",     "status": "M", "added": 12, "removed": 3, "unstaged": true },
+    { "path": "src/git.rs",     "status": "A", "added": 140, "removed": 0, "staged": true, "unstaged": true },
+    { "path": "docs/old.md",    "status": "D", "added": 0, "removed": 33, "unstaged": true },
+    { "path": "src/renamed.rs", "status": "R", "old_path": "src/orig.rs", "added": 3, "removed": 3, "unstaged": true },
+    { "path": "notes.txt",      "status": "?" }
+  ]
+}
+```
+
+Status codes: `M` modified, `A` added, `D` deleted, `R` renamed, `C` copied, `?` untracked. Untracked files have no `added`/`removed` (drilldown isn't supported for them ~ use `read` for content).
+
+```bash
+hitagi diff src/cli.rs --pretty
+```
+
+```json
+{
+  "path": "src/cli.rs",
+  "status": "M",
+  "added": 12,
+  "removed": 0,
+  "language": "rust",
+  "hunks": [
+    {
+      "old_lines": [320, 320],
+      "new_lines": [321, 332],
+      "added": 12,
+      "removed": 0,
+      "symbol": "Commands",
+      "kind": "enum",
+      "body": "+    /// Show uncommitted changes.\n+    Diff { ... }\n"
+    }
+  ]
+}
+```
+
+Each hunk's `symbol` / `kind` is the innermost parsed symbol that contains the hunk (Rust/TS/TSX/Python/Kotlin/Prisma only). Multi-symbol hunks include a `spans: [...]` field listing every overlapping qualname. Pure deletions still get annotated ~ the HEAD-side blob is fetched via `git show` and parsed in-memory (no cache write).
+
+Flags:
+
+- `--symbol QUALNAME` ~ narrow drilldown to hunks overlapping one symbol. Same qualname/leaf semantics as the top-level `symbol` command (suggests near-misses on misspellings).
+- `--raw` ~ emit the unified diff text instead of structured hunks. Mutually exclusive with `--symbol`.
+- `--staged` ~ index vs base ref only.
+- `--unstaged` ~ working tree vs index only.
+- `--against REF` ~ compare against `REF` instead of `HEAD`. Validated; rejects leading `-`, `..`, NUL, and whitespace before any subprocess fires.
+- `--exclude PATTERN` (repeatable) ~ skip files in the overview. Same syntax as other commands.
+
+Path resolution in drilldown matches against the diff's own file list (not a filesystem walk), so suffix shorthand works the same as `outline`/`symbol`:
+
+```bash
+hitagi diff Button.tsx           # resolves like outline does, but only against changed files
+hitagi diff deleted_file.rs      # works fine ~ deleted files are still in the diff list
+```
+
+Monorepo / repo-subdir scoping: `diff` only ever surfaces changes inside the hitagi `--repo` subtree. When `--repo` is a subdir of a larger git toplevel, sibling-project changes are silently filtered and a top-level `note` reports the count. **Cross-subtree renames are surfaced symmetrically:** the destination subtree sees the file as `A` with a per-file `note` naming the toplevel-relative origin; the source subtree sees a synthesized `D` with a `note` naming the toplevel-relative destination. Both halves are drillable.
+
+Token efficiency: a typical pre-commit review (overview ≈ 0.5 KB + one or two file drilldowns ≈ 2-6 KB each) lands well under raw `git diff HEAD` for the same change set ~ which is the main reason this command exists.
 
 ### `cache [status|path|clear]`
 

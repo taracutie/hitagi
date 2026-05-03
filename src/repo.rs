@@ -49,6 +49,21 @@ impl RepoRoot {
         resolve_path(&self.root, relative_path, PathKind::FileOnly)
     }
 
+    /// Validate `relative_path` for traversal/escape and return a normalized
+    /// repo-relative form. Unlike `resolve_file`, this does NOT require the
+    /// file to exist on disk ~ used by `hitagi diff` so deleted files (and
+    /// rename old paths) can still be addressed.
+    pub fn validate_diff_path(&self, relative_path: &str) -> AppResult<String> {
+        validate_requested_path(relative_path)?;
+        let normalized = normalize_repo_relative(relative_path);
+        if normalized.is_empty() {
+            return Err(AppError::bad_request(format!(
+                "path must point inside the repo: {relative_path}"
+            )));
+        }
+        Ok(normalized)
+    }
+
     fn resolve_search_path(&self, relative_path: &str) -> AppResult<ResolvedPath> {
         resolve_path(&self.root, relative_path, PathKind::FileOrDir)
     }
@@ -237,6 +252,28 @@ fn requested_components(relative_path: &str) -> Vec<String> {
             _ => None,
         })
         .collect()
+}
+
+pub(crate) fn normalize_repo_relative(relative_path: &str) -> String {
+    Path::new(relative_path)
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => Some(value.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+pub(crate) fn path_components_match_suffix(
+    candidate_relative: &str,
+    requested_components: &[String],
+) -> bool {
+    path_ends_with_components(candidate_relative, requested_components)
+}
+
+pub(crate) fn parse_requested_components(relative_path: &str) -> Vec<String> {
+    requested_components(relative_path)
 }
 
 fn path_ends_with_components(candidate_relative: &str, requested_components: &[String]) -> bool {
