@@ -1,0 +1,439 @@
+use std::path::PathBuf;
+
+use clap::{Parser, Subcommand};
+use serde::Serialize;
+
+use crate::{
+    commands::{
+        self, FilesOptions, FindOptions, OutlineOptions, ReadOptions, SearchOptions, SymbolOptions,
+    },
+    error::{AppError, AppResult},
+    repo::RepoRoot,
+};
+
+const DEFAULT_SEARCH_LIMIT: usize = 50;
+const DEFAULT_FIND_LIMIT: usize = 50;
+const DEFAULT_FILES_LIMIT: usize = 2000;
+
+const LONG_ABOUT: &str = "\
+hitagi is a local CLI for tree-sitter-backed structural code queries, built for LLM \
+coding agents (Claude Code, Codex, etc.) to navigate a codebase token-efficiently. \
+Every command parses on demand, prints compact JSON to stdout, and exits ~ no daemon, \
+no network, no auth.
+
+PRINCIPLE
+  Minimize tokens spent reading code. Use outline / find / search to locate the right \
+slice first, then read only that slice. Prefer  find -> outline -> symbol  over a raw \
+read. Reach for `read` only when you need surrounding context that scope-aware tools \
+can't give.
+
+RECOMMENDED WORKFLOW
+  1. langs                 one-shot summary of which languages live here
+  2. files [GLOBS...]      discover what's in the repo (gitignore-aware, sorted)
+  3. find <NAME>           locate a symbol by qualname substring across the repo
+  4. outline <FILE>        see the structure of one file (compact, lines only)
+  5. symbol <FILE> <Q>     read one symbol's body in isolation
+  6. search <STR>          substring search with scope + match-line annotation
+  7. read <FILE>           dump a file (use --lines to slice big files)
+
+SUPPORTED LANGUAGES
+  PARSEABLE (full outline / symbol / find): Rust (.rs), TypeScript (.ts), TSX \
+(.tsx), Python (.py), Kotlin (.kt/.kts), Prisma (.prisma).
+  RECOGNISED (named in `langs`, `search`-able as plaintext, but no symbol info): \
+JSON, YAML, TOML, Markdown, SQL, HTML, CSS, shell, Dockerfile.
+  Truly unknown extensions get bucketed as `plaintext` ~ still searchable, just \
+unlabelled.\
+";
+
+const AFTER_LONG_HELP: &str = "\
+TIPS
+
+  Token-efficient defaults
+    Compact JSON to stdout. Use --pretty only when a human is reading. Outline omits
+    start_byte/end_byte and parent (derivable from qualname); pass --bytes only when
+    you actually need byte offsets.
+
+  Path resolution
+    File path is repo-relative (e.g. src/auth.ts) OR a unique repo-internal suffix
+    (e.g. src-tauri/src/main.rs auto-resolves to apps/desktop/src-tauri/src/main.rs).
+    Ambiguous suffixes error out with the candidates listed.
+
+  Symbol qualnames
+    `symbol` accepts the full dotted form (AuthService.handleAuth) or just a unique
+    leaf (handleAuth). Misses include near-miss qualnames in the error so you can
+    retry without another roundtrip.
+
+  Search syntax
+    Combine alternatives with \" OR \" (literal, space-padded): \"foo OR bar\" is two
+    terms, \"fooORbar\" is one literal. Each result reads
+      `scope(kind) @L<line>`   for matches inside a parsed symbol
+      `@L<line>`               for matches outside any scope (imports, comments,
+                               plaintext files)
+    Pass extra positional [PATHS] to scope the walk to subtrees.
+
+  Snippets
+    `--snippet` on `search` appends ` :: <matched line>` to each entry.
+    `--snippet` on `find` adds the symbol's first-line signature.
+    Both save a follow-up `read` when you only needed inline context.
+
+  Limits and truncation
+    Default --limit is 50 for search/find, 500 for files. When the cap is reached
+    the response carries `\"truncated\": true`. Bump --limit when sweeping; reduce
+    it for noisy queries.
+
+  Excluding noise (--exclude)
+    `search`, `find`, and `files` accept --exclude PATTERN (repeatable). Bare names
+    like `--exclude vendor` skip that directory at any depth; full globs like
+    `--exclude \"vendor/**\"` work too. Typical: --exclude vendor --exclude target
+    --exclude node_modules. Cuts grammar-source / build-artifact noise from sweeps.
+
+  --kind filter
+    Case-insensitive (function, Function, FUNCTION all match). When --kind matches
+    nothing, the response includes `available_kinds: [...]` so you know what was
+    actually present ~ no need for a second probe call.
+
+  outline --depth N
+    Limits nesting depth: --depth 1 keeps top-level shapes only; --depth 2 also
+    keeps one level of nesting (e.g. methods inside a class, variants inside an
+    enum). Depth is counted from dots in the qualname. Use it on big files where
+    you only need orientation.
+
+  find --terse
+    Compact output mode. `matches` becomes a list of strings like
+    `path:line qualname(kind)` instead of structured objects ~ ~3x smaller for
+    sweep queries. With --snippet the line continues with ` :: <signature>`.
+
+  langs and parseable
+    `langs` summarises file count + line count per detected language and includes
+    `parseable: bool`. Languages with `parseable: true` (Rust/TS/TSX/Python/Kotlin/
+    Prisma) work with outline/symbol/find. Recognised non-parseable ones (json,
+    markdown, sql, css, shell, dockerfile, ...) only show up in `langs`/`search`/
+    `read`.
+
+  When `find` returns nothing
+    `find` only matches qualnames in PARSEABLE files (.md/.txt/.toml etc. are
+    skipped). For raw substring search across all file types, use `search`. The
+    `searched_files` field tells you how many files actually got parsed; if it's 0
+    the response includes a `note` explaining why.
+
+COMMON PATTERNS
+
+  What languages are here?        hitagi langs
+  Where is symbol X?              hitagi find X --snippet
+  What's in this file?            hitagi outline FILE
+  Just top-level shapes?          hitagi outline FILE --kind function,struct,enum
+  Read this function/struct       hitagi symbol FILE Qualname.Or.Leaf
+  Where's this string used?       hitagi search \"X\" --snippet
+  Where's it used (specific dir)? hitagi search \"X\" src/auth
+  Sweep without vendor noise      hitagi search \"X\" --exclude vendor --exclude target
+  Read a slice of a big file      hitagi read FILE --lines 1400-1510
+  List all Rust + TOML files      hitagi files \"**/*.rs\" \"**/*.toml\"
+  Find Auth-related classes       hitagi find Auth --kind class,struct --snippet
+  Find inside one subtree         hitagi find Network --kind struct src/nnue
+  Cheap top-level orientation     hitagi outline FILE --depth 1
+  Cheap sweep across the repo     hitagi find X --terse --limit 200
+
+ANTI-PATTERNS (token waste)
+
+  hitagi read big_file.rs                  # ~5K-line files cost a lot of tokens.
+                                           # Use `outline` then `symbol`, or
+                                           # `read --lines S-E` for slices.
+  hitagi search \"the\"                      # tighten queries; pass [PATHS] to scope.
+  hitagi outline huge_file.rs              # add --kind to filter, or just `find`
+                                           # the specific symbol you wanted.
+  hitagi outline FILE --bytes              # don't pass --bytes unless you actually
+                                           # need byte offsets ~ they ~double the
+                                           # output size.
+
+OUTPUT SHAPES (compact form ~ omitted optional fields appear only when set)
+
+  outline   {\"language\":\"rust\",\"symbols\":[{\"kind\":\"...\",\"name\":\"...\",
+            \"qualname\":\"...\",\"lines\":[s,e]}],\"available_kinds\":[...]?}
+  symbol    {\"language\":\"rust\",\"symbol\":{\"kind\":\"...\",\"name\":\"...\",
+            \"qualname\":\"...\",\"content\":\"...\",\"lines\":[s,e]}}
+  search    {\"prefix\":\"src/\",\"results\":{\"file.rs\":[\"scope(kind) @L<n>\"]},
+            \"truncated\":bool}
+  read      {\"language\":\"rust\",\"content\":\"...\",\"lines\":[s,e],
+            \"total_lines\":N}    (lines/total_lines only when --lines is passed)
+  find      {\"matches\":[{\"path\":\"...\",\"kind\":\"...\",\"name\":\"...\",
+            \"qualname\":\"...\",\"lines\":[s,e]}],\"truncated\":bool,
+            \"searched_files\":N,\"available_kinds\":[...]?,\"note\":\"...\"?}
+  files     {\"files\":[\"a\",\"b\",...],\"truncated\":bool,\"note\":\"...\"?}
+  langs     {\"languages\":[{\"language\":\"rust\",\"files\":N,\"lines\":N,
+            \"parseable\":bool},...]}
+
+  find --terse override:
+    matches becomes a flat list of strings like
+    `\"src/foo.rs:42 Foo.bar(method) :: pub fn bar(...) {\"`
+
+ERRORS
+  Errors print to stderr as `error: <msg>` and exit 1. Path-not-found, ambiguous
+  suffix, symbol-not-found (with suggestions), --limit < 1, invalid --lines range,
+  invalid glob, file too large (>1 MiB), and binary/UTF-8 issues all surface this
+  way.\
+";
+
+#[derive(Parser)]
+#[command(
+    name = "hitagi",
+    version,
+    about = "Local CLI for tree-sitter-backed structural code queries.",
+    long_about = LONG_ABOUT,
+    after_long_help = AFTER_LONG_HELP,
+)]
+struct Cli {
+    /// Repo root to query. Defaults to the current working directory.
+    #[arg(long, global = true, value_name = "PATH")]
+    repo: Option<PathBuf>,
+
+    /// Pretty-print JSON output (indented). Default is compact.
+    #[arg(long, global = true)]
+    pretty: bool,
+
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// List symbols in a file.
+    Outline {
+        /// File path relative to the repo root (or a unique repo-internal suffix).
+        path: String,
+        /// Include byte ranges (`bytes: [start, end]`) on each symbol.
+        #[arg(long)]
+        bytes: bool,
+        /// Filter to symbols of these kinds. Comma-separated, e.g. `--kind function,struct`.
+        #[arg(long, value_delimiter = ',', value_name = "KIND")]
+        kind: Vec<String>,
+        /// Limit nesting depth: 1 = top-level only, 2 = top + 1 nested, etc. Counted by
+        /// dots in the qualname (`Foo.bar` has depth 2).
+        #[arg(long, value_name = "N")]
+        depth: Option<usize>,
+    },
+    /// Show a single symbol's source by qualified name.
+    ///
+    /// QUALNAME accepts the full dotted form (e.g. `AuthService.handleAuth`) or just the
+    /// leaf name (e.g. `handleAuth`) when it resolves uniquely within the file.
+    Symbol {
+        /// File path relative to the repo root (or a unique repo-internal suffix).
+        path: String,
+        /// Qualified symbol name, or a unique leaf name within the file.
+        qualname: String,
+        /// Include byte ranges (`bytes: [start, end]`) on the symbol.
+        #[arg(long)]
+        bytes: bool,
+    },
+    /// Substring search across the repo, grouped by enclosing scope.
+    ///
+    /// QUERY is a literal substring. Combine alternatives with ` OR ` (literal,
+    /// surrounded by spaces), e.g. `"foo OR bar"`. Each result is annotated with the
+    /// enclosing symbol scope (when known) and the actual match line, e.g.
+    /// `parse_source(function) @L23` ~ unscoped matches show only `@L23`.
+    Search {
+        /// Substring query. Use ` OR ` (space-padded) to combine alternatives.
+        query: String,
+        /// Optional path prefixes to scope the search.
+        paths: Vec<String>,
+        /// Maximum total matches to return. Response includes `truncated: true` when hit.
+        #[arg(long, default_value_t = DEFAULT_SEARCH_LIMIT)]
+        limit: usize,
+        /// Append the matched line as a snippet (` :: <line>`) for inline context.
+        #[arg(long)]
+        snippet: bool,
+        /// Glob patterns to exclude (repeatable). Bare names like `vendor` exclude that
+        /// directory at any depth; use `vendor/**` for explicit globbing.
+        #[arg(long, value_name = "PATTERN")]
+        exclude: Vec<String>,
+    },
+    /// Read a file's contents.
+    Read {
+        /// File path relative to the repo root (or a unique repo-internal suffix).
+        path: String,
+        /// Slice to a 1-indexed inclusive line range, e.g. `--lines 100-200`.
+        #[arg(long, value_name = "S-E")]
+        lines: Option<String>,
+    },
+    /// Find symbols across the repo whose qualname contains QUERY (case-insensitive).
+    ///
+    /// Only matches qualnames within parseable files; `.md`/`.txt`/etc. are skipped.
+    /// For raw substring search across all file types, use `search`.
+    Find {
+        /// Substring matched against symbol qualnames (case-insensitive).
+        query: String,
+        /// Optional path prefixes to scope the find.
+        paths: Vec<String>,
+        /// Filter to symbols of these kinds (case-insensitive). Comma-separated.
+        #[arg(long, value_delimiter = ',', value_name = "KIND")]
+        kind: Vec<String>,
+        /// Maximum total matches to return. Response includes `truncated: true` when hit.
+        #[arg(long, default_value_t = DEFAULT_FIND_LIMIT)]
+        limit: usize,
+        /// Include byte ranges (`bytes: [start, end]`) on each match.
+        #[arg(long)]
+        bytes: bool,
+        /// Include the symbol's first-line signature as a `snippet` field on each match.
+        #[arg(long)]
+        snippet: bool,
+        /// Compact output mode: `matches` becomes a list of `"path:line qualname(kind)"`
+        /// strings instead of structured objects. ~3x smaller for sweep queries.
+        #[arg(long)]
+        terse: bool,
+        /// Glob patterns to exclude (repeatable). Bare names like `vendor` exclude that
+        /// directory at any depth; use `vendor/**` for explicit globbing.
+        #[arg(long, value_name = "PATTERN")]
+        exclude: Vec<String>,
+    },
+    /// List files in the repo (gitignore-aware), optionally filtered by globs.
+    ///
+    /// Multiple positional GLOBS are OR'd together: `hitagi files "**/*.rs" "**/*.toml"`.
+    Files {
+        /// Glob patterns. Multiple are OR'd. If omitted, lists everything.
+        globs: Vec<String>,
+        /// Glob patterns to exclude (repeatable). Bare names like `vendor` exclude that
+        /// directory at any depth; use `vendor/**` for explicit globbing.
+        #[arg(long, value_name = "PATTERN")]
+        exclude: Vec<String>,
+        /// Maximum number of files to return.
+        #[arg(long, default_value_t = DEFAULT_FILES_LIMIT)]
+        limit: usize,
+    },
+    /// Summarize languages present in the repo (file count + line count per language).
+    ///
+    /// Useful for "is this a Rust project? what other languages?" orientation in one call.
+    Langs,
+}
+
+pub fn run() -> AppResult<()> {
+    let cli = Cli::parse();
+    let repo_root = resolve_repo_root(cli.repo)?;
+    let repo = RepoRoot::new(repo_root);
+
+    match cli.command {
+        Commands::Outline {
+            path,
+            bytes,
+            kind,
+            depth,
+        } => {
+            let opts = OutlineOptions {
+                bytes,
+                kinds: kind,
+                depth,
+            };
+            print_json(&commands::outline(&repo, &path, opts)?, cli.pretty)
+        }
+        Commands::Symbol {
+            path,
+            qualname,
+            bytes,
+        } => {
+            let opts = SymbolOptions { bytes };
+            print_json(&commands::symbol(&repo, &path, &qualname, opts)?, cli.pretty)
+        }
+        Commands::Search {
+            query,
+            paths,
+            limit,
+            snippet,
+            exclude,
+        } => {
+            let opts = SearchOptions {
+                paths,
+                excludes: exclude,
+                limit,
+                snippet,
+            };
+            print_json(&commands::search(&repo, &query, opts)?, cli.pretty)
+        }
+        Commands::Read { path, lines } => {
+            let opts = ReadOptions {
+                lines: lines.as_deref().map(parse_lines).transpose()?,
+            };
+            print_json(&commands::read_file(&repo, &path, opts)?, cli.pretty)
+        }
+        Commands::Find {
+            query,
+            paths,
+            kind,
+            limit,
+            bytes,
+            snippet,
+            terse,
+            exclude,
+        } => {
+            let opts = FindOptions {
+                paths,
+                excludes: exclude,
+                kinds: kind,
+                limit,
+                bytes,
+                snippet,
+                terse,
+            };
+            print_json(&commands::find(&repo, &query, opts)?, cli.pretty)
+        }
+        Commands::Files {
+            globs,
+            exclude,
+            limit,
+        } => {
+            let opts = FilesOptions {
+                globs,
+                excludes: exclude,
+                limit,
+            };
+            print_json(&commands::files(&repo, opts)?, cli.pretty)
+        }
+        Commands::Langs => print_json(&commands::langs(&repo)?, cli.pretty),
+    }
+}
+
+fn resolve_repo_root(flag: Option<PathBuf>) -> AppResult<PathBuf> {
+    let candidate = match flag {
+        Some(path) => path,
+        None => std::env::current_dir().map_err(|error| {
+            AppError::bad_request(format!("failed to read current directory: {error}"))
+        })?,
+    };
+
+    let canonical = std::fs::canonicalize(&candidate).map_err(|error| {
+        AppError::bad_request(format!(
+            "failed to open repo root {}: {error}",
+            candidate.display()
+        ))
+    })?;
+
+    if !canonical.is_dir() {
+        return Err(AppError::bad_request(format!(
+            "repo root is not a directory: {}",
+            canonical.display()
+        )));
+    }
+
+    Ok(canonical)
+}
+
+fn parse_lines(spec: &str) -> AppResult<(usize, usize)> {
+    let (start, end) = spec.split_once('-').ok_or_else(|| {
+        AppError::bad_request(format!("--lines must be in S-E format, got: {spec}"))
+    })?;
+    let start = start.trim().parse::<usize>().map_err(|_| {
+        AppError::bad_request(format!("--lines start is not a positive integer: {start}"))
+    })?;
+    let end = end.trim().parse::<usize>().map_err(|_| {
+        AppError::bad_request(format!("--lines end is not a positive integer: {end}"))
+    })?;
+    Ok((start, end))
+}
+
+fn print_json<T: Serialize>(value: &T, pretty: bool) -> AppResult<()> {
+    let serialized = if pretty {
+        serde_json::to_string_pretty(value)
+    } else {
+        serde_json::to_string(value)
+    }
+    .map_err(|error| AppError::internal(format!("failed to serialize response: {error}")))?;
+    println!("{serialized}");
+    Ok(())
+}

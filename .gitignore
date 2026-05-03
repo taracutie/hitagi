@@ -1,0 +1,8 @@
+target
+node_modules/
+
+# Generated tree-sitter outputs (regenerate with: tree-sitter generate --abi 14 grammar.js)
+vendor/*/src/
+vendor/node_modules/
+vendor/package.json
+vendor/package-lock.json
