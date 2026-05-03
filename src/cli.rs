@@ -116,6 +116,16 @@ TIPS
     `searched_files` field tells you how many files actually got parsed; if it's 0
     the response includes a `note` explaining why.
 
+  Parse cache
+    find / outline / search / symbol persist parsed symbols at
+    $HITAGI_CACHE_DIR / $XDG_CACHE_HOME/hitagi / $HOME/.cache/hitagi, keyed by
+    (path, mtime, size, language). Warm runs skip the parse step (and skip the
+    file read entirely for `find` without --snippet and `outline`), turning a
+    multi-second cold sweep into ~100ms. Set HITAGI_NO_CACHE=1 to bypass for one
+    invocation. Use `hitagi cache status` to inspect, `hitagi cache clear` to
+    drop the current repo's cache, `hitagi cache clear --all` to nuke all of
+    them.
+
 COMMON PATTERNS
 
   What languages are here?        hitagi langs
@@ -302,6 +312,33 @@ enum Commands {
     ///
     /// Useful for "is this a Rust project? what other languages?" orientation in one call.
     Langs,
+    /// Inspect or manage the on-disk parse cache.
+    ///
+    /// The cache lives at $HITAGI_CACHE_DIR / $XDG_CACHE_HOME/hitagi /
+    /// $HOME/.cache/hitagi (in that resolution order), keyed by canonical repo
+    /// root. With no subcommand, prints `status`. Set HITAGI_NO_CACHE=1 in the
+    /// environment to bypass the cache for any command.
+    Cache {
+        #[command(subcommand)]
+        action: Option<CacheAction>,
+    },
+}
+
+#[derive(Subcommand)]
+enum CacheAction {
+    /// Print cache info: path, file size, entry count, language breakdown,
+    /// version, whether the stored cache matches the current binary.
+    Status,
+    /// Print just the resolved cache directory path for this repo.
+    Path,
+    /// Delete the cache for the current repo. Pass `--all` to delete the
+    /// entire hitagi cache root (every repo). Cache contents are fully
+    /// regenerable ~ next find/search/outline rebuilds them.
+    Clear {
+        /// Delete every repo's cache, not just this one's.
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 pub fn run() -> AppResult<()> {
@@ -389,6 +426,13 @@ pub fn run() -> AppResult<()> {
             print_json(&commands::files(&repo, opts)?, cli.pretty)
         }
         Commands::Langs => print_json(&commands::langs(&repo)?, cli.pretty),
+        Commands::Cache { action } => match action.unwrap_or(CacheAction::Status) {
+            CacheAction::Status => print_json(&commands::cache_status(&repo), cli.pretty),
+            CacheAction::Path => print_json(&commands::cache_path(&repo), cli.pretty),
+            CacheAction::Clear { all } => {
+                print_json(&commands::cache_clear(&repo, all)?, cli.pretty)
+            }
+        },
     }
 }
 

@@ -41,6 +41,10 @@ impl RepoRoot {
         Self { root }
     }
 
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     pub fn resolve_file(&self, relative_path: &str) -> AppResult<ResolvedPath> {
         resolve_path(&self.root, relative_path, PathKind::FileOnly)
     }

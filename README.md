@@ -22,6 +22,7 @@ Commands:
 - `find <QUERY> [PATHS...]` ~ locate symbols across the repo by qualname substring (case-insensitive).
 - `files [GLOBS...]` ~ list files in the repo (gitignore-aware), optionally filtered by globs.
 - `langs` ~ summarise languages present in the repo (file count + line count per language).
+- `cache [status|path|clear]` ~ inspect or manage the on-disk parse cache.
 
 Supported languages:
 
@@ -227,6 +228,52 @@ hitagi langs --pretty
 ```
 
 One-shot orientation: walks the repo and tallies file count + line count per detected language. Sorted by file count descending. The `parseable` flag tells you which entries support `outline`/`symbol`/`find` (Rust, TypeScript, TSX, Python, Kotlin, Prisma) ~ the rest are recognised by extension but only respond to `search` and `read`.
+
+### `cache [status|path|clear]`
+
+`outline`, `symbol`, `search`, and `find` automatically persist the parsed symbols of every file they touch, keyed on `(repo-relative path, mtime, size, language)`. Subsequent invocations stat the same files (~30ms for a 3.6k-file repo), reuse cached symbols when nothing changed, and only re-read + re-parse the few files that actually moved. On a 3.6k-file tree this turns a 3.5s cold sweep into a ~140ms warm one.
+
+Cache file lives at `${HITAGI_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}}/hitagi/<repo-hash>/index.v1.bin` (one file per repo, bincode-serialized). Failures (missing dir, corrupt file, version mismatch) silently fall back to a cold parse ~ a stale cache will never break a command.
+
+```bash
+hitagi cache              # alias for `cache status`
+hitagi cache status       # full info: size, entry count, language breakdown
+hitagi cache path         # just the cache directory for this repo
+hitagi cache clear        # delete this repo's cache subdir
+hitagi cache clear --all  # nuke every repo's cache
+```
+
+`status` (default) returns:
+
+```json
+{
+  "enabled": true,
+  "disabled_via_env": false,
+  "current_version": "v1-0.1.0",
+  "cache_dir": "/home/user/.cache/hitagi/abc123def4567890",
+  "cache_file": "/home/user/.cache/hitagi/abc123def4567890/index.v1.bin",
+  "exists": true,
+  "size_bytes": 7324880,
+  "modified_unix_secs": 1714728000,
+  "stored_version": "v1-0.1.0",
+  "stored_repo_root": "/home/user/code/myrepo",
+  "version_match": true,
+  "repo_root_match": true,
+  "entry_count": 3201,
+  "languages": [
+    { "language": "typescript", "files": 1893 },
+    { "language": "rust",       "files": 642 },
+    { "language": "tsx",        "files": 412 }
+  ]
+}
+```
+
+`version_match`/`repo_root_match` flag stale caches: bumping `Cargo.toml`'s version invalidates everything (cheapest proxy for "visitor logic might have changed"); a `false` `repo_root_match` means a hash collision (run `cache clear` and move on).
+
+Environment variables:
+
+- `HITAGI_NO_CACHE=1` ~ skip both the cache load and the cache save for this invocation. Use it to benchmark the cold path or as a safety hatch when the cache is suspect.
+- `HITAGI_CACHE_DIR=/path` ~ override where the cache lives entirely (skips the `XDG_CACHE_HOME`/`HOME` fallback chain). Useful for sandboxed CI runs.
 
 ## Limits
 

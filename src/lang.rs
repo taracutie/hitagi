@@ -1,8 +1,10 @@
 use std::path::Path;
 
+use serde::{Deserialize, Serialize};
+
 use crate::error::AppError;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Language {
     // Parseable (have tree-sitter grammars)
     Rust,

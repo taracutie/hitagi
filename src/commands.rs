@@ -1,15 +1,18 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::Metadata;
 use std::path::Path;
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
 
 use crate::{
+    cache::ParseCache,
     error::{AppError, AppResult},
     lang::Language,
     models::{
-        FilesResponse, FindMatch, FindMatches, FindResponse, LangSummary, LangsResponse,
-        OutlineResponse, OutputSymbol, OutputSymbolDetail, ReadFileResponse, SearchResponse,
-        SymbolDetail, SymbolInfo, SymbolResponse,
+        CacheClearResponse, CacheLangCount, CachePathResponse, CacheStatusResponse, FilesResponse,
+        FindMatch, FindMatches, FindResponse, LangSummary, LangsResponse, OutlineResponse,
+        OutputSymbol, OutputSymbolDetail, ReadFileResponse, SearchResponse, SymbolDetail,
+        SymbolInfo, SymbolResponse,
     },
     parser::{parse_source, ParsedFile},
     queries::{search_file, search_file_plain, snippet_for_symbol_signature, symbol_detail},
@@ -68,26 +71,21 @@ struct LoadedSource {
     content: String,
 }
 
-struct LoadedParsed {
-    language: Language,
-    content: String,
-    parsed: ParsedFile,
-}
-
 pub fn outline(repo: &RepoRoot, path: &str, opts: OutlineOptions) -> AppResult<OutlineResponse> {
     let resolved = repo.resolve_file(path)?;
-    let loaded = load_parsed(&resolved)?;
+    let mut cache = ParseCache::open(repo.root());
 
-    let all_kinds: BTreeSet<String> = loaded
-        .parsed
-        .symbols
-        .iter()
-        .map(|s| s.kind.clone())
-        .collect();
+    let stat = stat_file(&resolved)?;
+    let language = stat.language.filter(|l| l.is_parseable()).ok_or_else(|| {
+        AppError::unsupported(format!("no parser for {}", resolved.relative_path))
+    })?;
 
-    let symbols: Vec<OutputSymbol> = loaded
-        .parsed
-        .symbols
+    let symbols = cached_or_parsed(&mut cache, &resolved, &stat.metadata, language, None)?;
+    cache.save(false);
+
+    let all_kinds: BTreeSet<String> = symbols.iter().map(|s| s.kind.clone()).collect();
+
+    let symbols: Vec<OutputSymbol> = symbols
         .into_iter()
         .filter(|s| within_depth(&s.qualname, opts.depth))
         .filter(|s| matches_kinds(&opts.kinds, &s.kind))
@@ -101,7 +99,7 @@ pub fn outline(repo: &RepoRoot, path: &str, opts: OutlineOptions) -> AppResult<O
     };
 
     Ok(OutlineResponse {
-        language: loaded.language.as_str().to_string(),
+        language: language.as_str().to_string(),
         symbols,
         available_kinds,
     })
@@ -119,16 +117,27 @@ pub fn symbol(
     }
 
     let resolved = repo.resolve_file(path)?;
-    let loaded = load_parsed(&resolved)?;
-    let detail = symbol_detail(
-        &loaded.parsed,
-        &loaded.content,
-        qualname,
-        MAX_RESPONSE_BYTES,
+    let mut cache = ParseCache::open(repo.root());
+
+    let stat = stat_file(&resolved)?;
+    let language = stat.language.filter(|l| l.is_parseable()).ok_or_else(|| {
+        AppError::unsupported(format!("no parser for {}", resolved.relative_path))
+    })?;
+    let content = read_after_stat(&resolved)?;
+    let symbols = cached_or_parsed(
+        &mut cache,
+        &resolved,
+        &stat.metadata,
+        language,
+        Some(&content),
     )?;
+    cache.save(false);
+
+    let parsed = ParsedFile { language, symbols };
+    let detail = symbol_detail(&parsed, &content, qualname, MAX_RESPONSE_BYTES)?;
 
     Ok(SymbolResponse {
-        language: loaded.language.as_str().to_string(),
+        language: language.as_str().to_string(),
         symbol: to_output_symbol_detail(detail, opts.bytes),
     })
 }
@@ -142,12 +151,18 @@ pub fn search(repo: &RepoRoot, query: &str, opts: SearchOptions) -> AppResult<Se
         return Err(AppError::bad_request("--limit must be at least 1"));
     }
 
+    let mut cache = ParseCache::open(repo.root());
+    let prune = opts.paths.is_empty() && opts.excludes.is_empty();
+
     let exclude_set = build_exclude_set(&opts.excludes)?;
     let files = apply_excludes(
         repo.collect_search_files(&opts.paths)?,
         exclude_set.as_ref(),
     );
-    search_resolved_files(files, query, opts.limit, opts.snippet)
+    let result = search_resolved_files(files, query, opts.limit, opts.snippet, &mut cache);
+    let should_prune = prune && matches!(result.as_ref(), Ok(response) if !response.truncated);
+    cache.save(should_prune);
+    result
 }
 
 fn search_resolved_files(
@@ -155,6 +170,7 @@ fn search_resolved_files(
     query: &str,
     limit: usize,
     snippet: bool,
+    cache: &mut ParseCache,
 ) -> AppResult<SearchResponse> {
     let mut raw_results: Vec<(String, Vec<String>)> = Vec::new();
     let mut total = 0usize;
@@ -168,26 +184,44 @@ fn search_resolved_files(
         let remaining = limit - total;
         let file_limit = remaining.saturating_add(1);
 
-        let loaded = match load_source(&resolved) {
+        // search always needs content (substring grep on source). Stat first so
+        // we can use the metadata for the cache key, then read.
+        let stat = match stat_file(&resolved) {
             Ok(value) => value,
             Err(AppError::TooLarge(_)) | Err(AppError::InvalidUtf8(_)) => continue,
             Err(error) => return Err(error),
         };
 
-        let mut matches: Vec<String> = match loaded.language.filter(|l| l.is_parseable()) {
-            Some(language) => match parse_source(language, &loaded.content) {
-                Ok(parsed) => search_file(
+        let content = match read_after_stat(&resolved) {
+            Ok(value) => value,
+            Err(AppError::TooLarge(_)) | Err(AppError::InvalidUtf8(_)) => continue,
+            Err(error) => return Err(error),
+        };
+
+        let mut matches: Vec<String> = match stat.language.filter(|l| l.is_parseable()) {
+            Some(language) => {
+                let symbols = match cached_or_parsed(
+                    cache,
+                    &resolved,
+                    &stat.metadata,
+                    language,
+                    Some(&content),
+                ) {
+                    Ok(s) => s,
+                    Err(AppError::Parse(_)) | Err(AppError::Unsupported(_)) => continue,
+                    Err(error) => return Err(error),
+                };
+                let parsed = ParsedFile { language, symbols };
+                search_file(
                     &parsed,
-                    &loaded.content,
+                    &content,
                     &resolved.relative_path,
                     query,
                     file_limit,
                     snippet,
-                ),
-                Err(AppError::Parse(_)) | Err(AppError::Unsupported(_)) => continue,
-                Err(error) => return Err(error),
-            },
-            None => search_file_plain(&loaded.content, query, file_limit, snippet),
+                )
+            }
+            None => search_file_plain(&content, query, file_limit, snippet),
         };
 
         if matches.len() > remaining {
@@ -298,21 +332,31 @@ pub fn find(repo: &RepoRoot, query: &str, opts: FindOptions) -> AppResult<FindRe
         return Err(AppError::bad_request("--limit must be at least 1"));
     }
 
+    let mut cache = ParseCache::open(repo.root());
+    let prune = opts.paths.is_empty() && opts.excludes.is_empty();
+
     let exclude_set = build_exclude_set(&opts.excludes)?;
     let files = apply_excludes(
         repo.collect_search_files(&opts.paths)?,
         exclude_set.as_ref(),
     );
-    find_resolved_files(files, query, opts)
+    let result = find_resolved_files(files, query, opts, &mut cache);
+    let should_prune = prune && matches!(result.as_ref(), Ok(response) if !response.truncated);
+    cache.save(should_prune);
+    result
 }
 
 fn find_resolved_files(
     files: Vec<ResolvedPath>,
     query: &str,
     opts: FindOptions,
+    cache: &mut ParseCache,
 ) -> AppResult<FindResponse> {
     let needle = query.to_lowercase();
     let limit = opts.limit;
+    // Cache hits + no snippet = skip the read entirely. With --snippet we still
+    // need source bytes to extract the signature line.
+    let needs_content_for_output = opts.snippet;
 
     let mut matches: Vec<FindMatch> = Vec::new();
     let mut truncated = false;
@@ -325,26 +369,56 @@ fn find_resolved_files(
             break;
         }
 
-        let loaded = match load_source(&resolved) {
+        let stat = match stat_file(&resolved) {
             Ok(value) => value,
             Err(AppError::TooLarge(_)) | Err(AppError::InvalidUtf8(_)) => continue,
             Err(error) => return Err(error),
         };
 
-        let language = match loaded.language.filter(|l| l.is_parseable()) {
+        let language = match stat.language.filter(|l| l.is_parseable()) {
             Some(l) => l,
             None => continue,
         };
 
-        let parsed = match parse_source(language, &loaded.content) {
-            Ok(p) => p,
-            Err(AppError::Parse(_)) | Err(AppError::Unsupported(_)) => continue,
-            Err(error) => return Err(error),
+        // Try the cache first. On hit + no snippet, skip read+parse entirely.
+        // On hit + snippet, skip parse but still read for the snippet bytes.
+        // On miss, fall through to read+parse and populate cache.
+        let (symbols, content) = if let Some(symbols) =
+            cache.lookup(&resolved.relative_path, &stat.metadata, language)
+        {
+            let content = if needs_content_for_output {
+                match read_after_stat(&resolved) {
+                    Ok(c) => Some(c),
+                    Err(AppError::TooLarge(_)) | Err(AppError::InvalidUtf8(_)) => continue,
+                    Err(error) => return Err(error),
+                }
+            } else {
+                None
+            };
+            (symbols, content)
+        } else {
+            let content = match read_after_stat(&resolved) {
+                Ok(c) => c,
+                Err(AppError::TooLarge(_)) | Err(AppError::InvalidUtf8(_)) => continue,
+                Err(error) => return Err(error),
+            };
+            let parsed = match parse_source(language, &content) {
+                Ok(p) => p,
+                Err(AppError::Parse(_)) | Err(AppError::Unsupported(_)) => continue,
+                Err(error) => return Err(error),
+            };
+            cache.insert(
+                resolved.relative_path.clone(),
+                &stat.metadata,
+                language,
+                parsed.symbols.clone(),
+            );
+            (parsed.symbols, Some(content))
         };
 
         searched_files += 1;
 
-        for symbol in parsed.symbols {
+        for symbol in symbols {
             if matches.len() >= limit {
                 truncated = true;
                 break 'outer;
@@ -356,7 +430,7 @@ fn find_resolved_files(
                 }
                 let snippet = opts.snippet.then(|| {
                     snippet_for_symbol_signature(
-                        &loaded.content,
+                        content.as_deref().unwrap_or(""),
                         symbol.range.start_byte,
                         symbol.range.end_byte,
                     )
@@ -521,6 +595,68 @@ pub fn langs(repo: &RepoRoot) -> AppResult<LangsResponse> {
     })
 }
 
+pub fn cache_status(repo: &RepoRoot) -> CacheStatusResponse {
+    let inspection = ParseCache::inspect(repo.root());
+    let mut languages: Vec<CacheLangCount> = inspection
+        .languages
+        .into_iter()
+        .map(|(language, files)| CacheLangCount { language, files })
+        .collect();
+    // Most populous languages first; alphabetical on ties.
+    languages.sort_by(|a, b| {
+        b.files
+            .cmp(&a.files)
+            .then_with(|| a.language.cmp(&b.language))
+    });
+
+    CacheStatusResponse {
+        enabled: inspection.enabled,
+        disabled_via_env: inspection.disabled_via_env,
+        current_version: inspection.current_version,
+        cache_dir: inspection
+            .cache_dir
+            .map(|p| p.to_string_lossy().into_owned()),
+        cache_file: inspection
+            .cache_file
+            .map(|p| p.to_string_lossy().into_owned()),
+        exists: inspection.exists,
+        size_bytes: inspection.size_bytes,
+        modified_unix_secs: inspection.modified_unix_secs,
+        stored_version: inspection.stored_version,
+        stored_repo_root: inspection.stored_repo_root,
+        version_match: inspection.version_match,
+        repo_root_match: inspection.repo_root_match,
+        entry_count: inspection.entry_count,
+        languages,
+    }
+}
+
+pub fn cache_path(repo: &RepoRoot) -> CachePathResponse {
+    CachePathResponse {
+        path: ParseCache::cache_dir_for(repo.root()).map(|p| p.to_string_lossy().into_owned()),
+    }
+}
+
+pub fn cache_clear(repo: &RepoRoot, all: bool) -> AppResult<CacheClearResponse> {
+    if all {
+        let outcome = ParseCache::clear_all().map_err(AppError::from)?;
+        Ok(CacheClearResponse {
+            scope: "all".to_string(),
+            path: outcome.path.to_string_lossy().into_owned(),
+            cleared: outcome.existed,
+            repos_removed: Some(outcome.repos_removed),
+        })
+    } else {
+        let outcome = ParseCache::clear(repo.root()).map_err(AppError::from)?;
+        Ok(CacheClearResponse {
+            scope: "repo".to_string(),
+            path: outcome.path.to_string_lossy().into_owned(),
+            cleared: outcome.existed,
+            repos_removed: None,
+        })
+    }
+}
+
 fn to_output_symbol(s: SymbolInfo, include_bytes: bool) -> OutputSymbol {
     OutputSymbol {
         kind: s.kind,
@@ -555,7 +691,12 @@ fn first_chunk_has_nul(path: &Path) -> bool {
     buf.contains(&0)
 }
 
-fn load_source(resolved: &ResolvedPath) -> AppResult<LoadedSource> {
+struct FileStat {
+    metadata: Metadata,
+    language: Option<Language>,
+}
+
+fn stat_file(resolved: &ResolvedPath) -> AppResult<FileStat> {
     let metadata = std::fs::metadata(&resolved.full_path)?;
 
     if !metadata.is_file() {
@@ -572,6 +713,11 @@ fn load_source(resolved: &ResolvedPath) -> AppResult<LoadedSource> {
         )));
     }
 
+    let language = Language::detect(Path::new(&resolved.full_path)).ok();
+    Ok(FileStat { metadata, language })
+}
+
+fn read_after_stat(resolved: &ResolvedPath) -> AppResult<String> {
     let bytes = std::fs::read(&resolved.full_path)?;
     if bytes.len() > MAX_FILE_BYTES {
         return Err(AppError::too_large(format!(
@@ -587,32 +733,55 @@ fn load_source(resolved: &ResolvedPath) -> AppResult<LoadedSource> {
         )));
     }
 
-    let content = String::from_utf8(bytes).map_err(|_| {
+    String::from_utf8(bytes).map_err(|_| {
         AppError::InvalidUtf8(format!(
             "file is not valid UTF-8: {}",
             resolved.relative_path
         ))
-    })?;
-
-    let language = Language::detect(Path::new(&resolved.full_path)).ok();
-
-    Ok(LoadedSource { language, content })
+    })
 }
 
-fn load_parsed(resolved: &ResolvedPath) -> AppResult<LoadedParsed> {
-    let loaded = load_source(resolved)?;
-    let language = loaded
-        .language
-        .filter(|l| l.is_parseable())
-        .ok_or_else(|| {
-            AppError::unsupported(format!("no parser for {}", resolved.relative_path))
-        })?;
-    let parsed = parse_source(language, &loaded.content)?;
-    Ok(LoadedParsed {
-        language,
-        content: loaded.content,
-        parsed,
+fn load_source(resolved: &ResolvedPath) -> AppResult<LoadedSource> {
+    let stat = stat_file(resolved)?;
+    let content = read_after_stat(resolved)?;
+    Ok(LoadedSource {
+        language: stat.language,
+        content,
     })
+}
+
+/// Return symbols for `resolved` from the cache, or parse if missing/stale.
+///
+/// `content`: pass the already-read source when the caller has it. Pass None
+/// when content isn't otherwise needed ~ we'll read on cache miss only.
+fn cached_or_parsed(
+    cache: &mut ParseCache,
+    resolved: &ResolvedPath,
+    metadata: &Metadata,
+    language: Language,
+    content: Option<&str>,
+) -> AppResult<Vec<SymbolInfo>> {
+    if let Some(symbols) = cache.lookup(&resolved.relative_path, metadata, language) {
+        return Ok(symbols);
+    }
+
+    let owned;
+    let source: &str = match content {
+        Some(s) => s,
+        None => {
+            owned = read_after_stat(resolved)?;
+            &owned
+        }
+    };
+
+    let parsed = parse_source(language, source)?;
+    cache.insert(
+        resolved.relative_path.clone(),
+        metadata,
+        language,
+        parsed.symbols.clone(),
+    );
+    Ok(parsed.symbols)
 }
 
 fn matches_kinds(filter: &[String], kind: &str) -> bool {
@@ -766,6 +935,7 @@ mod tests {
             "needle",
             1,
             false,
+            &mut ParseCache::disabled(),
         )
         .unwrap();
 
@@ -778,8 +948,14 @@ mod tests {
         let repo = TempRepo::new("search-file-limit");
         fs::write(repo.root.join("first.txt"), "needle\nneedle\n").unwrap();
 
-        let response =
-            search_resolved_files(vec![repo.resolved("first.txt")], "needle", 1, false).unwrap();
+        let response = search_resolved_files(
+            vec![repo.resolved("first.txt")],
+            "needle",
+            1,
+            false,
+            &mut ParseCache::disabled(),
+        )
+        .unwrap();
 
         assert_eq!(response.results.get("first.txt").unwrap(), &vec!["@L1"]);
         assert_eq!(response.truncated, true);
@@ -802,6 +978,7 @@ mod tests {
                 snippet: false,
                 terse: false,
             },
+            &mut ParseCache::disabled(),
         )
         .unwrap();
 
@@ -835,6 +1012,7 @@ mod tests {
                 snippet: false,
                 terse: false,
             },
+            &mut ParseCache::disabled(),
         )
         .unwrap();
 

@@ -1,10 +1,13 @@
 use std::collections::BTreeMap;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-// Internal types: shared by parser and queries. Not serialized.
+// Internal types shared by parser, queries, and cache. RangeInfo and SymbolInfo
+// are wire-format-stable: the on-disk parse cache (cache.rs) bincodes them, so
+// changing their shape requires bumping CACHE_VERSION_KEY in cache.rs (or relying
+// on the crate-version suffix it already includes).
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RangeInfo {
     pub start_byte: usize,
     pub end_byte: usize,
@@ -12,7 +15,7 @@ pub struct RangeInfo {
     pub end_line: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SymbolInfo {
     pub kind: String,
     pub name: String,
@@ -150,4 +153,51 @@ pub struct LangSummary {
     pub files: usize,
     pub lines: usize,
     pub parseable: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CacheStatusResponse {
+    pub enabled: bool,
+    pub disabled_via_env: bool,
+    pub current_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_dir: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_file: Option<String>,
+    pub exists: bool,
+    pub size_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modified_unix_secs: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stored_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stored_repo_root: Option<String>,
+    pub version_match: bool,
+    pub repo_root_match: bool,
+    pub entry_count: usize,
+    pub languages: Vec<CacheLangCount>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CacheLangCount {
+    pub language: String,
+    pub files: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CachePathResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CacheClearResponse {
+    /// "repo" (default) or "all" (with --all).
+    pub scope: String,
+    pub path: String,
+    /// True when something was actually removed.
+    pub cleared: bool,
+    /// For scope=all only: number of repo subdirs that existed before delete.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repos_removed: Option<usize>,
 }

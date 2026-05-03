@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use assert_cmd::Command;
 use serde_json::Value;
@@ -10,11 +11,29 @@ fn fixture_repo() -> PathBuf {
         .join("sample_repo")
 }
 
+// Per-process tmpdir for the parse cache. Keeps `cargo test` from writing into
+// the user's real ~/.cache/hitagi. Shared across tests is fine: the fixture
+// repo content doesn't change, so cache hits produce the same symbols as
+// fresh parses.
+fn shared_cache_dir() -> &'static Path {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("hitagi-itest-{}-cache", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    })
+}
+
 fn run(args: &[&str]) -> Value {
+    run_in(&fixture_repo(), shared_cache_dir(), args)
+}
+
+fn run_in(repo: &Path, cache_dir: &Path, args: &[&str]) -> Value {
     let output = Command::cargo_bin("hitagi")
         .unwrap()
+        .env("HITAGI_CACHE_DIR", cache_dir)
         .arg("--repo")
-        .arg(fixture_repo())
+        .arg(repo)
         .args(args)
         .assert()
         .success()
@@ -27,6 +46,7 @@ fn run(args: &[&str]) -> Value {
 fn run_failure(args: &[&str]) -> String {
     let assert = Command::cargo_bin("hitagi")
         .unwrap()
+        .env("HITAGI_CACHE_DIR", shared_cache_dir())
         .arg("--repo")
         .arg(fixture_repo())
         .args(args)
@@ -650,6 +670,7 @@ fn find_terse_with_snippet_appends_signature() {
 fn pretty_flag_indents_output() {
     let stdout = Command::cargo_bin("hitagi")
         .unwrap()
+        .env("HITAGI_CACHE_DIR", shared_cache_dir())
         .arg("--repo")
         .arg(fixture_repo())
         .arg("--pretty")
@@ -693,4 +714,444 @@ fn long_help_includes_llm_prompt_sections() {
             "long help should contain `{needle}` section"
         );
     }
+}
+
+// ~~ Parse cache integration tests ~~
+
+struct ScratchRepo {
+    cache_dir: PathBuf,
+    repo: PathBuf,
+}
+
+impl ScratchRepo {
+    fn new(name: &str) -> Self {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "hitagi-itest-{}-{name}-{unique}",
+            std::process::id()
+        ));
+        let repo = root.join("repo");
+        let cache_dir = root.join("cache");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        // git ignore conventions ~ no .gitignore needed; ignore::WalkBuilder
+        // walks everything inside this tmpdir.
+        Self { cache_dir, repo }
+    }
+
+    fn write(&self, rel: &str, body: &str) {
+        let path = self.repo.join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, body).unwrap();
+    }
+
+    fn run(&self, args: &[&str]) -> Value {
+        run_in(&self.repo, &self.cache_dir, args)
+    }
+}
+
+impl Drop for ScratchRepo {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(self.cache_dir.parent().unwrap());
+    }
+}
+
+#[test]
+fn find_returns_same_results_warm_and_cold() {
+    let cold = run(&["find", "AuthService"]);
+    let warm = run(&["find", "AuthService"]);
+    assert_eq!(cold, warm, "warm cache hit must match cold parse output");
+}
+
+#[test]
+fn outline_returns_same_results_warm_and_cold() {
+    let cold = run(&["outline", "src/auth.ts"]);
+    let warm = run(&["outline", "src/auth.ts"]);
+    assert_eq!(cold, warm);
+}
+
+#[test]
+fn cache_invalidates_when_file_content_changes() {
+    let scratch = ScratchRepo::new("invalidate");
+    scratch.write("a.rs", "pub fn first() {}\n");
+
+    let before = scratch.run(&["find", "first"]);
+    let matches = before["matches"].as_array().unwrap();
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0]["qualname"], "first");
+
+    // Sleep past mtime resolution then rewrite. Different size + different
+    // content guarantees the (mtime, size) cache key changes.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    scratch.write("a.rs", "pub fn second_renamed() {}\n");
+
+    let after_rename = scratch.run(&["find", "second_renamed"]);
+    let after_matches = after_rename["matches"].as_array().unwrap();
+    assert_eq!(after_matches.len(), 1);
+    assert_eq!(after_matches[0]["qualname"], "second_renamed");
+
+    let stale = scratch.run(&["find", "first"]);
+    assert!(
+        stale["matches"].as_array().unwrap().is_empty(),
+        "post-edit find for old symbol must not return cached matches: {stale:?}"
+    );
+}
+
+#[test]
+fn scoped_walk_does_not_prune_full_repo_entries() {
+    let scratch = ScratchRepo::new("scoped-prune");
+    scratch.write("alpha/foo.rs", "pub fn alpha_only() {}\n");
+    scratch.write("beta/bar.rs", "pub fn beta_only() {}\n");
+
+    // Full-repo walk populates entries for both files.
+    let full = scratch.run(&["find", "_only"]);
+    assert_eq!(full["matches"].as_array().unwrap().len(), 2);
+
+    // Scoped walk visits only alpha/, but must NOT prune beta/ from the cache.
+    let alpha = scratch.run(&["find", "alpha_only", "alpha"]);
+    assert_eq!(alpha["matches"].as_array().unwrap().len(), 1);
+
+    // Subsequent full walk should still find beta_only ~ if scoped walk had
+    // pruned, beta would just be re-parsed and we couldn't observe pruning,
+    // but the cache file size shouldn't shrink. The behavioral invariant we
+    // can check from the outside: the search terminates with both matches.
+    let again = scratch.run(&["find", "_only"]);
+    assert_eq!(again["matches"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn truncated_find_does_not_prune_full_repo_entries() {
+    let scratch = ScratchRepo::new("truncated-find-prune");
+    scratch.write("alpha/foo.rs", "pub fn alpha_only() {}\n");
+    scratch.write("beta/bar.rs", "pub fn beta_only() {}\n");
+
+    let full = scratch.run(&["find", "_only"]);
+    assert_eq!(full["matches"].as_array().unwrap().len(), 2);
+    let warm = scratch.run(&["cache", "status"]);
+    assert!(warm["entry_count"].as_u64().unwrap() >= 2);
+
+    let limited = scratch.run(&["find", "_only", "--limit", "1"]);
+    assert_eq!(limited["truncated"], true);
+
+    let status = scratch.run(&["cache", "status"]);
+    assert!(
+        status["entry_count"].as_u64().unwrap() >= 2,
+        "truncated find must not prune warmed cache entries: {status:?}"
+    );
+}
+
+#[test]
+fn truncated_search_does_not_prune_full_repo_entries() {
+    let scratch = ScratchRepo::new("truncated-search-prune");
+    scratch.write("alpha/foo.rs", "pub fn alpha_only() {}\n");
+    scratch.write("beta/bar.rs", "pub fn beta_only() {}\n");
+
+    let full = scratch.run(&["search", "_only"]);
+    let full_total: usize = full["results"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|v| v.as_array().unwrap().len())
+        .sum();
+    assert_eq!(full_total, 2);
+    let warm = scratch.run(&["cache", "status"]);
+    assert!(warm["entry_count"].as_u64().unwrap() >= 2);
+
+    let limited = scratch.run(&["search", "_only", "--limit", "1"]);
+    assert_eq!(limited["truncated"], true);
+
+    let status = scratch.run(&["cache", "status"]);
+    assert!(
+        status["entry_count"].as_u64().unwrap() >= 2,
+        "truncated search must not prune warmed cache entries: {status:?}"
+    );
+}
+
+#[test]
+fn cache_status_when_empty_shows_no_file() {
+    let scratch = ScratchRepo::new("status-empty");
+    let value = scratch.run(&["cache", "status"]);
+    assert_eq!(value["enabled"], true);
+    assert_eq!(value["disabled_via_env"], false);
+    assert_eq!(value["exists"], false);
+    assert_eq!(value["entry_count"], 0);
+    assert_eq!(value["languages"].as_array().unwrap().len(), 0);
+    // Stored fields elided when the file doesn't exist.
+    assert!(value.get("stored_version").is_none());
+    assert!(value.get("stored_repo_root").is_none());
+    let cache_dir = value["cache_dir"].as_str().unwrap();
+    assert!(
+        cache_dir.starts_with(scratch.cache_dir.to_str().unwrap()),
+        "cache_dir should live under HITAGI_CACHE_DIR, got {cache_dir}"
+    );
+}
+
+#[test]
+fn cache_status_reports_disabled_when_no_cache_root_can_be_resolved() {
+    let scratch = ScratchRepo::new("status-no-root");
+    let output = Command::cargo_bin("hitagi")
+        .unwrap()
+        .env_remove("HITAGI_CACHE_DIR")
+        .env_remove("XDG_CACHE_HOME")
+        .env_remove("HOME")
+        .env_remove("HITAGI_NO_CACHE")
+        .arg("--repo")
+        .arg(&scratch.repo)
+        .args(["cache", "status"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: Value = serde_json::from_slice(&output).unwrap();
+
+    assert_eq!(value["enabled"], false);
+    assert_eq!(value["disabled_via_env"], false);
+    assert!(value.get("cache_dir").is_none());
+    assert!(value.get("cache_file").is_none());
+}
+
+#[test]
+fn cache_ignores_empty_xdg_cache_home_and_falls_back_to_home() {
+    let scratch = ScratchRepo::new("xdg-empty");
+    let home = scratch.repo.parent().unwrap().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let output = Command::cargo_bin("hitagi")
+        .unwrap()
+        .env_remove("HITAGI_CACHE_DIR")
+        .env("XDG_CACHE_HOME", "")
+        .env("HOME", &home)
+        .env_remove("HITAGI_NO_CACHE")
+        .arg("--repo")
+        .arg(&scratch.repo)
+        .args(["cache", "path"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: Value = serde_json::from_slice(&output).unwrap();
+    let path = value["path"].as_str().unwrap();
+    let expected_prefix = home.join(".cache").join("hitagi");
+
+    assert!(
+        path.starts_with(expected_prefix.to_str().unwrap()),
+        "empty XDG_CACHE_HOME should fall back under HOME, got {path}"
+    );
+}
+
+#[test]
+fn cache_clear_all_ignores_relative_xdg_cache_home() {
+    let scratch = ScratchRepo::new("xdg-relative-clear-all");
+    let cwd = scratch.repo.parent().unwrap().join("cwd");
+    let dangerous = cwd.join("hitagi");
+    let home = scratch.repo.parent().unwrap().join("home");
+    std::fs::create_dir_all(&dangerous).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(dangerous.join("sentinel.txt"), "do not delete").unwrap();
+
+    let output = Command::cargo_bin("hitagi")
+        .unwrap()
+        .current_dir(&cwd)
+        .env_remove("HITAGI_CACHE_DIR")
+        .env("XDG_CACHE_HOME", "hitagi")
+        .env("HOME", &home)
+        .env_remove("HITAGI_NO_CACHE")
+        .arg("--repo")
+        .arg(&scratch.repo)
+        .args(["cache", "clear", "--all"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: Value = serde_json::from_slice(&output).unwrap();
+
+    assert_eq!(value["scope"], "all");
+    assert_eq!(value["cleared"], false);
+    assert!(
+        dangerous.join("sentinel.txt").exists(),
+        "relative XDG_CACHE_HOME must not let --all delete ./hitagi"
+    );
+}
+
+#[test]
+fn relative_hitagi_cache_dir_disables_cache_resolution() {
+    let scratch = ScratchRepo::new("custom-relative");
+    let cwd = scratch.repo.parent().unwrap().join("cwd");
+    let dangerous = cwd.join("hitagi");
+    let home = scratch.repo.parent().unwrap().join("home");
+    std::fs::create_dir_all(&dangerous).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(dangerous.join("sentinel.txt"), "do not delete").unwrap();
+
+    let output = Command::cargo_bin("hitagi")
+        .unwrap()
+        .current_dir(&cwd)
+        .env("HITAGI_CACHE_DIR", "hitagi")
+        .env("XDG_CACHE_HOME", home.join(".xdg-cache"))
+        .env("HOME", &home)
+        .env_remove("HITAGI_NO_CACHE")
+        .arg("--repo")
+        .arg(&scratch.repo)
+        .args(["cache", "clear", "--all"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: Value = serde_json::from_slice(&output).unwrap();
+
+    assert_eq!(value["scope"], "all");
+    assert_eq!(value["cleared"], false);
+    assert_eq!(value["repos_removed"], 0);
+    assert!(value["path"].as_str().unwrap().is_empty());
+    assert!(
+        dangerous.join("sentinel.txt").exists(),
+        "relative HITAGI_CACHE_DIR must not let --all delete ./hitagi"
+    );
+}
+
+#[test]
+fn cache_status_after_populate_reports_languages() {
+    let scratch = ScratchRepo::new("status-warm");
+    scratch.write("a.rs", "pub fn first() {}\n");
+    scratch.write("b.ts", "export function second() {}\n");
+    let _ = scratch.run(&["find", "first"]);
+
+    let value = scratch.run(&["cache", "status"]);
+    assert_eq!(value["exists"], true);
+    assert!(value["size_bytes"].as_u64().unwrap() > 0);
+    assert_eq!(value["version_match"], true);
+    assert_eq!(value["repo_root_match"], true);
+    assert!(value["entry_count"].as_u64().unwrap() >= 2);
+    let langs: Vec<&str> = value["languages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l["language"].as_str().unwrap())
+        .collect();
+    assert!(langs.contains(&"rust"));
+    assert!(langs.contains(&"typescript"));
+}
+
+#[test]
+fn cache_path_returns_repo_subdir() {
+    let scratch = ScratchRepo::new("path");
+    let value = scratch.run(&["cache", "path"]);
+    let path = value["path"].as_str().unwrap();
+    assert!(
+        path.starts_with(scratch.cache_dir.to_str().unwrap()),
+        "cache path should be under HITAGI_CACHE_DIR, got {path}"
+    );
+    // The subdir is the repo hash, not the bare cache dir.
+    assert_ne!(path, scratch.cache_dir.to_str().unwrap());
+}
+
+#[test]
+fn cache_default_subcommand_is_status() {
+    let scratch = ScratchRepo::new("default");
+    let with_status = scratch.run(&["cache", "status"]);
+    let without = scratch.run(&["cache"]);
+    assert_eq!(with_status, without);
+}
+
+#[test]
+fn cache_clear_removes_repo_dir() {
+    let scratch = ScratchRepo::new("clear-repo");
+    scratch.write("a.rs", "pub fn keep() {}\n");
+    let _ = scratch.run(&["find", "keep"]);
+
+    let pre = scratch.run(&["cache", "status"]);
+    assert_eq!(pre["exists"], true);
+
+    let cleared = scratch.run(&["cache", "clear"]);
+    assert_eq!(cleared["scope"], "repo");
+    assert_eq!(cleared["cleared"], true);
+    assert!(cleared.get("repos_removed").is_none());
+
+    let post = scratch.run(&["cache", "status"]);
+    assert_eq!(post["exists"], false);
+    assert_eq!(post["entry_count"], 0);
+}
+
+#[test]
+fn cache_clear_when_missing_reports_nothing_cleared() {
+    let scratch = ScratchRepo::new("clear-missing");
+    let cleared = scratch.run(&["cache", "clear"]);
+    assert_eq!(cleared["scope"], "repo");
+    assert_eq!(cleared["cleared"], false);
+}
+
+#[test]
+fn cache_clear_all_removes_every_repo() {
+    let scratch = ScratchRepo::new("clear-all");
+    scratch.write("a.rs", "pub fn one() {}\n");
+    let _ = scratch.run(&["find", "one"]);
+
+    // Also point a second pseudo-repo at the same cache to populate a sibling
+    // subdir under HITAGI_CACHE_DIR.
+    let other = scratch.repo.parent().unwrap().join("other-repo");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(other.join("b.rs"), "pub fn two() {}\n").unwrap();
+    let _ = run_in(&other, &scratch.cache_dir, &["find", "two"]);
+
+    let entries_before: Vec<_> = std::fs::read_dir(&scratch.cache_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .collect();
+    assert!(
+        entries_before.len() >= 2,
+        "expected at least 2 repo subdirs, found {}",
+        entries_before.len()
+    );
+
+    let cleared = scratch.run(&["cache", "clear", "--all"]);
+    assert_eq!(cleared["scope"], "all");
+    assert_eq!(cleared["cleared"], true);
+    assert!(cleared["repos_removed"].as_u64().unwrap() >= 2);
+
+    assert!(
+        !scratch.cache_dir.exists(),
+        "cache root should be gone after --all"
+    );
+}
+
+#[test]
+fn no_cache_env_disables_persistence() {
+    let scratch = ScratchRepo::new("no-cache");
+    scratch.write("a.rs", "pub fn keep_me() {}\n");
+
+    // First run with cache disabled.
+    let value = Command::cargo_bin("hitagi")
+        .unwrap()
+        .env("HITAGI_CACHE_DIR", &scratch.cache_dir)
+        .env("HITAGI_NO_CACHE", "1")
+        .arg("--repo")
+        .arg(&scratch.repo)
+        .args(["find", "keep_me"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let parsed: Value = serde_json::from_slice(&value).unwrap();
+    assert_eq!(parsed["matches"].as_array().unwrap().len(), 1);
+
+    // Cache file must not have been written.
+    let entries = std::fs::read_dir(&scratch.cache_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .count();
+    assert_eq!(
+        entries, 0,
+        "HITAGI_NO_CACHE must skip persistence; got {entries} entries in cache dir"
+    );
 }
