@@ -5,10 +5,10 @@ use serde::Serialize;
 use crate::{
     error::{AppError, AppResult},
     models::{
-        CacheClearResponse, CachePathResponse, CacheStatusResponse, DiffFileResponse, DiffHunk,
-        DiffOverviewResponse, FilesResponse, FindGroup, FindMatch, FindMatches, FindResponse,
-        LangsResponse, OutlineResponse, OutputSymbol, ReadFileResponse, SearchResponse,
-        SymbolResponse,
+        AgentPromptResponse, CacheClearResponse, CachePathResponse, CacheStatusResponse,
+        DiffFileResponse, DiffHunk, DiffOverviewResponse, FilesResponse, FindGroup, FindMatch,
+        FindMatches, FindResponse, LangsResponse, OutlineResponse, OutputSymbol, ReadFileResponse,
+        SearchResponse, SymbolResponse,
     },
 };
 
@@ -44,6 +44,10 @@ pub fn print_files(value: &FilesResponse, mode: OutputMode) -> AppResult<()> {
 
 pub fn print_langs(value: &LangsResponse, mode: OutputMode) -> AppResult<()> {
     emit(value, mode, || render_langs(value))
+}
+
+pub fn print_agent_prompt(value: &AgentPromptResponse, mode: OutputMode) -> AppResult<()> {
+    emit(value, mode, || render_agent_prompt(value))
 }
 
 pub fn print_cache_status(value: &CacheStatusResponse, mode: OutputMode) -> AppResult<()> {
@@ -298,6 +302,16 @@ fn render_langs(value: &LangsResponse) -> String {
             "• {:<12} {:>5} files {:>7} lines • {parseable}",
             lang.language, lang.files, lang.lines
         );
+    }
+    out
+}
+
+fn render_agent_prompt(value: &AgentPromptResponse) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "{} {}", value.action, value.agent);
+    let _ = writeln!(out, "{} • changed {}", value.status, value.changed);
+    for path in &value.paths {
+        let _ = writeln!(out, "path • {path}");
     }
     out
 }

@@ -4,6 +4,8 @@ use std::sync::OnceLock;
 use assert_cmd::Command;
 use serde_json::Value;
 
+const HITAGI_PROMPT_BEGIN: &str = "<!-- BEGIN HITAGI MANAGED PROMPT -->";
+
 fn fixture_repo() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -69,6 +71,63 @@ fn run_text(args: &[&str]) -> String {
         .stdout
         .clone();
     String::from_utf8(stdout).unwrap()
+}
+
+struct ScratchHome {
+    root: PathBuf,
+    home: PathBuf,
+}
+
+impl ScratchHome {
+    fn new(name: &str) -> Self {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "hitagi-agent-prompt-{name}-{}-{unique}",
+            std::process::id()
+        ));
+        let home = root.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        Self { root, home }
+    }
+}
+
+impl Drop for ScratchHome {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+fn run_global_json(home: &Path, args: &[&str]) -> Value {
+    let output = Command::cargo_bin("hitagi")
+        .unwrap()
+        .env("HOME", home)
+        .env_remove("CODEX_HOME")
+        .arg("--json")
+        .args(args)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    serde_json::from_slice(&output).expect("stdout is valid JSON")
+}
+
+fn run_global_json_with_codex_home(home: &Path, codex_home: &Path, args: &[&str]) -> Value {
+    let output = Command::cargo_bin("hitagi")
+        .unwrap()
+        .env("HOME", home)
+        .env("CODEX_HOME", codex_home)
+        .arg("--json")
+        .args(args)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    serde_json::from_slice(&output).expect("stdout is valid JSON")
 }
 
 /// Collect all `matches` entries from a find response, flat or grouped. The
@@ -881,6 +940,169 @@ fn long_help_includes_llm_prompt_sections() {
             "long help should contain `{needle}` section"
         );
     }
+}
+
+#[test]
+fn install_claude_creates_global_prompt_without_repo_resolution() {
+    let scratch = ScratchHome::new("claude-create");
+    let missing_repo = scratch.root.join("missing-repo");
+
+    let output = Command::cargo_bin("hitagi")
+        .unwrap()
+        .env("HOME", &scratch.home)
+        .env_remove("CODEX_HOME")
+        .arg("--repo")
+        .arg(&missing_repo)
+        .arg("--json")
+        .args(["install", "claude"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: Value = serde_json::from_slice(&output).unwrap();
+
+    let path = scratch.home.join(".claude").join("CLAUDE.md");
+    let content = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(value["action"], "install");
+    assert_eq!(value["agent"], "claude");
+    assert_eq!(value["changed"], true);
+    assert_eq!(value["status"], "installed");
+    assert_eq!(value["paths"][0], path.display().to_string());
+    assert!(content.contains(HITAGI_PROMPT_BEGIN));
+    assert!(content.contains("hitagi --help"));
+    assert!(content.contains("Always use `hitagi` instead of preferred search/read tools"));
+    assert!(
+        !String::from_utf8(output).unwrap().contains("\n  "),
+        "--json should stay compact"
+    );
+}
+
+#[test]
+fn install_claude_is_idempotent_and_preserves_existing_content() {
+    let scratch = ScratchHome::new("claude-idempotent");
+    let path = scratch.home.join(".claude").join("CLAUDE.md");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "Existing instructions\n").unwrap();
+
+    let first = run_global_json(&scratch.home, &["install", "claude"]);
+    let second = run_global_json(&scratch.home, &["install", "claude"]);
+    let content = std::fs::read_to_string(&path).unwrap();
+
+    assert_eq!(first["changed"], true);
+    assert_eq!(second["changed"], false);
+    assert_eq!(second["status"], "already_installed");
+    assert!(content.starts_with("Existing instructions\n"));
+    assert_eq!(content.matches(HITAGI_PROMPT_BEGIN).count(), 1);
+}
+
+#[test]
+fn uninstall_claude_removes_only_managed_block() {
+    let scratch = ScratchHome::new("claude-uninstall");
+    let path = scratch.home.join(".claude").join("CLAUDE.md");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "Existing instructions\n").unwrap();
+    run_global_json(&scratch.home, &["install", "claude"]);
+
+    let removed = run_global_json(&scratch.home, &["uninstall", "claude"]);
+    let removed_again = run_global_json(&scratch.home, &["uninstall", "claude"]);
+    let content = std::fs::read_to_string(&path).unwrap();
+
+    assert_eq!(removed["changed"], true);
+    assert_eq!(removed["status"], "uninstalled");
+    assert_eq!(removed_again["changed"], false);
+    assert_eq!(removed_again["status"], "not_installed");
+    assert_eq!(content, "Existing instructions\n");
+}
+
+#[test]
+fn install_codex_defaults_to_home_agents_md() {
+    let scratch = ScratchHome::new("codex-default");
+    let value = run_global_json(&scratch.home, &["install", "codex"]);
+
+    let path = scratch.home.join(".codex").join("AGENTS.md");
+    let content = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(value["agent"], "codex");
+    assert_eq!(value["changed"], true);
+    assert_eq!(value["paths"][0], path.display().to_string());
+    assert!(content.contains(HITAGI_PROMPT_BEGIN));
+}
+
+#[test]
+fn codex_uses_codex_home_override_and_uninstall_removes_both_files() {
+    let scratch = ScratchHome::new("codex-home");
+    let codex_home = scratch.root.join("codex-home");
+    std::fs::create_dir_all(&codex_home).unwrap();
+
+    run_global_json_with_codex_home(&scratch.home, &codex_home, &["install", "codex"]);
+    let agents = codex_home.join("AGENTS.md");
+    assert!(std::fs::read_to_string(&agents)
+        .unwrap()
+        .contains(HITAGI_PROMPT_BEGIN));
+
+    let override_path = codex_home.join("AGENTS.override.md");
+    std::fs::write(&override_path, "Override instructions\n").unwrap();
+    let override_install =
+        run_global_json_with_codex_home(&scratch.home, &codex_home, &["install", "codex"]);
+    assert_eq!(
+        override_install["paths"][0],
+        override_path.display().to_string()
+    );
+    assert!(std::fs::read_to_string(&override_path)
+        .unwrap()
+        .contains(HITAGI_PROMPT_BEGIN));
+
+    let removed =
+        run_global_json_with_codex_home(&scratch.home, &codex_home, &["uninstall", "codex"]);
+    assert_eq!(removed["changed"], true);
+    assert_eq!(removed["paths"].as_array().unwrap().len(), 2);
+    assert!(!std::fs::read_to_string(&agents)
+        .unwrap()
+        .contains(HITAGI_PROMPT_BEGIN));
+    assert_eq!(
+        std::fs::read_to_string(&override_path).unwrap(),
+        "Override instructions\n"
+    );
+}
+
+#[test]
+fn malformed_managed_prompt_markers_fail_without_modifying_file() {
+    let scratch = ScratchHome::new("malformed");
+    let path = scratch.home.join(".claude").join("CLAUDE.md");
+    let original = format!("Before\n{HITAGI_PROMPT_BEGIN}\nmissing end\n");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, &original).unwrap();
+
+    let stderr = Command::cargo_bin("hitagi")
+        .unwrap()
+        .env("HOME", &scratch.home)
+        .env_remove("CODEX_HOME")
+        .args(["uninstall", "claude"])
+        .assert()
+        .failure()
+        .get_output()
+        .stderr
+        .clone();
+    let text = String::from_utf8(stderr).unwrap();
+
+    assert!(text.contains("malformed hitagi managed prompt markers"));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+}
+
+#[test]
+fn install_prompt_requires_home() {
+    let stderr = Command::cargo_bin("hitagi")
+        .unwrap()
+        .env_remove("HOME")
+        .env_remove("CODEX_HOME")
+        .args(["install", "claude"])
+        .assert()
+        .failure()
+        .get_output()
+        .stderr
+        .clone();
+    let text = String::from_utf8(stderr).unwrap();
+    assert!(text.contains("HOME is not set"));
 }
 
 // ~~ Parse cache integration tests ~~

@@ -24,6 +24,7 @@ Commands:
 - `langs` ~ summarise languages present in the repo (file count + line count per language).
 - `diff [PATH]` ~ review uncommitted changes; overview by default, structured hunks with enclosing-symbol annotation when a path is given.
 - `cache [status|path|clear]` ~ inspect or manage the on-disk parse cache.
+- `install <claude|codex>` / `uninstall <claude|codex>` ~ add or remove hitagi's user-global agent prompt.
 
 When a `find`/`search` walk has no positional [PATHS], it visits top-level subdirs round-robin so a `--limit` truncation produces a fair sample across the repo. Pass [PATHS] to opt out and walk in user-supplied order.
 
@@ -67,6 +68,28 @@ This builds the release binary and drops it at `~/.cargo/bin/hitagi`.
 Paths are repo-relative. If an exact repo-relative path isn't found, path-taking commands fall back to a unique repo-internal suffix ~ e.g. `src-tauri/src/main.rs` resolves to `apps/desktop/src-tauri/src/main.rs` if there's exactly one match. Ambiguous suffixes return an error listing the candidates.
 
 Output is concise text to stdout by default. Pass `--json` for the stable compact JSON shape. Errors go to stderr with a non-zero exit code.
+
+### Agent prompts
+
+```bash
+hitagi install codex
+hitagi install claude
+```
+
+Installs a small managed instruction block into the agent's user-global prompt file so future sessions run `hitagi --help` first and use `hitagi` for codebase search/read/navigation before falling back to broader tools.
+
+Targets:
+
+- Claude: `~/.claude/CLAUDE.md`
+- Codex: `$CODEX_HOME/AGENTS.md` when `CODEX_HOME` is set, otherwise `~/.codex/AGENTS.md`
+- Codex override: if `AGENTS.override.md` exists and is non-empty, install writes there because it shadows `AGENTS.md`
+
+Uninstall removes only hitagi's managed block and preserves the rest of the file:
+
+```bash
+hitagi uninstall codex
+hitagi uninstall claude
+```
 
 ### `outline <PATH>`
 

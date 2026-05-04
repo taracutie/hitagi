@@ -215,6 +215,15 @@ pub struct LangSummary {
     pub parseable: bool,
 }
 
+#[derive(Debug, Serialize)]
+pub struct AgentPromptResponse {
+    pub action: String,
+    pub agent: String,
+    pub changed: bool,
+    pub status: String,
+    pub paths: Vec<String>,
+}
+
 // ~~ Diff (uncommitted-change review) ~~
 
 #[derive(Debug, Serialize)]

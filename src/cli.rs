@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 use crate::{
+    agent_prompt::{self, AgentKind},
     commands::{
         self, DiffFileOptions, DiffOptions, DiffScope, FilesOptions, FindOptions, OutlineOptions,
         ReadOptions, SearchOptions, SymbolOptions,
@@ -408,6 +409,26 @@ enum Commands {
         #[command(subcommand)]
         action: Option<CacheAction>,
     },
+    /// Install the global hitagi prompt for an agent.
+    ///
+    /// Writes a small managed block to the agent's user-global instruction file:
+    /// `~/.claude/CLAUDE.md` for Claude, `$CODEX_HOME/AGENTS.md` or
+    /// `~/.codex/AGENTS.md` for Codex. If Codex has a non-empty
+    /// `AGENTS.override.md`, installs there because it shadows `AGENTS.md`.
+    Install {
+        /// Agent to configure.
+        #[arg(value_enum)]
+        agent: AgentKind,
+    },
+    /// Remove the global hitagi prompt for an agent.
+    ///
+    /// Removes only hitagi's managed block, preserving surrounding user content.
+    /// Codex uninstall checks both `AGENTS.md` and `AGENTS.override.md`.
+    Uninstall {
+        /// Agent to configure.
+        #[arg(value_enum)]
+        agent: AgentKind,
+    },
     /// Show uncommitted changes (working tree vs HEAD by default).
     ///
     /// With no PATH, prints a one-entry-per-file overview (status, ±line counts,
@@ -468,142 +489,159 @@ pub fn run() -> AppResult<()> {
     } else {
         OutputMode::Text
     };
-    let repo_root = resolve_repo_root(cli.repo)?;
-    let repo = RepoRoot::new(repo_root);
+    let command = cli.command;
 
-    match cli.command {
-        Commands::Outline {
-            path,
-            bytes,
-            kind,
-            depth,
-        } => {
-            let opts = OutlineOptions {
-                bytes,
-                kinds: kind,
-                depth,
-            };
-            let response = commands::outline(&repo, &path, opts)?;
-            output::print_outline(&path, &response, mode)
+    match command {
+        Commands::Install { agent } => {
+            let response = agent_prompt::install(agent)?;
+            output::print_agent_prompt(&response, mode)
         }
-        Commands::Symbol {
-            path,
-            qualname,
-            bytes,
-        } => {
-            let opts = SymbolOptions { bytes };
-            let response = commands::symbol(&repo, &path, &qualname, opts)?;
-            output::print_symbol(&path, &response, mode)
+        Commands::Uninstall { agent } => {
+            let response = agent_prompt::uninstall(agent)?;
+            output::print_agent_prompt(&response, mode)
         }
-        Commands::Search {
-            query,
-            paths,
-            limit,
-            snippet,
-            exclude,
-        } => {
-            let opts = SearchOptions {
-                paths,
-                excludes: exclude,
-                limit,
-                snippet,
-            };
-            let response = commands::search(&repo, &query, opts)?;
-            output::print_search(&query, &response, mode)
-        }
-        Commands::Read { path, lines } => {
-            let opts = ReadOptions {
-                lines: lines.as_deref().map(parse_lines).transpose()?,
-            };
-            let response = commands::read_file(&repo, &path, opts)?;
-            output::print_read(&path, &response, mode)
-        }
-        Commands::Find {
-            query,
-            paths,
-            kind,
-            limit,
-            bytes,
-            snippet,
-            terse,
-            per_file,
-            exclude,
-        } => {
-            let opts = FindOptions {
-                paths,
-                excludes: exclude,
-                kinds: kind,
-                limit,
-                bytes,
-                snippet,
-                terse,
-                per_file,
-            };
-            let response = commands::find(&repo, &query, opts)?;
-            output::print_find(&query, &response, mode)
-        }
-        Commands::Files {
-            globs,
-            exclude,
-            limit,
-        } => {
-            let opts = FilesOptions {
-                globs,
-                excludes: exclude,
-                limit,
-            };
-            let response = commands::files(&repo, opts)?;
-            output::print_files(&response, mode)
-        }
-        Commands::Langs => {
-            let response = commands::langs(&repo)?;
-            output::print_langs(&response, mode)
-        }
-        Commands::Cache { action } => match action.unwrap_or(CacheAction::Status) {
-            CacheAction::Status => {
-                let response = commands::cache_status(&repo);
-                output::print_cache_status(&response, mode)
-            }
-            CacheAction::Path => {
-                let response = commands::cache_path(&repo);
-                output::print_cache_path(&response, mode)
-            }
-            CacheAction::Clear { all } => {
-                let response = commands::cache_clear(&repo, all)?;
-                output::print_cache_clear(&response, mode)
-            }
-        },
-        Commands::Diff {
-            path,
-            symbol,
-            raw,
-            staged,
-            unstaged,
-            against,
-            exclude,
-        } => {
-            let scope = if staged {
-                DiffScope::Staged
-            } else if unstaged {
-                DiffScope::Unstaged
-            } else {
-                DiffScope::All
-            };
-            let opts = DiffOptions {
-                scope,
-                against,
-                excludes: exclude,
-            };
-            match path {
-                None => {
-                    let response = commands::diff_overview(&repo, opts)?;
-                    output::print_diff_overview(&response, mode)
+        command => {
+            let repo_root = resolve_repo_root(cli.repo)?;
+            let repo = RepoRoot::new(repo_root);
+
+            match command {
+                Commands::Outline {
+                    path,
+                    bytes,
+                    kind,
+                    depth,
+                } => {
+                    let opts = OutlineOptions {
+                        bytes,
+                        kinds: kind,
+                        depth,
+                    };
+                    let response = commands::outline(&repo, &path, opts)?;
+                    output::print_outline(&path, &response, mode)
                 }
-                Some(p) => {
-                    let drill = DiffFileOptions { symbol, raw };
-                    let response = commands::diff_file(&repo, &p, opts, drill)?;
-                    output::print_diff_file(&p, &response, mode)
+                Commands::Symbol {
+                    path,
+                    qualname,
+                    bytes,
+                } => {
+                    let opts = SymbolOptions { bytes };
+                    let response = commands::symbol(&repo, &path, &qualname, opts)?;
+                    output::print_symbol(&path, &response, mode)
                 }
+                Commands::Search {
+                    query,
+                    paths,
+                    limit,
+                    snippet,
+                    exclude,
+                    include_unscoped,
+                } => {
+                    let opts = SearchOptions {
+                        paths,
+                        excludes: exclude,
+                        limit,
+                        snippet,
+                        include_unscoped,
+                    };
+                    let response = commands::search(&repo, &query, opts)?;
+                    output::print_search(&query, &response, mode)
+                }
+                Commands::Read { path, lines } => {
+                    let opts = ReadOptions {
+                        lines: lines.as_deref().map(parse_lines).transpose()?,
+                    };
+                    let response = commands::read_file(&repo, &path, opts)?;
+                    output::print_read(&path, &response, mode)
+                }
+                Commands::Find {
+                    query,
+                    paths,
+                    kind,
+                    limit,
+                    bytes,
+                    snippet,
+                    terse,
+                    per_file,
+                    exclude,
+                } => {
+                    let opts = FindOptions {
+                        paths,
+                        excludes: exclude,
+                        kinds: kind,
+                        limit,
+                        bytes,
+                        snippet,
+                        terse,
+                        per_file,
+                    };
+                    let response = commands::find(&repo, &query, opts)?;
+                    output::print_find(&query, &response, mode)
+                }
+                Commands::Files {
+                    globs,
+                    exclude,
+                    limit,
+                } => {
+                    let opts = FilesOptions {
+                        globs,
+                        excludes: exclude,
+                        limit,
+                    };
+                    let response = commands::files(&repo, opts)?;
+                    output::print_files(&response, mode)
+                }
+                Commands::Langs => {
+                    let response = commands::langs(&repo)?;
+                    output::print_langs(&response, mode)
+                }
+                Commands::Cache { action } => match action.unwrap_or(CacheAction::Status) {
+                    CacheAction::Status => {
+                        let response = commands::cache_status(&repo);
+                        output::print_cache_status(&response, mode)
+                    }
+                    CacheAction::Path => {
+                        let response = commands::cache_path(&repo);
+                        output::print_cache_path(&response, mode)
+                    }
+                    CacheAction::Clear { all } => {
+                        let response = commands::cache_clear(&repo, all)?;
+                        output::print_cache_clear(&response, mode)
+                    }
+                },
+                Commands::Diff {
+                    path,
+                    symbol,
+                    raw,
+                    staged,
+                    unstaged,
+                    against,
+                    exclude,
+                } => {
+                    let scope = if staged {
+                        DiffScope::Staged
+                    } else if unstaged {
+                        DiffScope::Unstaged
+                    } else {
+                        DiffScope::All
+                    };
+                    let opts = DiffOptions {
+                        scope,
+                        against,
+                        excludes: exclude,
+                    };
+                    match path {
+                        None => {
+                            let response = commands::diff_overview(&repo, opts)?;
+                            output::print_diff_overview(&response, mode)
+                        }
+                        Some(p) => {
+                            let drill = DiffFileOptions { symbol, raw };
+                            let response = commands::diff_file(&repo, &p, opts, drill)?;
+                            output::print_diff_file(&p, &response, mode)
+                        }
+                    }
+                }
+                Commands::Install { .. } | Commands::Uninstall { .. } => unreachable!(),
             }
         }
     }

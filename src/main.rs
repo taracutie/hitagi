@@ -1,3 +1,4 @@
+mod agent_prompt;
 mod cache;
 mod cli;
 mod commands;
