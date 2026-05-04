@@ -126,6 +126,13 @@ fn visit_typescript(
 
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
+        // Inline `{ ... }` type literals (in property annotations, generic args,
+        // function signatures, index signatures, etc.) emit their own
+        // property_signature nodes that are NOT API surface ~ skipping them
+        // here keeps `User.id` from leaking out of `data: { id; handle }`.
+        if child.kind() == "object_type" {
+            continue;
+        }
         visit_typescript(child, source, symbols, next_prefix.clone());
     }
 }
@@ -461,5 +468,75 @@ mod bar { pub fn inside() {} }
             .map(|s| s.qualname.as_str())
             .collect();
         assert_eq!(module_names, vec!["bar"]);
+    }
+
+    #[test]
+    fn typescript_nested_inline_object_types_do_not_emit_phantom_properties() {
+        let source = r#"
+interface User {
+  name: string;
+  data: { id: string; handle: string };
+  list: Array<{ key: string; value: number }>;
+}
+"#;
+        let parsed = parse_source(Language::TypeScript, source).unwrap();
+        let qualnames: Vec<&str> = parsed.symbols.iter().map(|s| s.qualname.as_str()).collect();
+
+        assert!(qualnames.contains(&"User"));
+        assert!(qualnames.contains(&"User.name"));
+        assert!(qualnames.contains(&"User.data"));
+        assert!(qualnames.contains(&"User.list"));
+
+        // Inner inline-object property names must NOT leak as siblings of
+        // the real interface members.
+        assert!(!qualnames.contains(&"User.id"));
+        assert!(!qualnames.contains(&"User.handle"));
+        assert!(!qualnames.contains(&"User.key"));
+        assert!(!qualnames.contains(&"User.value"));
+
+        // And not as bare top-level symbols either.
+        assert!(!qualnames.contains(&"id"));
+        assert!(!qualnames.contains(&"handle"));
+        assert!(!qualnames.contains(&"key"));
+        assert!(!qualnames.contains(&"value"));
+    }
+
+    #[test]
+    fn typescript_class_field_with_inline_object_type_does_not_emit_phantoms() {
+        let source = r#"
+class Handler {
+  name: string = "";
+  config: { host: string; port: number } = { host: "", port: 0 };
+}
+"#;
+        let parsed = parse_source(Language::TypeScript, source).unwrap();
+        let qualnames: Vec<&str> = parsed.symbols.iter().map(|s| s.qualname.as_str()).collect();
+
+        assert!(qualnames.contains(&"Handler"));
+        assert!(qualnames.contains(&"Handler.name"));
+        assert!(qualnames.contains(&"Handler.config"));
+
+        assert!(!qualnames.contains(&"Handler.host"));
+        assert!(!qualnames.contains(&"Handler.port"));
+    }
+
+    #[test]
+    fn typescript_type_alias_with_inline_object_does_not_leak_top_level_symbols() {
+        let source = r#"
+type Account = {
+  accounts: Array<{ id: string; handle: string }>;
+};
+"#;
+        let parsed = parse_source(Language::TypeScript, source).unwrap();
+        let qualnames: Vec<&str> = parsed.symbols.iter().map(|s| s.qualname.as_str()).collect();
+
+        assert!(qualnames.contains(&"Account"));
+
+        // Today's bug emitted these as bare top-level symbols (no Account.
+        // prefix because type_alias_declaration is not a container). Skipping
+        // object_type recursion eliminates them entirely.
+        assert!(!qualnames.contains(&"id"));
+        assert!(!qualnames.contains(&"handle"));
+        assert!(!qualnames.contains(&"accounts"));
     }
 }
