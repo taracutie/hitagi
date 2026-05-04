@@ -66,23 +66,21 @@ This builds the release binary and drops it at `~/.cargo/bin/hitagi`.
 
 Paths are repo-relative. If an exact repo-relative path isn't found, path-taking commands fall back to a unique repo-internal suffix ~ e.g. `src-tauri/src/main.rs` resolves to `apps/desktop/src-tauri/src/main.rs` if there's exactly one match. Ambiguous suffixes return an error listing the candidates.
 
-Output is compact JSON to stdout. Pass `--pretty` for indented output. Errors go to stderr with a non-zero exit code.
+Output is concise text to stdout by default. Pass `--json` for the stable compact JSON shape. Errors go to stderr with a non-zero exit code.
 
 ### `outline <PATH>`
 
 ```bash
-hitagi outline src/cli.rs --pretty
+hitagi outline src/cli.rs
 ```
 
-```json
-{
-  "language": "rust",
-  "symbols": [
-    { "kind": "struct",   "name": "Cli",      "qualname": "Cli",                "lines": [24, 35] },
-    { "kind": "enum",     "name": "Commands", "qualname": "Commands",           "lines": [38, 119] },
-    { "kind": "variant",  "name": "Outline",  "qualname": "Commands.Outline",   "lines": [40, 49] }
-  ]
-}
+```text
+outline src/cli.rs
+rust • 3/3 symbols
+kinds • enum 1 • struct 1 • variant 1
+• L24-35 struct Cli
+• L38-119 enum Commands
+  • L40-49 variant Commands.Outline
 ```
 
 Bodyless `mod foo;` declarations are intentionally omitted (they're imports, not scoped containers); `mod foo { ... }` blocks are included.
@@ -106,17 +104,14 @@ Flags: `--bytes` (same as outline).
 ### `search <QUERY> [PATHS...]`
 
 ```bash
-hitagi search "tree_sitter::Parser" --snippet --pretty
+hitagi search "tree_sitter::Parser" --snippet
 ```
 
-```json
-{
-  "results": {
-    "src/parser.rs": [
-      "parse_source(function) @L16 :: let mut parser = tree_sitter::Parser::new();"
-    ]
-  }
-}
+```text
+search "tree_sitter::Parser"
+1 matches
+src/parser.rs
+  • parse_source(function) @L16 :: let mut parser = tree_sitter::Parser::new();
 ```
 
 Each entry follows the format `<scope>(<kind>) @L<match_line>` for matches inside a parsed symbol, or just `@L<match_line>` for matches outside any scope (top-of-file imports, comments, plaintext files). Pass `--snippet` to append the matched line.
@@ -143,32 +138,22 @@ When matches span multiple top-level dirs with no shared prefix, the response sw
 hitagi read src/lang.rs
 ```
 
-Returns `{ "language": "rust", "content": "..." }`. For files with no recognised extension, `language` is `"plaintext"`.
+Prints a short metadata header followed by the file content. For files with no recognised extension, `language` is `"plaintext"`.
 
 Flags:
 
-- `--lines S-E` ~ slice to a 1-indexed inclusive line range, e.g. `--lines 100-200`. The end clamps to the file; if `S` is past EOF you get an error (`--lines start (X) is past end of file (file has N lines)`). Slicing adds `"lines": [s, e]` and `"total_lines": N` to the response.
+- `--lines S-E` ~ slice to a 1-indexed inclusive line range, e.g. `--lines 100-200`. The end clamps to the file; if `S` is past EOF you get an error (`--lines start (X) is past end of file (file has N lines)`). With `--json`, slicing adds `"lines": [s, e]` and `"total_lines": N` to the response.
 
 ### `find <QUERY> [PATHS...]`
 
 ```bash
-hitagi find load_source --snippet --pretty
+hitagi find load_source --snippet
 ```
 
-```json
-{
-  "matches": [
-    {
-      "path": "src/commands.rs",
-      "kind": "function",
-      "name": "load_source",
-      "qualname": "load_source",
-      "lines": [380, 422],
-      "snippet": "fn load_source(resolved: &ResolvedPath) -> AppResult<LoadedSource> {"
-    }
-  ],
-  "searched_files": 18
-}
+```text
+find "load_source"
+1 matches • 18 files searched
+• src/commands.rs:L380-422 function load_source :: fn load_source(resolved: &ResolvedPath) -> AppResult<LoadedSource> {
 ```
 
 Walks the repo, parses every supported file, returns symbols whose qualname contains `QUERY` (case-insensitive). Use this when you know the symbol name but not the file. Only matches qualnames within parseable files; `.md`/`.txt`/etc. are skipped ~ for raw substring search across all files, use `search`.
@@ -195,44 +180,43 @@ When matches span multiple top-level dirs with no shared prefix, the response sw
 hitagi files "src/**/*.rs" "**/*.toml"
 ```
 
-```json
-{
-  "files": [
-    "Cargo.toml",
-    "src/cli.rs",
-    "src/commands.rs",
-    "src/error.rs",
-    "src/lang.rs",
-    "src/main.rs",
-    "src/models.rs",
-    "src/parser.rs",
-    "src/queries.rs",
-    "src/repo.rs"
-  ]
-}
+```text
+files
+13 files
+• Cargo.toml
+• src/cache.rs
+• src/cli.rs
+• src/commands.rs
+• src/error.rs
+• src/git.rs
+• src/lang.rs
+• src/main.rs
+• src/models.rs
+• src/output.rs
+• src/parser.rs
+• src/queries.rs
+• src/repo.rs
 ```
 
 Lists all files in the repo, sorted alphabetically. Respects `.gitignore` (and `.git/info/exclude`). Pass one or more positional [globset](https://docs.rs/globset/) patterns to filter (multiple are OR'd) ~ `**` for any-depth directory wildcard, `*` for one segment, etc.
 
 Flags:
 
-- `--limit N` ~ maximum number of files to return (default `2000`). Response includes `"truncated": true` and a `"note"` field suggesting how to refine when the cap is hit.
+- `--limit N` ~ maximum number of files to return (default `2000`). Output includes a truncation note when the cap is hit; `--json` includes `"truncated": true` and a `"note"` field.
 - `--exclude PATTERN` (repeatable) ~ skip files matching the pattern. Bare names like `--exclude vendor` skip that directory at any depth.
 
 ### `langs`
 
 ```bash
-hitagi langs --pretty
+hitagi langs
 ```
 
-```json
-{
-  "languages": [
-    { "language": "rust",     "files": 9, "lines": 2400, "parseable": true  },
-    { "language": "markdown", "files": 4, "lines": 870,  "parseable": false },
-    { "language": "tsx",      "files": 2, "lines": 312,  "parseable": true  }
-  ]
-}
+```text
+languages
+3 languages
+• rust             9 files    2400 lines • parseable
+• markdown         4 files     870 lines • plain
+• tsx              2 files     312 lines • parseable
 ```
 
 One-shot orientation: walks the repo and tallies file count + line count per detected language. Sorted by file count descending. The `parseable` flag tells you which entries support `outline`/`symbol`/`find` (Rust, TypeScript, TSX, Python, Kotlin, Prisma) ~ the rest are recognised by extension but only respond to `search` and `read`.
@@ -242,46 +226,31 @@ One-shot orientation: walks the repo and tallies file count + line count per det
 Review uncommitted changes (working tree vs `HEAD` by default). Shells out to `git` ~ requires a git repo. With no `PATH`, prints a one-entry-per-file overview; with a `PATH`, prints structured hunks annotated by enclosing symbol.
 
 ```bash
-hitagi diff --pretty
+hitagi diff
 ```
 
-```json
-{
-  "files": [
-    { "path": "src/cli.rs",     "status": "M", "added": 12, "removed": 3, "unstaged": true },
-    { "path": "src/git.rs",     "status": "A", "added": 140, "removed": 0, "staged": true, "unstaged": true },
-    { "path": "docs/old.md",    "status": "D", "added": 0, "removed": 33, "unstaged": true },
-    { "path": "src/renamed.rs", "status": "R", "old_path": "src/orig.rs", "added": 3, "removed": 3, "unstaged": true },
-    { "path": "notes.txt",      "status": "?" }
-  ]
-}
+```text
+diff
+5 files
+M src/cli.rs +12 -3 • unstaged
+A src/git.rs +140 -0 • staged • unstaged
+D docs/old.md +0 -33 • unstaged
+R src/renamed.rs +3 -3 ← src/orig.rs • unstaged
+? notes.txt
 ```
 
 Status codes: `M` modified, `A` added, `D` deleted, `R` renamed, `C` copied, `?` untracked. Untracked files have no `added`/`removed` (drilldown isn't supported for them ~ use `read` for content).
 
 ```bash
-hitagi diff src/cli.rs --pretty
+hitagi diff src/cli.rs
 ```
 
-```json
-{
-  "path": "src/cli.rs",
-  "status": "M",
-  "added": 12,
-  "removed": 0,
-  "language": "rust",
-  "hunks": [
-    {
-      "old_lines": [320, 320],
-      "new_lines": [321, 332],
-      "added": 12,
-      "removed": 0,
-      "symbol": "Commands",
-      "kind": "enum",
-      "body": "+    /// Show uncommitted changes.\n+    Diff { ... }\n"
-    }
-  ]
-}
+```text
+diff src/cli.rs
+M src/cli.rs +12 -0 • rust
+@@ -320-320 +321-332 • +12 -0 • Commands(enum)
++    /// Show uncommitted changes.
++    Diff { ... }
 ```
 
 Each hunk's `symbol` / `kind` is the innermost parsed symbol that contains the hunk (Rust/TS/TSX/Python/Kotlin/Prisma only). Multi-symbol hunks include a `spans: [...]` field listing every overlapping qualname. Pure deletions still get annotated ~ the HEAD-side blob is fetched via `git show` and parsed in-memory (no cache write).
@@ -308,9 +277,9 @@ Token efficiency: a typical pre-commit review (overview ≈ 0.5 KB + one or two 
 
 ### `cache [status|path|clear]`
 
-`outline`, `symbol`, `search`, and `find` automatically persist the parsed symbols of every file they touch, keyed on `(repo-relative path, mtime, size, language)`. Subsequent invocations stat the same files (~30ms for a 3.6k-file repo), reuse cached symbols when nothing changed, and only re-read + re-parse the few files that actually moved. On a 3.6k-file tree this turns a 3.5s cold sweep into a ~140ms warm one.
+`outline`, `symbol`, `search`, and `find` automatically persist the parsed symbols of every file they touch, keyed on `(repo-relative path, mtime, size, language)`. Subsequent invocations stat the same files, reuse cached symbols when nothing changed, and only re-read + re-parse the few files that actually moved. Single-file commands fetch just that file's cache row; full-repo walks reuse the same indexed store.
 
-Cache file lives at `${HITAGI_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}}/hitagi/<repo-hash>/index.v1.bin` (one file per repo, bincode-serialized). Failures (missing dir, corrupt file, version mismatch) silently fall back to a cold parse ~ a stale cache will never break a command.
+Cache database lives at `${HITAGI_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}}/hitagi/<repo-hash>/index.v3.sqlite` (one SQLite database per repo; symbols are bincode-serialized per file row). Failures (missing dir, corrupt file, version mismatch) silently fall back to a cold parse ~ a stale cache will never break a command.
 
 ```bash
 hitagi cache              # alias for `cache status`
@@ -320,19 +289,19 @@ hitagi cache clear        # delete this repo's cache subdir
 hitagi cache clear --all  # nuke every repo's cache
 ```
 
-`status` (default) returns:
+With `--json`, `status` returns:
 
 ```json
 {
   "enabled": true,
   "disabled_via_env": false,
-  "current_version": "v1-0.1.0",
+  "current_version": "v3-0.1.0",
   "cache_dir": "/home/user/.cache/hitagi/abc123def4567890",
-  "cache_file": "/home/user/.cache/hitagi/abc123def4567890/index.v1.bin",
+  "cache_file": "/home/user/.cache/hitagi/abc123def4567890/index.v3.sqlite",
   "exists": true,
   "size_bytes": 7324880,
   "modified_unix_secs": 1714728000,
-  "stored_version": "v1-0.1.0",
+  "stored_version": "v3-0.1.0",
   "stored_repo_root": "/home/user/code/myrepo",
   "version_match": true,
   "repo_root_match": true,

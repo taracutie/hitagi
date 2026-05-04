@@ -5,6 +5,7 @@ mod error;
 mod git;
 mod lang;
 mod models;
+mod output;
 mod parser;
 mod queries;
 mod repo;

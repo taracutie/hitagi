@@ -938,6 +938,7 @@ pub fn diff_overview(repo: &RepoRoot, opts: DiffOptions) -> AppResult<DiffOvervi
                     path: new_path,
                     status: entry.status.to_string(),
                     old_path: Some(old_path),
+                    old_path_needs_prefix: false,
                     added: numstat.and_then(|n| n.added),
                     removed: numstat.and_then(|n| n.removed),
                     staged,
@@ -956,6 +957,7 @@ pub fn diff_overview(repo: &RepoRoot, opts: DiffOptions) -> AppResult<DiffOvervi
                     path: new_path,
                     status: entry.status.to_string(),
                     old_path: None,
+                    old_path_needs_prefix: false,
                     added: numstat.and_then(|n| n.added),
                     removed: numstat.and_then(|n| n.removed),
                     staged,
@@ -976,6 +978,7 @@ pub fn diff_overview(repo: &RepoRoot, opts: DiffOptions) -> AppResult<DiffOvervi
                     path: new_path,
                     status: "A".to_string(),
                     old_path: None,
+                    old_path_needs_prefix: false,
                     added: None,
                     removed: None,
                     staged,
@@ -1006,6 +1009,7 @@ pub fn diff_overview(repo: &RepoRoot, opts: DiffOptions) -> AppResult<DiffOvervi
                     path: old_path,
                     status: "D".to_string(),
                     old_path: None,
+                    old_path_needs_prefix: false,
                     added: None,
                     removed: None,
                     staged,
@@ -1032,6 +1036,7 @@ pub fn diff_overview(repo: &RepoRoot, opts: DiffOptions) -> AppResult<DiffOvervi
             path: repo_path,
             status: UNTRACKED_STATUS.to_string(),
             old_path: None,
+            old_path_needs_prefix: false,
             added: None,
             removed: None,
             staged: false,
@@ -1053,7 +1058,10 @@ pub fn diff_overview(repo: &RepoRoot, opts: DiffOptions) -> AppResult<DiffOvervi
         for f in &mut summaries {
             f.path = strip_prefix(&f.path, &prefix);
             if let Some(op) = f.old_path.as_mut() {
-                *op = strip_prefix(op, &prefix);
+                if let Some(stripped) = op.strip_prefix(&prefix) {
+                    *op = stripped.to_string();
+                    f.old_path_needs_prefix = true;
+                }
             }
         }
     }

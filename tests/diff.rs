@@ -99,10 +99,26 @@ impl DiffRepo {
             .env("HITAGI_CACHE_DIR", &self.cache_dir)
             .arg("--repo")
             .arg(&self.repo)
+            .arg("--json")
             .args(args)
             .assert()
             .failure();
         String::from_utf8(assert.get_output().stderr.clone()).unwrap()
+    }
+
+    fn run_text(&self, args: &[&str]) -> String {
+        let stdout = Command::cargo_bin("hitagi")
+            .unwrap()
+            .env("HITAGI_CACHE_DIR", &self.cache_dir)
+            .arg("--repo")
+            .arg(&self.repo)
+            .args(args)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        String::from_utf8(stdout).unwrap()
     }
 }
 
@@ -118,6 +134,7 @@ fn run_in(repo: &Path, cache_dir: &Path, args: &[&str]) -> Value {
         .env("HITAGI_CACHE_DIR", cache_dir)
         .arg("--repo")
         .arg(repo)
+        .arg("--json")
         .args(args)
         .assert()
         .success()
@@ -177,7 +194,10 @@ fn overview_lists_modified_added_deleted() {
 #[test]
 fn overview_detects_rename() {
     let r = DiffRepo::new("rename");
-    r.write("orig.rs", "pub fn original_function_with_some_body() {\n    println!(\"hi\");\n}\n");
+    r.write(
+        "orig.rs",
+        "pub fn original_function_with_some_body() {\n    println!(\"hi\");\n}\n",
+    );
     r.commit("base");
     r.git(&["mv", "orig.rs", "renamed.rs"]);
 
@@ -462,7 +482,10 @@ fn drilldown_deleted_file_returns_status_d_no_hunks_with_note() {
 #[test]
 fn drilldown_deleted_file_annotates_with_head_blob_symbols() {
     let r = DiffRepo::new("drill-delete-symbol");
-    r.write("gone.rs", "pub fn alpha() {\n    let x = 1;\n}\n\npub fn beta() {\n    let y = 2;\n}\n");
+    r.write(
+        "gone.rs",
+        "pub fn alpha() {\n    let x = 1;\n}\n\npub fn beta() {\n    let y = 2;\n}\n",
+    );
     r.commit("base");
     r.rm("gone.rs");
 
@@ -470,10 +493,7 @@ fn drilldown_deleted_file_annotates_with_head_blob_symbols() {
     assert_eq!(v["status"], "D");
     let hunks = v["hunks"].as_array().unwrap();
     // For pure deletions the hunks should annotate with HEAD-side symbols.
-    let symbols: Vec<&str> = hunks
-        .iter()
-        .filter_map(|h| h["symbol"].as_str())
-        .collect();
+    let symbols: Vec<&str> = hunks.iter().filter_map(|h| h["symbol"].as_str()).collect();
     assert!(symbols.iter().any(|s| *s == "alpha" || *s == "beta"));
 }
 
@@ -496,11 +516,17 @@ fn drilldown_added_file_emits_full_addition_hunk() {
 #[test]
 fn drilldown_renamed_file_includes_old_path_and_hunks() {
     let r = DiffRepo::new("drill-rename");
-    r.write("orig.rs", "pub fn lots_of_content() {\n    let a = 1;\n    let b = 2;\n    let c = 3;\n}\n");
+    r.write(
+        "orig.rs",
+        "pub fn lots_of_content() {\n    let a = 1;\n    let b = 2;\n    let c = 3;\n}\n",
+    );
     r.commit("base");
     r.git(&["mv", "orig.rs", "renamed.rs"]);
     // Tweak content so it's not a 100% rename.
-    r.write("renamed.rs", "pub fn lots_of_content() {\n    let a = 1;\n    let b = 2;\n    let CHANGED = 99;\n}\n");
+    r.write(
+        "renamed.rs",
+        "pub fn lots_of_content() {\n    let a = 1;\n    let b = 2;\n    let CHANGED = 99;\n}\n",
+    );
 
     let v = r.run(&["diff", "renamed.rs"]);
     assert_eq!(v["status"], "R");
@@ -679,7 +705,11 @@ fn monorepo_subdir_filters_to_cwd_subtree_only() {
         .iter()
         .map(|f| f["path"].as_str().unwrap())
         .collect();
-    assert_eq!(paths.len(), 1, "only project-a's change should appear: {paths:?}");
+    assert_eq!(
+        paths.len(),
+        1,
+        "only project-a's change should appear: {paths:?}"
+    );
     assert!(paths[0].ends_with("lib.rs"));
     let note = v["note"].as_str().expect("filter note should be set");
     assert!(note.contains("project-a"));
@@ -687,7 +717,11 @@ fn monorepo_subdir_filters_to_cwd_subtree_only() {
 
     // Drilling deeper (project-b/src) also filters correctly ~ shared/, root,
     // and other projects are all out of the subtree.
-    let v = run_in(&r.repo.join("project-b").join("src"), &r.cache_dir, &["diff"]);
+    let v = run_in(
+        &r.repo.join("project-b").join("src"),
+        &r.cache_dir,
+        &["diff"],
+    );
     let paths: Vec<&str> = v["files"]
         .as_array()
         .unwrap()
@@ -707,11 +741,23 @@ fn monorepo_subdir_filters_to_cwd_subtree_only() {
 #[test]
 fn monorepo_subdir_drilldown_finds_path_via_repo_relative_form() {
     let r = DiffRepo::new("monorepo-drill");
-    r.write("project-a/src/lib.rs", "pub fn alpha() {\n    let x = 1;\n}\n");
-    r.write("project-b/src/lib.rs", "pub fn beta() {\n    let y = 2;\n}\n");
+    r.write(
+        "project-a/src/lib.rs",
+        "pub fn alpha() {\n    let x = 1;\n}\n",
+    );
+    r.write(
+        "project-b/src/lib.rs",
+        "pub fn beta() {\n    let y = 2;\n}\n",
+    );
     r.commit("base");
-    r.write("project-a/src/lib.rs", "pub fn alpha() {\n    let x = 11;\n}\n");
-    r.write("project-b/src/lib.rs", "pub fn beta() {\n    let y = 22;\n}\n");
+    r.write(
+        "project-a/src/lib.rs",
+        "pub fn alpha() {\n    let x = 11;\n}\n",
+    );
+    r.write(
+        "project-b/src/lib.rs",
+        "pub fn beta() {\n    let y = 22;\n}\n",
+    );
 
     // From project-a/, the repo-relative path is `src/lib.rs` (not
     // `project-a/src/lib.rs`).
@@ -761,7 +807,10 @@ fn monorepo_cross_subtree_rename_arrives_as_added_with_note() {
         .find(|f| f["path"].as_str().unwrap().ends_with("x_arrived.rs"))
         .expect("arrived file should appear");
     assert_eq!(entry["status"], "A");
-    assert!(entry.get("old_path").is_none(), "old_path is leaked toplevel");
+    assert!(
+        entry.get("old_path").is_none(),
+        "old_path is leaked toplevel"
+    );
     let note = entry["note"]
         .as_str()
         .expect("cross-subtree rename should carry a note");
@@ -802,11 +851,7 @@ fn monorepo_cross_subtree_rename_drilldown_shows_deletion_diff() {
     r.commit("base");
     r.git(&["mv", "lib/src/x.rs", "libfoo/src/x_arrived.rs"]);
 
-    let v = run_in(
-        &r.repo.join("lib"),
-        &r.cache_dir,
-        &["diff", "src/x.rs"],
-    );
+    let v = run_in(&r.repo.join("lib"), &r.cache_dir, &["diff", "src/x.rs"]);
     assert_eq!(v["status"], "D");
     let hunks = v["hunks"].as_array().unwrap();
     assert!(!hunks.is_empty());
@@ -840,31 +885,67 @@ fn monorepo_subdir_with_substring_sibling_does_not_leak() {
         .iter()
         .map(|f| f["path"].as_str().unwrap())
         .collect();
-    assert_eq!(paths.len(), 1, "lib/ subtree should not match libfoo/library");
+    assert_eq!(
+        paths.len(),
+        1,
+        "lib/ subtree should not match libfoo/library"
+    );
     assert!(paths[0].ends_with("x.rs"));
     let note = v["note"].as_str().expect("filter note should be set");
     assert!(note.contains("2 file"));
 }
 
 #[test]
-fn pretty_flag_indents_diff_output() {
-    let r = DiffRepo::new("pretty");
+fn default_diff_output_is_concise_text() {
+    let r = DiffRepo::new("text");
     r.write("a.rs", "pub fn a() {}\n");
     r.commit("base");
     r.write("a.rs", "pub fn aa() {}\n");
 
-    let stdout = Command::cargo_bin("hitagi")
-        .unwrap()
-        .env("HITAGI_CACHE_DIR", &r.cache_dir)
-        .arg("--repo")
-        .arg(&r.repo)
-        .arg("--pretty")
-        .args(["diff"])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let text = String::from_utf8(stdout).unwrap();
-    assert!(text.contains("\n  "), "pretty output should be indented");
+    let text = r.run_text(&["diff"]);
+    assert!(text.starts_with("diff"));
+    assert!(text.contains("1 files"));
+    assert!(text.contains("M a.rs"));
+    assert!(text.contains("• unstaged"));
+    assert!(
+        serde_json::from_str::<Value>(&text).is_err(),
+        "default diff output should not be JSON"
+    );
+}
+
+#[test]
+fn default_diff_text_renders_rename_origins_with_correct_prefixing() {
+    let cross = DiffRepo::new("text-cross-dir-rename");
+    cross.write("a/foo.rs", "pub fn foo() {}\n");
+    cross.commit("base");
+    std::fs::create_dir_all(cross.repo.join("b")).unwrap();
+    cross.git(&["mv", "a/foo.rs", "b/foo.rs"]);
+
+    let text = cross.run_text(&["diff"]);
+    assert!(text.contains("R b/foo.rs"), "{text}");
+    assert!(text.contains("← a/foo.rs"), "{text}");
+    assert!(!text.contains("← b/a/foo.rs"), "{text}");
+
+    let same = DiffRepo::new("text-same-prefix-rename");
+    same.write("src/orig.rs", "pub fn foo() {}\n");
+    same.commit("base");
+    same.git(&["mv", "src/orig.rs", "src/renamed.rs"]);
+
+    let text = same.run_text(&["diff"]);
+    assert!(text.contains("R src/renamed.rs"), "{text}");
+    assert!(text.contains("← src/orig.rs"), "{text}");
+    assert!(!text.contains("← orig.rs"), "{text}");
+}
+
+#[test]
+fn default_diff_file_output_shows_hunks_as_text() {
+    let r = DiffRepo::new("file-text");
+    r.write("a.rs", "pub fn a() {}\n");
+    r.commit("base");
+    r.write("a.rs", "pub fn aa() {}\n");
+
+    let text = r.run_text(&["diff", "a.rs"]);
+    assert!(text.starts_with("diff a.rs"));
+    assert!(text.contains("@@"));
+    assert!(text.contains("+pub fn aa()"));
 }

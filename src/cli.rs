@@ -1,7 +1,6 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use serde::Serialize;
 
 use crate::{
     commands::{
@@ -9,6 +8,7 @@ use crate::{
         ReadOptions, SearchOptions, SymbolOptions,
     },
     error::{AppError, AppResult},
+    output::{self, OutputMode},
     repo::RepoRoot,
 };
 
@@ -19,8 +19,8 @@ const DEFAULT_FILES_LIMIT: usize = 2000;
 const LONG_ABOUT: &str = "\
 hitagi is a local CLI for tree-sitter-backed structural code queries, built for LLM \
 coding agents (Claude Code, Codex, etc.) to navigate a codebase token-efficiently. \
-Every command parses on demand, prints compact JSON to stdout, and exits ~ no daemon, \
-no network, no auth.
+Every command parses on demand, prints concise text to stdout, and exits ~ no daemon, \
+no network, no auth. Pass --json for machine-readable output.
 
 PRINCIPLE
   Minimize tokens spent reading code. Use outline / find / search to locate the right \
@@ -51,9 +51,9 @@ const AFTER_LONG_HELP: &str = "\
 TIPS
 
   Token-efficient defaults
-    Compact JSON to stdout. Use --pretty only when a human is reading. Outline omits
-    start_byte/end_byte and parent (derivable from qualname); pass --bytes only when
-    you actually need byte offsets.
+    Concise text to stdout by default. Use --json for machine-readable compact
+    JSON. Outline omits start_byte/end_byte and parent (derivable from qualname);
+    pass --bytes only when you actually need byte offsets.
 
   Path resolution
     File path is repo-relative (e.g. src/auth.ts) OR a unique repo-internal suffix
@@ -218,7 +218,7 @@ ANTI-PATTERNS (token waste)
                                            # need byte offsets ~ they ~double the
                                            # output size.
 
-OUTPUT SHAPES (compact form ~ omitted optional fields appear only when set)
+JSON OUTPUT SHAPES (--json; compact form ~ omitted optional fields appear only when set)
 
   outline   {\"language\":\"rust\",\"symbols\":[{\"kind\":\"...\",\"name\":\"...\",
             \"qualname\":\"...\",\"lines\":[s,e]}],\"available_kinds\":[...]?}
@@ -277,9 +277,9 @@ struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     repo: Option<PathBuf>,
 
-    /// Pretty-print JSON output (indented). Default is compact.
+    /// Emit compact JSON instead of the default concise text output.
     #[arg(long, global = true)]
-    pretty: bool,
+    json: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -463,6 +463,11 @@ enum CacheAction {
 
 pub fn run() -> AppResult<()> {
     let cli = Cli::parse();
+    let mode = if cli.json {
+        OutputMode::Json
+    } else {
+        OutputMode::Text
+    };
     let repo_root = resolve_repo_root(cli.repo)?;
     let repo = RepoRoot::new(repo_root);
 
@@ -478,7 +483,8 @@ pub fn run() -> AppResult<()> {
                 kinds: kind,
                 depth,
             };
-            print_json(&commands::outline(&repo, &path, opts)?, cli.pretty)
+            let response = commands::outline(&repo, &path, opts)?;
+            output::print_outline(&path, &response, mode)
         }
         Commands::Symbol {
             path,
@@ -486,10 +492,8 @@ pub fn run() -> AppResult<()> {
             bytes,
         } => {
             let opts = SymbolOptions { bytes };
-            print_json(
-                &commands::symbol(&repo, &path, &qualname, opts)?,
-                cli.pretty,
-            )
+            let response = commands::symbol(&repo, &path, &qualname, opts)?;
+            output::print_symbol(&path, &response, mode)
         }
         Commands::Search {
             query,
@@ -504,13 +508,15 @@ pub fn run() -> AppResult<()> {
                 limit,
                 snippet,
             };
-            print_json(&commands::search(&repo, &query, opts)?, cli.pretty)
+            let response = commands::search(&repo, &query, opts)?;
+            output::print_search(&query, &response, mode)
         }
         Commands::Read { path, lines } => {
             let opts = ReadOptions {
                 lines: lines.as_deref().map(parse_lines).transpose()?,
             };
-            print_json(&commands::read_file(&repo, &path, opts)?, cli.pretty)
+            let response = commands::read_file(&repo, &path, opts)?;
+            output::print_read(&path, &response, mode)
         }
         Commands::Find {
             query,
@@ -533,7 +539,8 @@ pub fn run() -> AppResult<()> {
                 terse,
                 per_file,
             };
-            print_json(&commands::find(&repo, &query, opts)?, cli.pretty)
+            let response = commands::find(&repo, &query, opts)?;
+            output::print_find(&query, &response, mode)
         }
         Commands::Files {
             globs,
@@ -545,14 +552,25 @@ pub fn run() -> AppResult<()> {
                 excludes: exclude,
                 limit,
             };
-            print_json(&commands::files(&repo, opts)?, cli.pretty)
+            let response = commands::files(&repo, opts)?;
+            output::print_files(&response, mode)
         }
-        Commands::Langs => print_json(&commands::langs(&repo)?, cli.pretty),
+        Commands::Langs => {
+            let response = commands::langs(&repo)?;
+            output::print_langs(&response, mode)
+        }
         Commands::Cache { action } => match action.unwrap_or(CacheAction::Status) {
-            CacheAction::Status => print_json(&commands::cache_status(&repo), cli.pretty),
-            CacheAction::Path => print_json(&commands::cache_path(&repo), cli.pretty),
+            CacheAction::Status => {
+                let response = commands::cache_status(&repo);
+                output::print_cache_status(&response, mode)
+            }
+            CacheAction::Path => {
+                let response = commands::cache_path(&repo);
+                output::print_cache_path(&response, mode)
+            }
             CacheAction::Clear { all } => {
-                print_json(&commands::cache_clear(&repo, all)?, cli.pretty)
+                let response = commands::cache_clear(&repo, all)?;
+                output::print_cache_clear(&response, mode)
             }
         },
         Commands::Diff {
@@ -577,10 +595,14 @@ pub fn run() -> AppResult<()> {
                 excludes: exclude,
             };
             match path {
-                None => print_json(&commands::diff_overview(&repo, opts)?, cli.pretty),
+                None => {
+                    let response = commands::diff_overview(&repo, opts)?;
+                    output::print_diff_overview(&response, mode)
+                }
                 Some(p) => {
                     let drill = DiffFileOptions { symbol, raw };
-                    print_json(&commands::diff_file(&repo, &p, opts, drill)?, cli.pretty)
+                    let response = commands::diff_file(&repo, &p, opts, drill)?;
+                    output::print_diff_file(&p, &response, mode)
                 }
             }
         }
@@ -623,15 +645,4 @@ fn parse_lines(spec: &str) -> AppResult<(usize, usize)> {
         AppError::bad_request(format!("--lines end is not a positive integer: {end}"))
     })?;
     Ok((start, end))
-}
-
-fn print_json<T: Serialize>(value: &T, pretty: bool) -> AppResult<()> {
-    let serialized = if pretty {
-        serde_json::to_string_pretty(value)
-    } else {
-        serde_json::to_string(value)
-    }
-    .map_err(|error| AppError::internal(format!("failed to serialize response: {error}")))?;
-    println!("{serialized}");
-    Ok(())
 }

@@ -249,6 +249,10 @@ pub struct DiffFileSummary {
     /// endpoints fall inside the hitagi repo subtree.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub old_path: Option<String>,
+    /// Text-rendering hint: true when `old_path` had the overview `prefix`
+    /// stripped and needs it restored for display.
+    #[serde(skip_serializing)]
+    pub old_path_needs_prefix: bool,
     /// Lines added (numstat). Omitted for binary files (numstat returns `-`),
     /// untracked files, and cross-subtree-rename synthesized entries.
     #[serde(skip_serializing_if = "Option::is_none")]

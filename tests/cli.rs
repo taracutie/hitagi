@@ -34,6 +34,7 @@ fn run_in(repo: &Path, cache_dir: &Path, args: &[&str]) -> Value {
         .env("HITAGI_CACHE_DIR", cache_dir)
         .arg("--repo")
         .arg(repo)
+        .arg("--json")
         .args(args)
         .assert()
         .success()
@@ -53,6 +54,21 @@ fn run_failure(args: &[&str]) -> String {
         .assert()
         .failure();
     String::from_utf8(assert.get_output().stderr.clone()).unwrap()
+}
+
+fn run_text(args: &[&str]) -> String {
+    let stdout = Command::cargo_bin("hitagi")
+        .unwrap()
+        .env("HITAGI_CACHE_DIR", shared_cache_dir())
+        .arg("--repo")
+        .arg(fixture_repo())
+        .args(args)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    String::from_utf8(stdout).unwrap()
 }
 
 /// Collect all `matches` entries from a find response, flat or grouped. The
@@ -135,12 +151,20 @@ fn flatten_search_keys(value: &Value) -> Vec<String> {
 fn count_search_matches(value: &Value) -> usize {
     let mut total = 0usize;
     if let Some(o) = value["results"].as_object() {
-        total += o.values().filter_map(|v| v.as_array()).map(|a| a.len()).sum::<usize>();
+        total += o
+            .values()
+            .filter_map(|v| v.as_array())
+            .map(|a| a.len())
+            .sum::<usize>();
     }
     if let Some(groups) = value.get("groups").and_then(|v| v.as_array()) {
         for g in groups {
             if let Some(o) = g["results"].as_object() {
-                total += o.values().filter_map(|v| v.as_array()).map(|a| a.len()).sum::<usize>();
+                total += o
+                    .values()
+                    .filter_map(|v| v.as_array())
+                    .map(|a| a.len())
+                    .sum::<usize>();
             }
         }
     }
@@ -739,13 +763,60 @@ fn find_terse_with_snippet_appends_signature() {
 }
 
 #[test]
-fn pretty_flag_indents_output() {
+fn default_outline_output_is_concise_text() {
+    let text = run_text(&["outline", "src/auth.ts"]);
+    assert!(text.starts_with("outline src/auth.ts"));
+    assert!(text.contains("typescript •"));
+    assert!(text.contains("• L1-11 class AuthService"));
+    assert!(
+        serde_json::from_str::<Value>(&text).is_err(),
+        "default output should not be JSON"
+    );
+}
+
+#[test]
+fn default_find_output_is_concise_text() {
+    let text = run_text(&["find", "AuthService", "--snippet"]);
+    assert!(text.starts_with("find \"AuthService\""));
+    assert!(text.contains("matches •"));
+    assert!(text.contains("• src/auth.ts:L1-11 class AuthService"));
+    assert!(text.contains(":: class AuthService {"));
+}
+
+#[test]
+fn default_search_output_groups_matches_as_text() {
+    let text = run_text(&["search", "Button", "--snippet", "--limit", "5"]);
+    assert!(text.starts_with("search \"Button\""));
+    assert!(text.contains("apps/desktop/src/components/Button.tsx"));
+    assert!(text.contains("packages/mobile/src/components/Button.tsx"));
+    assert!(text.contains("• DesktopButton(function) @L1"));
+}
+
+#[test]
+fn default_read_output_prints_content_verbatim() {
+    let text = run_text(&["read", "src/auth.ts", "--lines", "1-2"]);
+    assert!(text.starts_with("read src/auth.ts"));
+    assert!(text.contains("typescript • L1-2"));
+    assert!(text.contains("\n\nexport class AuthService {\n  handleAuth"));
+}
+
+#[test]
+fn default_langs_output_is_text_table() {
+    let text = run_text(&["langs"]);
+    assert!(text.starts_with("languages"));
+    assert!(text.contains("rust"));
+    assert!(text.contains("parseable"));
+    assert!(serde_json::from_str::<Value>(&text).is_err());
+}
+
+#[test]
+fn json_flag_emits_compact_json() {
     let stdout = Command::cargo_bin("hitagi")
         .unwrap()
         .env("HITAGI_CACHE_DIR", shared_cache_dir())
         .arg("--repo")
         .arg(fixture_repo())
-        .arg("--pretty")
+        .arg("--json")
         .args(["outline", "src/auth.ts"])
         .assert()
         .success()
@@ -753,7 +824,30 @@ fn pretty_flag_indents_output() {
         .stdout
         .clone();
     let text = String::from_utf8(stdout).unwrap();
-    assert!(text.contains("\n  "), "pretty output should be indented");
+    let value: Value = serde_json::from_str(&text).expect("--json stdout should parse");
+    assert_eq!(value["language"], "typescript");
+    assert!(
+        !text.contains("\n  "),
+        "--json should stay compact rather than pretty-printed"
+    );
+}
+
+#[test]
+fn pretty_flag_is_removed() {
+    let stderr = Command::cargo_bin("hitagi")
+        .unwrap()
+        .env("HITAGI_CACHE_DIR", shared_cache_dir())
+        .arg("--repo")
+        .arg(fixture_repo())
+        .arg("--pretty")
+        .args(["outline", "src/auth.ts"])
+        .assert()
+        .failure()
+        .get_output()
+        .stderr
+        .clone();
+    let text = String::from_utf8(stderr).unwrap();
+    assert!(text.contains("unexpected argument '--pretty'") || text.contains("unknown argument"));
 }
 
 #[test]
@@ -779,7 +873,8 @@ fn long_help_includes_llm_prompt_sections() {
         "TIPS",
         "COMMON PATTERNS",
         "ANTI-PATTERNS",
-        "OUTPUT SHAPES",
+        "JSON OUTPUT SHAPES",
+        "--json",
     ] {
         assert!(
             text.contains(needle),
@@ -968,6 +1063,7 @@ fn cache_status_reports_disabled_when_no_cache_root_can_be_resolved() {
         .env_remove("HITAGI_NO_CACHE")
         .arg("--repo")
         .arg(&scratch.repo)
+        .arg("--json")
         .args(["cache", "status"])
         .assert()
         .success()
@@ -996,6 +1092,7 @@ fn cache_ignores_empty_xdg_cache_home_and_falls_back_to_home() {
         .env_remove("HITAGI_NO_CACHE")
         .arg("--repo")
         .arg(&scratch.repo)
+        .arg("--json")
         .args(["cache", "path"])
         .assert()
         .success()
@@ -1031,6 +1128,7 @@ fn cache_clear_all_ignores_relative_xdg_cache_home() {
         .env_remove("HITAGI_NO_CACHE")
         .arg("--repo")
         .arg(&scratch.repo)
+        .arg("--json")
         .args(["cache", "clear", "--all"])
         .assert()
         .success()
@@ -1066,6 +1164,7 @@ fn relative_hitagi_cache_dir_disables_cache_resolution() {
         .env_remove("HITAGI_NO_CACHE")
         .arg("--repo")
         .arg(&scratch.repo)
+        .arg("--json")
         .args(["cache", "clear", "--all"])
         .assert()
         .success()
@@ -1202,6 +1301,7 @@ fn no_cache_env_disables_persistence() {
         .env("HITAGI_NO_CACHE", "1")
         .arg("--repo")
         .arg(&scratch.repo)
+        .arg("--json")
         .args(["find", "keep_me"])
         .assert()
         .success()
@@ -1265,7 +1365,10 @@ fn outline_auto_summarizes_when_symbol_count_exceeds_threshold() {
     assert_eq!(value["total_symbols"], 600);
     assert_eq!(value["auto_summarized"], true);
     assert!(
-        value["note"].as_str().unwrap().contains("auto-applied --depth 1"),
+        value["note"]
+            .as_str()
+            .unwrap()
+            .contains("auto-applied --depth 1"),
         "expected auto-summary note, got {:?}",
         value["note"]
     );
@@ -1453,11 +1556,7 @@ fn find_per_file_caps_matches_and_reports_overflow() {
     let suppressed: u64 = value["more_in_file"]
         .as_object()
         .or_else(|| {
-            value
-                .get("groups")
-                .and_then(|g| g.as_array())?
-                .first()?["more_in_file"]
-                .as_object()
+            value.get("groups").and_then(|g| g.as_array())?.first()?["more_in_file"].as_object()
         })
         .expect("more_in_file should be set when --per-file capped a file")
         .values()
@@ -1498,7 +1597,10 @@ fn find_groups_results_when_matches_span_top_levels() {
         .as_array()
         .expect("groups should be present when matches span top-levels");
     assert_eq!(groups.len(), 2);
-    let prefixes: Vec<&str> = groups.iter().map(|g| g["prefix"].as_str().unwrap()).collect();
+    let prefixes: Vec<&str> = groups
+        .iter()
+        .map(|g| g["prefix"].as_str().unwrap())
+        .collect();
     assert!(prefixes.contains(&"aaa/"));
     assert!(prefixes.contains(&"bbb/"));
 }
