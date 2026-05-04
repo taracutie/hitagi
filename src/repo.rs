@@ -162,40 +162,19 @@ fn resolve_path_by_suffix(
     kind: PathKind,
 ) -> AppResult<ResolvedPath> {
     let requested_components = requested_components(relative_path);
-    let mut matches = Vec::new();
-    let mut matches_truncated = false;
 
-    let walker = WalkBuilder::new(repo_root)
-        .hidden(false)
-        .git_ignore(false)
-        .git_global(false)
-        .git_exclude(false)
-        .follow_links(false)
-        .build();
-
-    for entry in walker.flatten() {
-        let Some(file_type) = entry.file_type() else {
-            continue;
-        };
-
-        if !kind.matches(file_type) {
-            continue;
-        }
-
-        let full_path = entry.into_path();
-        let candidate_relative = match relative_path_string(repo_root, &full_path) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-
-        if path_ends_with_components(&candidate_relative, &requested_components) {
-            if matches.len() == AMBIGUOUS_COLLECT_CAP {
-                matches_truncated = true;
-                break;
-            }
-            matches.push(candidate_relative);
-        }
-    }
+    // Two-pass walk: prefer matches the agent can actually edit (gitignore-
+    // respected). Only fall back to ignored matches when the respected walk
+    // returned nothing ~ this stops `outline schema.prisma` from listing
+    // node_modules/.prisma/client/schema.prisma as a fake ambiguity, while
+    // still letting suffix matching find legitimately-ignored fixtures.
+    let (matches, matches_truncated) =
+        walk_for_suffix(repo_root, kind, &requested_components, true);
+    let (mut matches, matches_truncated) = if matches.is_empty() {
+        walk_for_suffix(repo_root, kind, &requested_components, false)
+    } else {
+        (matches, matches_truncated)
+    };
 
     if matches.is_empty() {
         return Err(AppError::not_found(format!(
@@ -214,6 +193,59 @@ fn resolve_path_by_suffix(
     }
 
     resolved_path(repo_root, &repo_root.join(&matches[0]), relative_path)
+}
+
+/// Walk `repo_root` and collect repo-relative paths whose component suffix
+/// matches `requested_components`. `respect_ignores=true` skips files
+/// hidden by `.gitignore`/`.git/info/exclude` ~ same flags used by the
+/// top-level commands' walker (collect_search_files). `false` walks
+/// everything for fallback resolution. The bool result is true when the
+/// AMBIGUOUS_COLLECT_CAP was hit.
+fn walk_for_suffix(
+    repo_root: &Path,
+    kind: PathKind,
+    requested_components: &[String],
+    respect_ignores: bool,
+) -> (Vec<String>, bool) {
+    // .hidden(true) SKIPS dotfiles (default), .hidden(false) walks them.
+    // Original suffix resolver walked hidden + ignored; respected mode now
+    // mirrors collect_search_files (skip hidden, respect ignores).
+    let walker = WalkBuilder::new(repo_root)
+        .hidden(respect_ignores)
+        .git_ignore(respect_ignores)
+        .git_global(false)
+        .git_exclude(respect_ignores)
+        .follow_links(false)
+        .build();
+
+    let mut matches = Vec::new();
+    let mut matches_truncated = false;
+
+    for entry in walker.flatten() {
+        let Some(file_type) = entry.file_type() else {
+            continue;
+        };
+
+        if !kind.matches(file_type) {
+            continue;
+        }
+
+        let full_path = entry.into_path();
+        let candidate_relative = match relative_path_string(repo_root, &full_path) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+
+        if path_ends_with_components(&candidate_relative, requested_components) {
+            if matches.len() == AMBIGUOUS_COLLECT_CAP {
+                matches_truncated = true;
+                break;
+            }
+            matches.push(candidate_relative);
+        }
+    }
+
+    (matches, matches_truncated)
 }
 
 fn resolved_path(
@@ -420,9 +452,13 @@ mod tests {
     }
 
     #[test]
-    fn rejects_ambiguous_suffix_matches_in_ignored_paths() {
+    fn suffix_resolution_prefers_gitignore_respected_match() {
+        // Two files with the same basename ~ one in an ignored dir, one in a
+        // visible dir. Old behavior surfaced both as ambiguity (which left
+        // node_modules mirrors polluting the candidate list); new behavior
+        // prefers the visible match and resolves uniquely.
         let root = std::env::temp_dir().join(format!(
-            "hitagi-ignored-ambiguous-paths-{}",
+            "hitagi-suffix-prefers-visible-{}",
             std::process::id()
         ));
         if root.exists() {
@@ -435,12 +471,57 @@ mod tests {
         std::fs::write(root.join("visible/src/config.txt"), "").unwrap();
 
         let registry = RepoRoot::new(std::fs::canonicalize(&root).unwrap());
+        let resolved = registry.resolve_file("src/config.txt").unwrap();
+        assert_eq!(resolved.relative_path, "visible/src/config.txt");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn suffix_resolution_falls_back_to_ignored_when_no_visible_match() {
+        // Only an ignored copy exists ~ resolution must still find it so
+        // agents can address files that are gitignored on purpose (build
+        // outputs, fixtures inside an ignored vendor dir, etc.).
+        let root = std::env::temp_dir().join(format!(
+            "hitagi-suffix-falls-back-{}",
+            std::process::id()
+        ));
+        if root.exists() {
+            std::fs::remove_dir_all(&root).unwrap();
+        }
+        std::fs::create_dir_all(root.join("ignored/src")).unwrap();
+        std::fs::write(root.join(".gitignore"), "ignored/\n").unwrap();
+        std::fs::write(root.join("ignored/src/config.txt"), "body").unwrap();
+
+        let registry = RepoRoot::new(std::fs::canonicalize(&root).unwrap());
+        let resolved = registry.resolve_file("src/config.txt").unwrap();
+        assert_eq!(resolved.relative_path, "ignored/src/config.txt");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn suffix_ambiguity_still_surfaces_among_visible_matches() {
+        // Two visible matches ~ ambiguity is still real; both surface in the
+        // error. (The fallback path doesn't hide real ambiguity.)
+        let root = std::env::temp_dir().join(format!(
+            "hitagi-suffix-visible-ambiguity-{}",
+            std::process::id()
+        ));
+        if root.exists() {
+            std::fs::remove_dir_all(&root).unwrap();
+        }
+        std::fs::create_dir_all(root.join("alpha/src")).unwrap();
+        std::fs::create_dir_all(root.join("beta/src")).unwrap();
+        std::fs::write(root.join("alpha/src/config.txt"), "").unwrap();
+        std::fs::write(root.join("beta/src/config.txt"), "").unwrap();
+
+        let registry = RepoRoot::new(std::fs::canonicalize(&root).unwrap());
         let error = registry.resolve_file("src/config.txt").unwrap_err();
         let message = error.to_string();
-
         assert!(message.contains("path is ambiguous: src/config.txt"));
-        assert!(message.contains("ignored/src/config.txt"));
-        assert!(message.contains("visible/src/config.txt"));
+        assert!(message.contains("alpha/src/config.txt"));
+        assert!(message.contains("beta/src/config.txt"));
 
         std::fs::remove_dir_all(root).unwrap();
     }
