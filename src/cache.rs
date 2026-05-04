@@ -13,8 +13,11 @@ use crate::{lang::Language, models::SymbolInfo};
 // Bumping the crate version invalidates all caches ~ cheapest proxy for
 // "visitor logic in parser.rs may have changed shape". Schema bumps just
 // change the v<N> prefix. Mismatch on either falls back to an empty cache.
-const CACHE_VERSION_KEY: &str = concat!("v1-", env!("CARGO_PKG_VERSION"));
-const CACHE_FILE_NAME: &str = "index.v1.bin";
+//
+// v2 added `line_count` to FileEntry and started inserting lang-only entries
+// (symbols=empty) for non-parseable files so `langs` can serve from cache.
+const CACHE_VERSION_KEY: &str = concat!("v2-", env!("CARGO_PKG_VERSION"));
+const CACHE_FILE_NAME: &str = "index.v2.bin";
 
 #[derive(Serialize, Deserialize)]
 struct CacheFile {
@@ -29,6 +32,18 @@ struct FileEntry {
     mtime_nanos: u32,
     size: u64,
     language: Language,
+    /// Newline count of the file's content as last seen. Capped at u32::MAX
+    /// (no real source file approaches that). Both parsed entries and
+    /// lang-only stamps populate this so `langs` warm runs are O(stat).
+    #[serde(default)]
+    line_count: Option<u32>,
+    /// True when `symbols` came from `parse_source`. False when this entry
+    /// was stamped by `langs` (line_count only); the symbols vec is empty
+    /// in that case and the next outline/find/symbol call must re-parse.
+    /// Defaulting to false on legacy entries is safe: they get re-parsed
+    /// once and upgraded.
+    #[serde(default)]
+    parsed_for_symbols: bool,
     symbols: Vec<SymbolInfo>,
 }
 
@@ -96,7 +111,8 @@ impl ParseCache {
         }
     }
 
-    /// Returns cached symbols when (mtime, size, language) match. Records the
+    /// Returns cached symbols when (mtime, size, language) match AND the
+    /// stored entry was actually parsed (not a langs stamp). Records the
     /// path as seen either way ~ a "negative" lookup (miss) still counts as a
     /// path we walked, so prune doesn't drop entries we just couldn't reuse.
     pub fn lookup(
@@ -105,6 +121,33 @@ impl ParseCache {
         metadata: &Metadata,
         language: Language,
     ) -> Option<Vec<SymbolInfo>> {
+        let entry = self.lookup_entry(rel_path, metadata, language)?;
+        if !entry.parsed_for_symbols {
+            return None;
+        }
+        Some(entry.symbols.clone())
+    }
+
+    /// Returns the cached line count when (mtime, size, language) match.
+    /// Used by `langs` to skip re-reading every file's bytes on warm runs.
+    /// Lang-only entries (symbols.is_empty()) populate this for non-parseable
+    /// languages too.
+    pub fn lookup_line_count(
+        &mut self,
+        rel_path: &str,
+        metadata: &Metadata,
+        language: Language,
+    ) -> Option<u32> {
+        let entry = self.lookup_entry(rel_path, metadata, language)?;
+        entry.line_count
+    }
+
+    fn lookup_entry(
+        &mut self,
+        rel_path: &str,
+        metadata: &Metadata,
+        language: Language,
+    ) -> Option<&FileEntry> {
         if !self.enabled {
             return None;
         }
@@ -117,18 +160,54 @@ impl ParseCache {
             && entry.size == metadata.len()
             && entry.language == language
         {
-            Some(entry.symbols.clone())
+            Some(entry)
         } else {
             None
         }
     }
 
+    /// Insert a fully-parsed entry (symbols + line_count). Used by the
+    /// outline/find/symbol/search hot path; subsequent `lookup` calls return
+    /// the symbols vec.
     pub fn insert(
         &mut self,
         rel_path: String,
         metadata: &Metadata,
         language: Language,
+        line_count: Option<u32>,
         symbols: Vec<SymbolInfo>,
+    ) {
+        self.insert_entry(rel_path, metadata, language, line_count, symbols, true);
+    }
+
+    /// Insert a langs-only stamp: line_count without parsed symbols. The
+    /// next outline/find/symbol call for this path treats it as a cache
+    /// miss and re-parses, replacing this entry with a full one.
+    pub fn insert_lang_only(
+        &mut self,
+        rel_path: String,
+        metadata: &Metadata,
+        language: Language,
+        line_count: u32,
+    ) {
+        self.insert_entry(
+            rel_path,
+            metadata,
+            language,
+            Some(line_count),
+            Vec::new(),
+            false,
+        );
+    }
+
+    fn insert_entry(
+        &mut self,
+        rel_path: String,
+        metadata: &Metadata,
+        language: Language,
+        line_count: Option<u32>,
+        symbols: Vec<SymbolInfo>,
+        parsed_for_symbols: bool,
     ) {
         if !self.enabled {
             return;
@@ -144,6 +223,8 @@ impl ParseCache {
                 mtime_nanos: nanos,
                 size: metadata.len(),
                 language,
+                line_count,
+                parsed_for_symbols,
                 symbols,
             },
         );
@@ -521,6 +602,7 @@ mod tests {
                 "a.rs".to_string(),
                 &metadata,
                 Language::Rust,
+                None,
                 sample_symbols(),
             );
             cache.save(false);
@@ -543,6 +625,7 @@ mod tests {
             "a.rs".to_string(),
             &metadata,
             Language::Rust,
+            None,
             sample_symbols(),
         );
 
@@ -560,6 +643,7 @@ mod tests {
             "a.ts".to_string(),
             &metadata,
             Language::TypeScript,
+            None,
             sample_symbols(),
         );
         // Same path, same metadata, different language => miss (covers .ts -> .tsx).
@@ -577,6 +661,7 @@ mod tests {
                 "a.rs".to_string(),
                 &metadata,
                 Language::Rust,
+                None,
                 sample_symbols(),
             );
             cache.save(false);
@@ -585,7 +670,7 @@ mod tests {
         let cache_file = tmp.cache_file();
         let bytes = fs::read(&cache_file).unwrap();
         let mut decoded: CacheFile = bincode::deserialize(&bytes).unwrap();
-        decoded.version = "v1-9999.9.9".to_string();
+        decoded.version = "v2-9999.9.9".to_string();
         let rewritten = bincode::serialize(&decoded).unwrap();
         fs::write(&cache_file, &rewritten).unwrap();
 
@@ -604,6 +689,7 @@ mod tests {
                 "a.rs".to_string(),
                 &metadata,
                 Language::Rust,
+                None,
                 sample_symbols(),
             );
             cache.save(false);
@@ -628,8 +714,8 @@ mod tests {
 
         {
             let mut cache = tmp.open();
-            cache.insert("a.rs".to_string(), &m_a, Language::Rust, sample_symbols());
-            cache.insert("b.rs".to_string(), &m_b, Language::Rust, sample_symbols());
+            cache.insert("a.rs".to_string(), &m_a, Language::Rust, None, sample_symbols());
+            cache.insert("b.rs".to_string(), &m_b, Language::Rust, None, sample_symbols());
             cache.save(false);
         }
 
@@ -651,8 +737,8 @@ mod tests {
 
         {
             let mut cache = tmp.open();
-            cache.insert("a.rs".to_string(), &m_a, Language::Rust, sample_symbols());
-            cache.insert("b.rs".to_string(), &m_b, Language::Rust, sample_symbols());
+            cache.insert("a.rs".to_string(), &m_a, Language::Rust, None, sample_symbols());
+            cache.insert("b.rs".to_string(), &m_b, Language::Rust, None, sample_symbols());
             cache.save(false);
         }
 
@@ -674,6 +760,7 @@ mod tests {
             "a.rs".to_string(),
             &metadata,
             Language::Rust,
+            None,
             sample_symbols(),
         );
         assert!(cache.lookup("a.rs", &metadata, Language::Rust).is_none());
@@ -683,6 +770,111 @@ mod tests {
             !tmp.cache_file().exists(),
             "disabled cache must not write {:?}",
             tmp.cache_file()
+        );
+    }
+
+    #[test]
+    fn lookup_line_count_returns_stored_value() {
+        let tmp = CacheTmp::new("line-count");
+        let metadata = write_file(&tmp.repo_root, "a.rs", "fn foo() {}\nfn bar() {}\n");
+
+        {
+            let mut cache = tmp.open();
+            cache.insert(
+                "a.rs".to_string(),
+                &metadata,
+                Language::Rust,
+                Some(2),
+                sample_symbols(),
+            );
+            cache.save(false);
+        }
+
+        let mut cache = tmp.open();
+        assert_eq!(
+            cache.lookup_line_count("a.rs", &metadata, Language::Rust),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn lookup_line_count_misses_on_size_change() {
+        let tmp = CacheTmp::new("line-count-invalidate");
+        let metadata = write_file(&tmp.repo_root, "a.rs", "fn foo() {}\n");
+
+        let mut cache = tmp.open();
+        cache.insert(
+            "a.rs".to_string(),
+            &metadata,
+            Language::Rust,
+            Some(1),
+            sample_symbols(),
+        );
+
+        let bigger = write_file(&tmp.repo_root, "a.rs", "fn foo() {}\nfn bar() {}\n");
+        assert_eq!(
+            cache.lookup_line_count("a.rs", &bigger, Language::Rust),
+            None
+        );
+    }
+
+    #[test]
+    fn langs_only_stamp_does_not_satisfy_lookup() {
+        // When langs writes a line-count stamp for a parseable file, a
+        // later outline/find/symbol call must MISS the symbol lookup so it
+        // re-parses and writes a full entry. lookup_line_count still hits.
+        let tmp = CacheTmp::new("langs-stamp");
+        let metadata = write_file(&tmp.repo_root, "a.rs", "fn foo() {}\n");
+
+        let mut cache = tmp.open();
+        cache.insert_lang_only("a.rs".to_string(), &metadata, Language::Rust, 1);
+
+        assert_eq!(
+            cache.lookup_line_count("a.rs", &metadata, Language::Rust),
+            Some(1),
+            "lang-only stamp serves line counts"
+        );
+        assert!(
+            cache.lookup("a.rs", &metadata, Language::Rust).is_none(),
+            "lang-only stamp must NOT satisfy symbol lookup"
+        );
+
+        // After a real parse populates the entry, both lookups should hit.
+        cache.insert(
+            "a.rs".to_string(),
+            &metadata,
+            Language::Rust,
+            Some(1),
+            sample_symbols(),
+        );
+        assert_eq!(
+            cache.lookup_line_count("a.rs", &metadata, Language::Rust),
+            Some(1)
+        );
+        assert_eq!(
+            cache.lookup("a.rs", &metadata, Language::Rust),
+            Some(sample_symbols())
+        );
+    }
+
+    #[test]
+    fn lookup_line_count_returns_none_when_field_unset() {
+        // Forward-compat: an entry without line_count (Option::None) should
+        // miss the lookup so the caller falls back to reading the file.
+        let tmp = CacheTmp::new("line-count-missing");
+        let metadata = write_file(&tmp.repo_root, "a.rs", "fn foo() {}\n");
+
+        let mut cache = tmp.open();
+        cache.insert(
+            "a.rs".to_string(),
+            &metadata,
+            Language::Rust,
+            None,
+            sample_symbols(),
+        );
+        assert_eq!(
+            cache.lookup_line_count("a.rs", &metadata, Language::Rust),
+            None
         );
     }
 

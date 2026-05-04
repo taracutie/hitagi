@@ -63,10 +63,24 @@ pub struct OutputSymbolDetail {
 #[derive(Debug, Serialize)]
 pub struct OutlineResponse {
     pub language: String,
+    /// Total parsed symbols in the file BEFORE --depth/--kind filtering.
+    /// Lets the caller decide whether to drill in further on the next call.
+    pub total_symbols: usize,
+    /// Per-kind counts BEFORE --depth/--kind filtering. Same orientation use
+    /// as `available_kinds` but with the actual breakdown attached.
+    pub kind_counts: BTreeMap<String, usize>,
     pub symbols: Vec<OutputSymbol>,
     /// Set when --kind was passed but matched zero symbols ~ lists what was actually available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub available_kinds: Option<Vec<String>>,
+    /// True when the response was auto-summarized to --depth 1 because the
+    /// file had more symbols than the soft cap and the caller didn't pass
+    /// --depth/--kind/--bytes. Re-run with explicit --depth N to override.
+    #[serde(skip_serializing_if = "is_false", default)]
+    pub auto_summarized: bool,
+    /// Human-readable hint accompanying `auto_summarized`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -82,6 +96,12 @@ pub struct SearchResponse {
     pub results: BTreeMap<String, Vec<String>>,
     #[serde(skip_serializing_if = "is_false")]
     pub truncated: bool,
+    /// Top-level directories present in the walk root that the cap stopped
+    /// us from reaching. Only present when `truncated == true` AND the walk
+    /// missed at least one subtree ~ otherwise empty/omitted. Lets the
+    /// caller know when their --limit is producing a biased sample.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub unsampled_dirs: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -111,6 +131,11 @@ pub struct FindResponse {
     #[serde(skip_serializing_if = "is_false")]
     pub truncated: bool,
     pub searched_files: usize,
+    /// Top-level directories the walk never visited because the limit was
+    /// hit first. Only present when `truncated == true` AND at least one
+    /// subtree was skipped. Same intent as the field on SearchResponse.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub unsampled_dirs: Vec<String>,
     /// Set when --kind was passed but matched zero symbols ~ lists what was actually available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub available_kinds: Option<Vec<String>>,

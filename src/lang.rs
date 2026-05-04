@@ -24,6 +24,11 @@ pub enum Language {
     Css,
     Shell,
     Dockerfile,
+    /// Catch-all for unrecognized extensions. `Language::detect` does NOT
+    /// return this ~ it still errors so existing callers' `.ok()` paths are
+    /// unchanged. Cache callers that need to key plaintext files map their
+    /// own Err → Plaintext (see `commands::cache_line_count_for`).
+    Plaintext,
 }
 
 extern "C" {
@@ -94,6 +99,7 @@ impl Language {
             Self::Css => "css",
             Self::Shell => "shell",
             Self::Dockerfile => "dockerfile",
+            Self::Plaintext => "plaintext",
         }
     }
 

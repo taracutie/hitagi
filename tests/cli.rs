@@ -1155,3 +1155,241 @@ fn no_cache_env_disables_persistence() {
         "HITAGI_NO_CACHE must skip persistence; got {entries} entries in cache dir"
     );
 }
+
+#[test]
+fn outline_includes_total_symbols_and_kind_counts_always() {
+    let value = run(&["outline", "src/auth.ts"]);
+    assert!(
+        value.get("total_symbols").is_some(),
+        "outline response must include total_symbols"
+    );
+    assert!(
+        value.get("kind_counts").is_some(),
+        "outline response must include kind_counts"
+    );
+    let total = value["total_symbols"].as_u64().unwrap() as usize;
+    let symbols_len = value["symbols"].as_array().unwrap().len();
+    assert_eq!(
+        total, symbols_len,
+        "small file is not auto-summarized, so total_symbols == symbols.len()"
+    );
+    let kind_counts = value["kind_counts"].as_object().unwrap();
+    assert!(!kind_counts.is_empty());
+    let counted: u64 = kind_counts.values().map(|v| v.as_u64().unwrap()).sum();
+    assert_eq!(counted as usize, total);
+    assert!(
+        value.get("auto_summarized").is_none(),
+        "auto_summarized hidden when false"
+    );
+}
+
+#[test]
+fn outline_auto_summarizes_when_symbol_count_exceeds_threshold() {
+    let scratch = ScratchRepo::new("outline-auto-summary");
+    // Generate a Rust file with > 500 top-level functions ~ exceeds the
+    // OUTLINE_AUTO_SUMMARY_THRESHOLD (currently 500).
+    let mut body = String::new();
+    for i in 0..600 {
+        body.push_str(&format!("pub fn fn_{i:04}() {{}}\n"));
+    }
+    scratch.write("big.rs", &body);
+
+    let value = scratch.run(&["outline", "big.rs"]);
+    assert_eq!(value["language"], "rust");
+    assert_eq!(value["total_symbols"], 600);
+    assert_eq!(value["auto_summarized"], true);
+    assert!(
+        value["note"].as_str().unwrap().contains("auto-applied --depth 1"),
+        "expected auto-summary note, got {:?}",
+        value["note"]
+    );
+    let symbols_len = value["symbols"].as_array().unwrap().len();
+    assert_eq!(
+        symbols_len, 600,
+        "all 600 fns are top-level, so depth=1 keeps them all (auto-summary doesn't drop top-level entries)"
+    );
+}
+
+#[test]
+fn outline_auto_summary_collapses_nested_symbols() {
+    let scratch = ScratchRepo::new("outline-auto-summary-nested");
+    // 50 enums, each with 12 variants ~ 50 + 600 = 650 total symbols. Under
+    // depth=1, only the 50 enum entries should remain.
+    let mut body = String::new();
+    for i in 0..50 {
+        body.push_str(&format!("pub enum E{i:02} {{\n"));
+        for j in 0..12 {
+            body.push_str(&format!("    V{j:02},\n"));
+        }
+        body.push_str("}\n");
+    }
+    scratch.write("enums.rs", &body);
+
+    let value = scratch.run(&["outline", "enums.rs"]);
+    assert_eq!(value["total_symbols"], 650);
+    assert_eq!(value["auto_summarized"], true);
+    let symbols_len = value["symbols"].as_array().unwrap().len();
+    assert_eq!(
+        symbols_len, 50,
+        "depth=1 should drop the variants under each enum"
+    );
+    let kinds = value["kind_counts"].as_object().unwrap();
+    assert_eq!(kinds["enum"], 50);
+    assert_eq!(kinds["variant"], 600);
+}
+
+#[test]
+fn outline_respects_explicit_depth_even_when_large() {
+    let scratch = ScratchRepo::new("outline-explicit-depth");
+    let mut body = String::new();
+    for i in 0..600 {
+        body.push_str(&format!("pub fn fn_{i:04}() {{}}\n"));
+    }
+    scratch.write("big.rs", &body);
+
+    let value = scratch.run(&["outline", "big.rs", "--depth", "5"]);
+    assert_eq!(value["total_symbols"], 600);
+    assert!(
+        value.get("auto_summarized").is_none(),
+        "explicit --depth opts out of auto-summary"
+    );
+    assert_eq!(value["symbols"].as_array().unwrap().len(), 600);
+}
+
+#[test]
+fn find_truncated_lists_unsampled_top_level_dirs() {
+    let scratch = ScratchRepo::new("find-unsampled-dirs");
+    // Three sibling top-level dirs. Pass paths explicitly so the walk visits
+    // them in the user-provided order regardless of OS readdir() ordering.
+    scratch.write("aaa/one.rs", "pub fn target() {}\n");
+    scratch.write("bbb/two.rs", "pub fn target() {}\n");
+    scratch.write("ccc/three.rs", "pub fn target() {}\n");
+
+    let value = scratch.run(&["find", "target", "--limit", "1", "aaa", "bbb", "ccc"]);
+    assert_eq!(value["truncated"], true);
+
+    let unsampled: Vec<&str> = value["unsampled_dirs"]
+        .as_array()
+        .expect("unsampled_dirs must be present when truncated")
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(unsampled, vec!["bbb", "ccc"]);
+}
+
+#[test]
+fn find_full_walk_omits_unsampled_dirs() {
+    let scratch = ScratchRepo::new("find-no-unsampled");
+    scratch.write("aaa/one.rs", "pub fn target() {}\n");
+    scratch.write("bbb/two.rs", "pub fn target() {}\n");
+
+    let value = scratch.run(&["find", "target", "--limit", "50"]);
+    assert!(
+        value.get("truncated").is_none(),
+        "walk should complete with limit 50"
+    );
+    assert!(
+        value.get("unsampled_dirs").is_none(),
+        "unsampled_dirs must be omitted when not truncated"
+    );
+}
+
+#[test]
+fn search_truncated_lists_unsampled_top_level_dirs() {
+    let scratch = ScratchRepo::new("search-unsampled-dirs");
+    scratch.write("aaa/notes.txt", "needle here\n");
+    scratch.write("bbb/notes.txt", "needle here\n");
+    scratch.write("ccc/notes.txt", "needle here\n");
+
+    let value = scratch.run(&["search", "needle", "--limit", "1", "aaa", "bbb", "ccc"]);
+    assert_eq!(value["truncated"], true);
+    let unsampled: Vec<&str> = value["unsampled_dirs"]
+        .as_array()
+        .expect("unsampled_dirs must be present when truncated")
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(unsampled, vec!["bbb", "ccc"]);
+}
+
+#[test]
+fn langs_populates_cache_for_non_parseable_files() {
+    let scratch = ScratchRepo::new("langs-cache-non-parseable");
+    scratch.write("README.md", "line one\nline two\nline three\n");
+    scratch.write("data.json", "{\"a\":1}\n");
+
+    // First call: empty cache, langs walks files.
+    let first = scratch.run(&["langs"]);
+    let by_lang: std::collections::HashMap<String, &Value> = first["languages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| (v["language"].as_str().unwrap().to_string(), v))
+        .collect();
+    assert_eq!(by_lang["markdown"]["files"], 1);
+    assert_eq!(by_lang["markdown"]["lines"], 3);
+    assert_eq!(by_lang["json"]["files"], 1);
+    assert_eq!(by_lang["json"]["lines"], 1);
+
+    // Cache should now hold lang-only entries for the two non-parseable files.
+    let status = scratch.run(&["cache", "status"]);
+    assert_eq!(status["entry_count"], 2);
+
+    // Warm call: same numbers, served from cache. (This also exercises the
+    // lookup_line_count path; if it were broken, the warm response would
+    // diverge from the cold one.)
+    let warm = scratch.run(&["langs"]);
+    assert_eq!(first, warm);
+}
+
+#[test]
+fn langs_reuses_line_counts_after_find_warms_cache() {
+    let scratch = ScratchRepo::new("langs-reuses-find-cache");
+    scratch.write("a.rs", "pub fn one() {}\npub fn two() {}\n");
+    scratch.write("b.rs", "pub fn three() {}\n");
+
+    // Find populates the cache with full FileEntry (symbols + line_count).
+    let _ = scratch.run(&["find", "one"]);
+    let status_after_find = scratch.run(&["cache", "status"]);
+    assert!(status_after_find["entry_count"].as_u64().unwrap() >= 2);
+
+    // langs should now serve line counts from cache without rewriting entries.
+    let langs = scratch.run(&["langs"]);
+    let by_lang: std::collections::HashMap<String, &Value> = langs["languages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| (v["language"].as_str().unwrap().to_string(), v))
+        .collect();
+    assert_eq!(by_lang["rust"]["files"], 2);
+    assert_eq!(by_lang["rust"]["lines"], 3);
+
+    // outline still works after langs ran ~ verifies langs didn't stamp
+    // empty-symbols entries over parseable files.
+    let outline = scratch.run(&["outline", "a.rs"]);
+    assert!(outline["total_symbols"].as_u64().unwrap() >= 2);
+    let qualnames: Vec<String> = outline["symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["qualname"].as_str().unwrap().to_string())
+        .collect();
+    assert!(qualnames.contains(&"one".to_string()));
+    assert!(qualnames.contains(&"two".to_string()));
+}
+
+#[test]
+fn find_truncated_within_single_top_level_omits_unsampled_dirs() {
+    // When the truncated walk only ever touched one top-level dir, there's
+    // nothing to flag ~ the field stays empty/omitted.
+    let scratch = ScratchRepo::new("find-single-top-truncated");
+    scratch.write("only/a.rs", "pub fn target() {}\n");
+    scratch.write("only/b.rs", "pub fn target() {}\n");
+
+    let value = scratch.run(&["find", "target", "--limit", "1", "only"]);
+    assert_eq!(value["truncated"], true);
+    assert!(
+        value.get("unsampled_dirs").is_none(),
+        "single-subtree walk emits no unsampled_dirs hint"
+    );
+}

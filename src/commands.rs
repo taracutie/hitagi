@@ -27,6 +27,12 @@ use crate::{
 pub const MAX_FILE_BYTES: usize = 1024 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 
+/// When `outline` is called without --depth, --kind, or --bytes and the file
+/// has more symbols than this, auto-collapse to --depth 1 and emit a note. A
+/// 2,500-symbol Prisma schema produces a ~240 KB response without this; the
+/// caller almost always wants orientation first, then a targeted drill.
+const OUTLINE_AUTO_SUMMARY_THRESHOLD: usize = 500;
+
 #[derive(Debug, Default, Clone)]
 pub struct OutlineOptions {
     pub bytes: bool,
@@ -109,11 +115,24 @@ pub fn outline(repo: &RepoRoot, path: &str, opts: OutlineOptions) -> AppResult<O
     let symbols = cached_or_parsed(&mut cache, &resolved, &stat.metadata, language, None)?;
     cache.save(false);
 
-    let all_kinds: BTreeSet<String> = symbols.iter().map(|s| s.kind.clone()).collect();
+    let total_symbols = symbols.len();
+    let mut kind_counts: BTreeMap<String, usize> = BTreeMap::new();
+    for s in &symbols {
+        *kind_counts.entry(s.kind.clone()).or_insert(0) += 1;
+    }
+    let all_kinds: BTreeSet<String> = kind_counts.keys().cloned().collect();
+
+    // Soft cap: if the caller didn't constrain the response and the file is
+    // huge, collapse to top-level shapes. The caller can always re-issue with
+    // explicit --depth N or --kind to drill in.
+    let caller_constrained = opts.depth.is_some() || !opts.kinds.is_empty() || opts.bytes;
+    let auto_summarized =
+        !caller_constrained && total_symbols > OUTLINE_AUTO_SUMMARY_THRESHOLD;
+    let effective_depth = if auto_summarized { Some(1) } else { opts.depth };
 
     let symbols: Vec<OutputSymbol> = symbols
         .into_iter()
-        .filter(|s| within_depth(&s.qualname, opts.depth))
+        .filter(|s| within_depth(&s.qualname, effective_depth))
         .filter(|s| matches_kinds(&opts.kinds, &s.kind))
         .map(|s| to_output_symbol(s, opts.bytes))
         .collect();
@@ -124,10 +143,23 @@ pub fn outline(repo: &RepoRoot, path: &str, opts: OutlineOptions) -> AppResult<O
         None
     };
 
+    let note = if auto_summarized {
+        Some(format!(
+            "file has {total_symbols} symbols; auto-applied --depth 1 to keep response compact. \
+             Re-run with --depth N or --kind K1,K2 to drill in."
+        ))
+    } else {
+        None
+    };
+
     Ok(OutlineResponse {
         language: language.as_str().to_string(),
+        total_symbols,
+        kind_counts,
         symbols,
         available_kinds,
+        auto_summarized,
+        note,
     })
 }
 
@@ -198,6 +230,9 @@ fn search_resolved_files(
     snippet: bool,
     cache: &mut ParseCache,
 ) -> AppResult<SearchResponse> {
+    let all_top_levels = collect_top_level_dirs(&files);
+    let mut visited_top_levels: BTreeSet<String> = BTreeSet::new();
+
     let mut raw_results: Vec<(String, Vec<String>)> = Vec::new();
     let mut total = 0usize;
     let mut truncated = false;
@@ -206,6 +241,9 @@ fn search_resolved_files(
         if total >= limit {
             truncated = true;
             break;
+        }
+        if let Some(top) = top_level_dir(&resolved.relative_path) {
+            visited_top_levels.insert(top.to_string());
         }
         let remaining = limit - total;
         let file_limit = remaining.saturating_add(1);
@@ -275,10 +313,13 @@ fn search_resolved_files(
         results.entry(key).or_default().extend(matches);
     }
 
+    let unsampled_dirs = unsampled_top_levels(truncated, &all_top_levels, &visited_top_levels);
+
     Ok(SearchResponse {
         prefix,
         results,
         truncated,
+        unsampled_dirs,
     })
 }
 
@@ -384,6 +425,9 @@ fn find_resolved_files(
     // need source bytes to extract the signature line.
     let needs_content_for_output = opts.snippet;
 
+    let all_top_levels = collect_top_level_dirs(&files);
+    let mut visited_top_levels: BTreeSet<String> = BTreeSet::new();
+
     let mut matches: Vec<FindMatch> = Vec::new();
     let mut truncated = false;
     let mut searched_files = 0usize;
@@ -393,6 +437,9 @@ fn find_resolved_files(
         if matches.len() >= limit {
             truncated = true;
             break;
+        }
+        if let Some(top) = top_level_dir(&resolved.relative_path) {
+            visited_top_levels.insert(top.to_string());
         }
 
         let stat = match stat_file(&resolved) {
@@ -433,10 +480,12 @@ fn find_resolved_files(
                 Err(AppError::Parse(_)) | Err(AppError::Unsupported(_)) => continue,
                 Err(error) => return Err(error),
             };
+            let line_count = Some(count_newlines(content.as_bytes()));
             cache.insert(
                 resolved.relative_path.clone(),
                 &stat.metadata,
                 language,
+                line_count,
                 parsed.symbols.clone(),
             );
             (parsed.symbols, Some(content))
@@ -504,11 +553,14 @@ fn find_resolved_files(
         FindMatches::Full(matches)
     };
 
+    let unsampled_dirs = unsampled_top_levels(truncated, &all_top_levels, &visited_top_levels);
+
     Ok(FindResponse {
         prefix,
         matches,
         truncated,
         searched_files,
+        unsampled_dirs,
         available_kinds,
         note,
     })
@@ -567,6 +619,7 @@ pub fn files(repo: &RepoRoot, opts: FilesOptions) -> AppResult<FilesResponse> {
 
 pub fn langs(repo: &RepoRoot) -> AppResult<LangsResponse> {
     let resolved_files = repo.collect_search_files(&[])?;
+    let mut cache = ParseCache::open(repo.root());
     // Tracks (files, lines, parseable) per language label.
     let mut counts: BTreeMap<String, (usize, usize, bool)> = BTreeMap::new();
 
@@ -579,27 +632,21 @@ pub fn langs(repo: &RepoRoot) -> AppResult<LangsResponse> {
             continue;
         }
 
-        if first_chunk_has_nul(Path::new(&resolved.full_path)) {
+        let language = Language::detect(Path::new(&resolved.full_path)).unwrap_or(Language::Plaintext);
+        // Binary detection runs lazily inside the miss path of
+        // cache_line_count_for ~ on warm runs we never open the file.
+        let Some(lines) = cache_line_count_for(&mut cache, &resolved, &metadata, language) else {
             continue;
-        }
-
-        let (label, parseable) = match Language::detect(Path::new(&resolved.full_path)) {
-            Ok(lang) => (lang.as_str().to_string(), lang.is_parseable()),
-            Err(_) => ("plaintext".to_string(), false),
         };
 
-        let lines = if metadata.len() > MAX_FILE_BYTES as u64 {
-            0
-        } else {
-            std::fs::read(&resolved.full_path)
-                .map(|bytes| bytes.iter().filter(|b| **b == b'\n').count())
-                .unwrap_or(0)
-        };
-
-        let entry = counts.entry(label).or_insert((0, 0, parseable));
+        let entry = counts
+            .entry(language.as_str().to_string())
+            .or_insert((0, 0, language.is_parseable()));
         entry.0 += 1;
-        entry.1 += lines;
+        entry.1 += lines as usize;
     }
+
+    cache.save(false);
 
     let mut summaries: Vec<LangSummary> = counts
         .into_iter()
@@ -1451,13 +1498,53 @@ fn cached_or_parsed(
     };
 
     let parsed = parse_source(language, source)?;
+    let line_count = Some(count_newlines(source.as_bytes()));
     cache.insert(
         resolved.relative_path.clone(),
         metadata,
         language,
+        line_count,
         parsed.symbols.clone(),
     );
     Ok(parsed.symbols)
+}
+
+/// Returns the cached line count for `resolved` if (mtime, size, language)
+/// match; otherwise reads the file, counts newlines, and writes a lang-only
+/// stamp into the cache (works for both parseable and non-parseable
+/// languages ~ the stamp doesn't satisfy `cache.lookup` for symbols, so a
+/// later outline/find/symbol call still re-parses and upgrades the entry).
+/// Binary / oversized / unreadable files yield `None` and are NOT cached
+/// (so a future content-change becomes detectable on the next call).
+fn cache_line_count_for(
+    cache: &mut ParseCache,
+    resolved: &ResolvedPath,
+    metadata: &Metadata,
+    language: Language,
+) -> Option<u32> {
+    if let Some(line_count) = cache.lookup_line_count(&resolved.relative_path, metadata, language) {
+        return Some(line_count);
+    }
+    if metadata.len() > MAX_FILE_BYTES as u64 {
+        return None;
+    }
+    let bytes = std::fs::read(&resolved.full_path).ok()?;
+    if bytes.contains(&0) {
+        return None;
+    }
+    let line_count = count_newlines(&bytes);
+    cache.insert_lang_only(
+        resolved.relative_path.clone(),
+        metadata,
+        language,
+        line_count,
+    );
+    Some(line_count)
+}
+
+fn count_newlines(bytes: &[u8]) -> u32 {
+    let n = bytes.iter().filter(|b| **b == b'\n').count();
+    u32::try_from(n).unwrap_or(u32::MAX)
 }
 
 fn matches_kinds(filter: &[String], kind: &str) -> bool {
@@ -1530,6 +1617,36 @@ fn apply_excludes(files: Vec<ResolvedPath>, excludes: Option<&GlobSet>) -> Vec<R
             .filter(|f| !set.is_match(&f.relative_path))
             .collect(),
     }
+}
+
+/// First path component (directory) of a repo-relative path, or None if the
+/// path is a single file at the root (no slash). Used as the bucket key for
+/// truncation-bias bookkeeping.
+fn top_level_dir(relative_path: &str) -> Option<&str> {
+    relative_path.split_once('/').map(|(head, _)| head)
+}
+
+/// All distinct top-level dirs present in `files`. Sorted (BTreeSet).
+fn collect_top_level_dirs(files: &[ResolvedPath]) -> BTreeSet<String> {
+    files
+        .iter()
+        .filter_map(|f| top_level_dir(&f.relative_path).map(String::from))
+        .collect()
+}
+
+/// `all - visited` when `truncated`, else empty. Sorted output.
+fn unsampled_top_levels(
+    truncated: bool,
+    all_top_levels: &BTreeSet<String>,
+    visited_top_levels: &BTreeSet<String>,
+) -> Vec<String> {
+    if !truncated {
+        return Vec::new();
+    }
+    all_top_levels
+        .difference(visited_top_levels)
+        .cloned()
+        .collect()
 }
 
 fn common_prefix(paths: &[String]) -> String {
