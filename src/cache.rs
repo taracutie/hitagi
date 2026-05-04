@@ -6,7 +6,7 @@ use std::{
     time::UNIX_EPOCH,
 };
 
-use serde::{Deserialize, Serialize};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
 
 use crate::{lang::Language, models::SymbolInfo};
 
@@ -14,19 +14,13 @@ use crate::{lang::Language, models::SymbolInfo};
 // "visitor logic in parser.rs may have changed shape". Schema bumps just
 // change the v<N> prefix. Mismatch on either falls back to an empty cache.
 //
-// v2 added `line_count` to FileEntry and started inserting lang-only entries
-// (symbols=empty) for non-parseable files so `langs` can serve from cache.
-const CACHE_VERSION_KEY: &str = concat!("v2-", env!("CARGO_PKG_VERSION"));
-const CACHE_FILE_NAME: &str = "index.v2.bin";
+// v3 moved from a repo-wide bincode blob to a SQLite row store, so one-file
+// queries can fetch and update one cache entry instead of deserializing and
+// rewriting every cached file in the repo.
+const CACHE_VERSION_KEY: &str = concat!("v3-", env!("CARGO_PKG_VERSION"));
+const CACHE_FILE_NAME: &str = "index.v3.sqlite";
 
-#[derive(Serialize, Deserialize)]
-struct CacheFile {
-    version: String,
-    repo_root: String,
-    entries: HashMap<String, FileEntry>,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Clone)]
 struct FileEntry {
     mtime_secs: i64,
     mtime_nanos: u32,
@@ -35,22 +29,22 @@ struct FileEntry {
     /// Newline count of the file's content as last seen. Capped at u32::MAX
     /// (no real source file approaches that). Both parsed entries and
     /// lang-only stamps populate this so `langs` warm runs are O(stat).
-    #[serde(default)]
     line_count: Option<u32>,
     /// True when `symbols` came from `parse_source`. False when this entry
     /// was stamped by `langs` (line_count only); the symbols vec is empty
     /// in that case and the next outline/find/symbol call must re-parse.
-    /// Defaulting to false on legacy entries is safe: they get re-parsed
-    /// once and upgraded.
-    #[serde(default)]
     parsed_for_symbols: bool,
     symbols: Vec<SymbolInfo>,
 }
 
 pub struct ParseCache {
     cache_dir: PathBuf,
+    cache_file: PathBuf,
     repo_root: String,
-    entries: HashMap<String, FileEntry>,
+    conn: Option<Connection>,
+    checked_existing: bool,
+    reset_on_write: bool,
+    pending: HashMap<String, FileEntry>,
     seen: HashSet<String>,
     enabled: bool,
 }
@@ -91,21 +85,30 @@ impl ParseCache {
         if !enabled {
             return Self::empty(cache_dir, repo_root, false);
         }
-        let entries = load_entries(&cache_dir, &repo_root).unwrap_or_default();
+        let cache_file = cache_dir.join(CACHE_FILE_NAME);
         Self {
             cache_dir,
+            cache_file,
             repo_root,
-            entries,
+            conn: None,
+            checked_existing: false,
+            reset_on_write: false,
+            pending: HashMap::new(),
             seen: HashSet::new(),
             enabled: true,
         }
     }
 
     fn empty(cache_dir: PathBuf, repo_root: String, enabled: bool) -> Self {
+        let cache_file = cache_dir.join(CACHE_FILE_NAME);
         Self {
             cache_dir,
+            cache_file,
             repo_root,
-            entries: HashMap::new(),
+            conn: None,
+            checked_existing: false,
+            reset_on_write: false,
+            pending: HashMap::new(),
             seen: HashSet::new(),
             enabled,
         }
@@ -125,7 +128,7 @@ impl ParseCache {
         if !entry.parsed_for_symbols {
             return None;
         }
-        Some(entry.symbols.clone())
+        Some(entry.symbols)
     }
 
     /// Returns the cached line count when (mtime, size, language) match.
@@ -147,22 +150,28 @@ impl ParseCache {
         rel_path: &str,
         metadata: &Metadata,
         language: Language,
-    ) -> Option<&FileEntry> {
+    ) -> Option<FileEntry> {
         if !self.enabled {
             return None;
         }
         self.seen.insert(rel_path.to_string());
 
-        let entry = self.entries.get(rel_path)?;
-        let (secs, nanos) = mtime_parts(metadata)?;
-        if entry.mtime_secs == secs
-            && entry.mtime_nanos == nanos
-            && entry.size == metadata.len()
-            && entry.language == language
-        {
-            Some(entry)
-        } else {
-            None
+        if let Some(entry) = self.pending.get(rel_path) {
+            return entry_matches(entry, metadata, language).then(|| entry.clone());
+        }
+
+        let loaded = {
+            let conn = self.ensure_read_conn()?;
+            load_entry(conn, rel_path)
+        };
+
+        match loaded {
+            Ok(Some(entry)) => entry_matches(&entry, metadata, language).then_some(entry),
+            Ok(None) => None,
+            Err(_) => {
+                self.reset_on_write = true;
+                None
+            }
         }
     }
 
@@ -216,7 +225,7 @@ impl ParseCache {
             return;
         };
         self.seen.insert(rel_path.clone());
-        self.entries.insert(
+        self.pending.insert(
             rel_path,
             FileEntry {
                 mtime_secs: secs,
@@ -230,17 +239,51 @@ impl ParseCache {
         );
     }
 
-    /// Persist to disk. When `prune_unseen` is true, drop entries not visited
-    /// during this run ~ only safe when the walk covered the whole repo.
-    /// Failures are silent: a stale or missing cache must never break a command.
+    /// Persist pending entries to disk. When `prune_unseen` is true, drop entries
+    /// not visited during this run ~ only safe when the walk covered the whole
+    /// repo. Failures are silent: a stale or missing cache must never break a
+    /// command.
     pub fn save(mut self, prune_unseen: bool) {
         if !self.enabled {
             return;
         }
-        if prune_unseen {
-            self.entries.retain(|key, _| self.seen.contains(key));
+        if self.pending.is_empty() && !prune_unseen {
+            return;
         }
-        let _ = write_entries(&self.cache_dir, &self.repo_root, &self.entries);
+        if self.pending.is_empty()
+            && prune_unseen
+            && self.conn.is_none()
+            && !self.cache_file.exists()
+        {
+            return;
+        }
+        if self.pending.is_empty() && prune_unseen && self.conn.is_none() {
+            let _ = self.ensure_read_conn();
+        }
+        if self.pending.is_empty() && self.conn.is_none() {
+            return;
+        }
+
+        let pending = std::mem::take(&mut self.pending);
+        let seen = if prune_unseen {
+            Some(std::mem::take(&mut self.seen))
+        } else {
+            None
+        };
+        let Some(conn) = self.ensure_write_conn() else {
+            return;
+        };
+
+        if write_entries(conn, &pending, seen.as_ref()).is_ok() {
+            return;
+        }
+
+        self.conn.take();
+        let _ = std::fs::remove_file(&self.cache_file);
+        self.reset_on_write = false;
+        if let Some(conn) = self.ensure_write_conn() {
+            let _ = write_entries(conn, &pending, seen.as_ref());
+        }
     }
 
     /// Where the cache for `repo_root` would live, given current env vars.
@@ -285,24 +328,46 @@ impl ParseCache {
         inspection.size_bytes = meta.len();
         inspection.modified_unix_secs = mtime_parts(&meta).map(|(s, _)| s);
 
-        let Ok(bytes) = std::fs::read(&file) else {
-            return inspection;
-        };
-        let Ok(decoded) = bincode::deserialize::<CacheFile>(&bytes) else {
+        let Ok(conn) = Connection::open_with_flags(&file, OpenFlags::SQLITE_OPEN_READ_ONLY) else {
             return inspection;
         };
 
-        inspection.version_match = decoded.version == CACHE_VERSION_KEY;
-        inspection.repo_root_match = decoded.repo_root == repo_root_str;
-        inspection.stored_version = Some(decoded.version);
-        inspection.stored_repo_root = Some(decoded.repo_root);
-        inspection.entry_count = decoded.entries.len();
-        for entry in decoded.entries.values() {
-            *inspection
-                .languages
-                .entry(entry.language.as_str().to_string())
-                .or_insert(0) += 1;
+        inspection.stored_version = meta_value(&conn, "version").ok().flatten();
+        inspection.stored_repo_root = meta_value(&conn, "repo_root").ok().flatten();
+        inspection.version_match = inspection
+            .stored_version
+            .as_deref()
+            .map(|v| v == CACHE_VERSION_KEY)
+            .unwrap_or(false);
+        inspection.repo_root_match = inspection
+            .stored_repo_root
+            .as_deref()
+            .map(|r| r == repo_root_str)
+            .unwrap_or(false);
+
+        if !(inspection.version_match && inspection.repo_root_match) {
+            return inspection;
         }
+
+        if let Ok(count) =
+            conn.query_row("SELECT COUNT(*) FROM files", [], |row| row.get::<_, i64>(0))
+        {
+            inspection.entry_count = usize::try_from(count).unwrap_or(0);
+        }
+
+        if let Ok(mut stmt) = conn.prepare("SELECT language, COUNT(*) FROM files GROUP BY language")
+        {
+            if let Ok(rows) = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            }) {
+                for row in rows.flatten() {
+                    if let Ok(files) = usize::try_from(row.1) {
+                        inspection.languages.insert(row.0, files);
+                    }
+                }
+            }
+        }
+
         inspection
     }
 
@@ -356,6 +421,53 @@ impl ParseCache {
             existed: true,
             repos_removed,
         })
+    }
+
+    fn ensure_read_conn(&mut self) -> Option<&Connection> {
+        if self.conn.is_some() {
+            return self.conn.as_ref();
+        }
+        if self.checked_existing {
+            return None;
+        }
+        self.checked_existing = true;
+        if !self.cache_file.exists() {
+            return None;
+        }
+
+        match Connection::open_with_flags(&self.cache_file, OpenFlags::SQLITE_OPEN_READ_WRITE) {
+            Ok(conn) if validate_db(&conn, &self.repo_root) => {
+                self.conn = Some(conn);
+                self.conn.as_ref()
+            }
+            Ok(_) | Err(_) => {
+                self.reset_on_write = true;
+                None
+            }
+        }
+    }
+
+    fn ensure_write_conn(&mut self) -> Option<&mut Connection> {
+        if self.reset_on_write {
+            self.conn.take();
+            let _ = std::fs::remove_file(&self.cache_file);
+            self.reset_on_write = false;
+        }
+
+        if self.conn.is_none() {
+            if std::fs::create_dir_all(&self.cache_dir).is_err() {
+                return None;
+            }
+            let conn = Connection::open(&self.cache_file).ok()?;
+            if init_db(&conn, &self.repo_root).is_err() {
+                let _ = std::fs::remove_file(&self.cache_file);
+                return None;
+            }
+            self.checked_existing = true;
+            self.conn = Some(conn);
+        }
+
+        self.conn.as_mut()
     }
 }
 
@@ -418,37 +530,228 @@ fn resolve_cache_dir(repo_root: &str) -> Option<PathBuf> {
     cache_root().map(|base| base.join(repo_hash(repo_root)))
 }
 
-fn load_entries(cache_dir: &Path, expected_repo_root: &str) -> Option<HashMap<String, FileEntry>> {
-    let bytes = std::fs::read(cache_dir.join(CACHE_FILE_NAME)).ok()?;
-    let file: CacheFile = bincode::deserialize(&bytes).ok()?;
-    if file.version != CACHE_VERSION_KEY || file.repo_root != expected_repo_root {
-        return None;
+fn init_db(conn: &Connection, repo_root: &str) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS files (
+            rel_path TEXT PRIMARY KEY,
+            mtime_secs INTEGER NOT NULL,
+            mtime_nanos INTEGER NOT NULL,
+            size INTEGER NOT NULL,
+            language TEXT NOT NULL,
+            line_count INTEGER,
+            parsed_for_symbols INTEGER NOT NULL,
+            symbols_blob BLOB NOT NULL
+        );
+        ",
+    )?;
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('version', ?1)",
+        params![CACHE_VERSION_KEY],
+    )?;
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('repo_root', ?1)",
+        params![repo_root],
+    )?;
+    Ok(())
+}
+
+fn validate_db(conn: &Connection, repo_root: &str) -> bool {
+    let version = meta_value(conn, "version").ok().flatten();
+    let stored_repo_root = meta_value(conn, "repo_root").ok().flatten();
+    version.as_deref() == Some(CACHE_VERSION_KEY)
+        && stored_repo_root.as_deref() == Some(repo_root)
+        && files_table_is_readable(conn)
+}
+
+fn meta_value(conn: &Connection, key: &str) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT value FROM meta WHERE key = ?1",
+        params![key],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+fn files_table_is_readable(conn: &Connection) -> bool {
+    conn.prepare(
+        "SELECT rel_path, mtime_secs, mtime_nanos, size, language, line_count, parsed_for_symbols, symbols_blob
+         FROM files LIMIT 0",
+    )
+    .is_ok()
+}
+
+fn load_entry(conn: &Connection, rel_path: &str) -> rusqlite::Result<Option<FileEntry>> {
+    struct RawEntry {
+        mtime_secs: i64,
+        mtime_nanos: i64,
+        size: i64,
+        language: String,
+        line_count: Option<i64>,
+        parsed_for_symbols: i64,
+        symbols_blob: Vec<u8>,
     }
-    Some(file.entries)
+
+    let Some(raw) = conn
+        .query_row(
+            "SELECT mtime_secs, mtime_nanos, size, language, line_count, parsed_for_symbols, symbols_blob
+             FROM files WHERE rel_path = ?1",
+            params![rel_path],
+            |row| {
+                Ok(RawEntry {
+                    mtime_secs: row.get(0)?,
+                    mtime_nanos: row.get(1)?,
+                    size: row.get(2)?,
+                    language: row.get(3)?,
+                    line_count: row.get(4)?,
+                    parsed_for_symbols: row.get(5)?,
+                    symbols_blob: row.get(6)?,
+                })
+            },
+        )
+        .optional()?
+    else {
+        return Ok(None);
+    };
+
+    let parsed_for_symbols = raw.parsed_for_symbols != 0;
+    let symbols = if parsed_for_symbols {
+        match bincode::deserialize(&raw.symbols_blob) {
+            Ok(symbols) => symbols,
+            Err(_) => return Ok(None),
+        }
+    } else {
+        Vec::new()
+    };
+
+    let Some(mtime_nanos) = u32::try_from(raw.mtime_nanos).ok() else {
+        return Ok(None);
+    };
+    let Some(size) = u64::try_from(raw.size).ok() else {
+        return Ok(None);
+    };
+    let Some(language) = language_from_str(&raw.language) else {
+        return Ok(None);
+    };
+
+    Ok(Some(FileEntry {
+        mtime_secs: raw.mtime_secs,
+        mtime_nanos,
+        size,
+        language,
+        line_count: raw.line_count.and_then(|n| u32::try_from(n).ok()),
+        parsed_for_symbols,
+        symbols,
+    }))
 }
 
 fn write_entries(
-    cache_dir: &Path,
-    repo_root: &str,
-    entries: &HashMap<String, FileEntry>,
-) -> std::io::Result<()> {
-    std::fs::create_dir_all(cache_dir)?;
-    let target = cache_dir.join(CACHE_FILE_NAME);
-    let tmp = cache_dir.join(format!("{CACHE_FILE_NAME}.tmp.{}", std::process::id()));
+    conn: &mut Connection,
+    pending: &HashMap<String, FileEntry>,
+    seen: Option<&HashSet<String>>,
+) -> rusqlite::Result<()> {
+    let tx = conn.transaction()?;
+    for (rel_path, entry) in pending {
+        upsert_entry(&tx, rel_path, entry)?;
+    }
+    if let Some(seen) = seen {
+        prune_entries(&tx, seen)?;
+    }
+    tx.commit()
+}
 
-    let file = CacheFile {
-        version: CACHE_VERSION_KEY.to_string(),
-        repo_root: repo_root.to_string(),
-        entries: entries.clone(),
+fn upsert_entry(tx: &Transaction<'_>, rel_path: &str, entry: &FileEntry) -> rusqlite::Result<()> {
+    let symbols_blob = if entry.parsed_for_symbols {
+        bincode::serialize(&entry.symbols)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+    } else {
+        Vec::new()
     };
-    let bytes = bincode::serialize(&file)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    std::fs::write(&tmp, &bytes)?;
-    if let Err(error) = std::fs::rename(&tmp, &target) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(error);
+    let mtime_nanos = i64::from(entry.mtime_nanos);
+    let size = i64::try_from(entry.size)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    let line_count = entry.line_count.map(i64::from);
+    let parsed_for_symbols = if entry.parsed_for_symbols { 1i64 } else { 0i64 };
+
+    tx.execute(
+        "
+        INSERT INTO files (
+            rel_path, mtime_secs, mtime_nanos, size, language,
+            line_count, parsed_for_symbols, symbols_blob
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        ON CONFLICT(rel_path) DO UPDATE SET
+            mtime_secs = excluded.mtime_secs,
+            mtime_nanos = excluded.mtime_nanos,
+            size = excluded.size,
+            language = excluded.language,
+            line_count = excluded.line_count,
+            parsed_for_symbols = excluded.parsed_for_symbols,
+            symbols_blob = excluded.symbols_blob
+        ",
+        params![
+            rel_path,
+            entry.mtime_secs,
+            mtime_nanos,
+            size,
+            entry.language.as_str(),
+            line_count,
+            parsed_for_symbols,
+            symbols_blob,
+        ],
+    )?;
+    Ok(())
+}
+
+fn prune_entries(tx: &Transaction<'_>, seen: &HashSet<String>) -> rusqlite::Result<()> {
+    let paths = {
+        let mut stmt = tx.prepare("SELECT rel_path FROM files")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.filter_map(Result::ok).collect::<Vec<_>>()
+    };
+
+    let mut delete = tx.prepare("DELETE FROM files WHERE rel_path = ?1")?;
+    for path in paths {
+        if !seen.contains(&path) {
+            delete.execute(params![path])?;
+        }
     }
     Ok(())
+}
+
+fn entry_matches(entry: &FileEntry, metadata: &Metadata, language: Language) -> bool {
+    let Some((secs, nanos)) = mtime_parts(metadata) else {
+        return false;
+    };
+    entry.mtime_secs == secs
+        && entry.mtime_nanos == nanos
+        && entry.size == metadata.len()
+        && entry.language == language
+}
+
+fn language_from_str(value: &str) -> Option<Language> {
+    match value {
+        "rust" => Some(Language::Rust),
+        "typescript" => Some(Language::TypeScript),
+        "tsx" => Some(Language::Tsx),
+        "python" => Some(Language::Python),
+        "kotlin" => Some(Language::Kotlin),
+        "prisma" => Some(Language::Prisma),
+        "json" => Some(Language::Json),
+        "yaml" => Some(Language::Yaml),
+        "toml" => Some(Language::Toml),
+        "markdown" => Some(Language::Markdown),
+        "sql" => Some(Language::Sql),
+        "html" => Some(Language::Html),
+        "css" => Some(Language::Css),
+        "shell" => Some(Language::Shell),
+        "dockerfile" => Some(Language::Dockerfile),
+        "plaintext" => Some(Language::Plaintext),
+        _ => None,
+    }
 }
 
 fn mtime_parts(metadata: &Metadata) -> Option<(i64, u32)> {
@@ -520,7 +823,7 @@ mod tests {
     use std::{
         fs,
         path::PathBuf,
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     use super::*;
@@ -589,6 +892,23 @@ mod tests {
         }
         fs::write(&path, body).unwrap();
         fs::metadata(&path).unwrap()
+    }
+
+    fn update_meta(cache_file: &Path, key: &str, value: &str) {
+        let conn = Connection::open(cache_file).unwrap();
+        conn.execute(
+            "UPDATE meta SET value = ?1 WHERE key = ?2",
+            params![value, key],
+        )
+        .unwrap();
+    }
+
+    fn break_files_table(cache_file: &Path, replacement_schema: Option<&str>) {
+        let conn = Connection::open(cache_file).unwrap();
+        conn.execute_batch("DROP TABLE files").unwrap();
+        if let Some(schema) = replacement_schema {
+            conn.execute_batch(schema).unwrap();
+        }
     }
 
     #[test]
@@ -667,12 +987,7 @@ mod tests {
             cache.save(false);
         }
 
-        let cache_file = tmp.cache_file();
-        let bytes = fs::read(&cache_file).unwrap();
-        let mut decoded: CacheFile = bincode::deserialize(&bytes).unwrap();
-        decoded.version = "v2-9999.9.9".to_string();
-        let rewritten = bincode::serialize(&decoded).unwrap();
-        fs::write(&cache_file, &rewritten).unwrap();
+        update_meta(&tmp.cache_file(), "version", "v3-9999.9.9");
 
         let mut cache = tmp.open();
         assert!(cache.lookup("a.rs", &metadata, Language::Rust).is_none());
@@ -695,15 +1010,87 @@ mod tests {
             cache.save(false);
         }
 
-        let cache_file = tmp.cache_file();
-        let bytes = fs::read(&cache_file).unwrap();
-        let mut decoded: CacheFile = bincode::deserialize(&bytes).unwrap();
-        decoded.repo_root = "/some/other/path".to_string();
-        let rewritten = bincode::serialize(&decoded).unwrap();
-        fs::write(&cache_file, &rewritten).unwrap();
+        update_meta(&tmp.cache_file(), "repo_root", "/some/other/path");
 
         let mut cache = tmp.open();
         assert!(cache.lookup("a.rs", &metadata, Language::Rust).is_none());
+    }
+
+    #[test]
+    fn missing_files_table_is_recreated_on_save() {
+        let tmp = CacheTmp::new("missing-files-table");
+        let metadata = write_file(&tmp.repo_root, "a.rs", "fn foo() {}");
+
+        {
+            let mut cache = tmp.open();
+            cache.insert(
+                "a.rs".to_string(),
+                &metadata,
+                Language::Rust,
+                None,
+                sample_symbols(),
+            );
+            cache.save(false);
+        }
+
+        break_files_table(&tmp.cache_file(), None);
+
+        let mut cache = tmp.open();
+        assert!(cache.lookup("a.rs", &metadata, Language::Rust).is_none());
+        cache.insert(
+            "a.rs".to_string(),
+            &metadata,
+            Language::Rust,
+            None,
+            sample_symbols(),
+        );
+        cache.save(false);
+
+        let mut cache = tmp.open();
+        assert_eq!(
+            cache.lookup("a.rs", &metadata, Language::Rust),
+            Some(sample_symbols())
+        );
+    }
+
+    #[test]
+    fn incompatible_files_table_is_recreated_on_save() {
+        let tmp = CacheTmp::new("bad-files-table");
+        let metadata = write_file(&tmp.repo_root, "a.rs", "fn foo() {}");
+
+        {
+            let mut cache = tmp.open();
+            cache.insert(
+                "a.rs".to_string(),
+                &metadata,
+                Language::Rust,
+                None,
+                sample_symbols(),
+            );
+            cache.save(false);
+        }
+
+        break_files_table(
+            &tmp.cache_file(),
+            Some("CREATE TABLE files (rel_path TEXT PRIMARY KEY)"),
+        );
+
+        let mut cache = tmp.open();
+        assert!(cache.lookup("a.rs", &metadata, Language::Rust).is_none());
+        cache.insert(
+            "a.rs".to_string(),
+            &metadata,
+            Language::Rust,
+            None,
+            sample_symbols(),
+        );
+        cache.save(false);
+
+        let mut cache = tmp.open();
+        assert_eq!(
+            cache.lookup("a.rs", &metadata, Language::Rust),
+            Some(sample_symbols())
+        );
     }
 
     #[test]
@@ -714,8 +1101,20 @@ mod tests {
 
         {
             let mut cache = tmp.open();
-            cache.insert("a.rs".to_string(), &m_a, Language::Rust, None, sample_symbols());
-            cache.insert("b.rs".to_string(), &m_b, Language::Rust, None, sample_symbols());
+            cache.insert(
+                "a.rs".to_string(),
+                &m_a,
+                Language::Rust,
+                None,
+                sample_symbols(),
+            );
+            cache.insert(
+                "b.rs".to_string(),
+                &m_b,
+                Language::Rust,
+                None,
+                sample_symbols(),
+            );
             cache.save(false);
         }
 
@@ -737,8 +1136,20 @@ mod tests {
 
         {
             let mut cache = tmp.open();
-            cache.insert("a.rs".to_string(), &m_a, Language::Rust, None, sample_symbols());
-            cache.insert("b.rs".to_string(), &m_b, Language::Rust, None, sample_symbols());
+            cache.insert(
+                "a.rs".to_string(),
+                &m_a,
+                Language::Rust,
+                None,
+                sample_symbols(),
+            );
+            cache.insert(
+                "b.rs".to_string(),
+                &m_b,
+                Language::Rust,
+                None,
+                sample_symbols(),
+            );
             cache.save(false);
         }
 
@@ -748,6 +1159,32 @@ mod tests {
 
         let mut cache = tmp.open();
         assert!(cache.lookup("b.rs", &m_b, Language::Rust).is_some());
+    }
+
+    #[test]
+    fn warm_lookup_without_pending_entries_does_not_rewrite_db() {
+        let tmp = CacheTmp::new("no-rewrite");
+        let metadata = write_file(&tmp.repo_root, "a.rs", "fn foo() {}");
+
+        {
+            let mut cache = tmp.open();
+            cache.insert(
+                "a.rs".to_string(),
+                &metadata,
+                Language::Rust,
+                None,
+                sample_symbols(),
+            );
+            cache.save(false);
+        }
+
+        let before = fs::metadata(tmp.cache_file()).unwrap().modified().unwrap();
+        std::thread::sleep(Duration::from_millis(1100));
+        let mut cache = tmp.open();
+        assert!(cache.lookup("a.rs", &metadata, Language::Rust).is_some());
+        cache.save(false);
+        let after = fs::metadata(tmp.cache_file()).unwrap().modified().unwrap();
+        assert_eq!(before, after, "warm hit + save(false) must not rewrite DB");
     }
 
     #[test]
@@ -872,6 +1309,7 @@ mod tests {
             None,
             sample_symbols(),
         );
+
         assert_eq!(
             cache.lookup_line_count("a.rs", &metadata, Language::Rust),
             None
