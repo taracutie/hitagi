@@ -55,7 +55,7 @@ Truly unknown extensions get bucketed as `plaintext` ~ still searchable, just un
 ## Install
 
 ```bash
-cargo install --path .
+bun run install
 ```
 
 This builds the release binary and drops it at `~/.cargo/bin/hitagi`.

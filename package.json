@@ -1,0 +1,11 @@
+{
+  "name": "hitagi",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "bun@1.3.13",
+  "scripts": {
+    "install": "cargo install --path .",
+    "bump:minor": "bun scripts/bump-minor.mjs",
+    "bump:patch": "bun scripts/bump-patch.mjs"
+  }
+}
