@@ -22,7 +22,7 @@ Commands:
 - `find <QUERY> [PATHS...]` ~ locate symbols across the repo by qualname substring (case-insensitive).
 - `files [GLOBS...]` ~ list files in the repo (gitignore-aware), optionally filtered by globs.
 - `langs` ~ summarise languages present in the repo (file count + line count per language).
-- `diff [PATH]` ~ review uncommitted changes; overview by default, structured hunks with enclosing-symbol annotation when a path is given.
+- `diff [PATHS...]` ~ review uncommitted changes; overview by default, compact summary with `--summary`, structured hunks with enclosing-symbol annotation when paths are given.
 - `cache [status|path|clear]` ~ inspect or manage the on-disk parse cache.
 - `install <claude|codex>` / `uninstall <claude|codex>` ~ add or remove hitagi's user-global agent prompt.
 
@@ -247,7 +247,7 @@ languages
 
 One-shot orientation: walks the repo and tallies file count + line count per detected language. Sorted by file count descending. The `parseable` flag tells you which entries support `outline`/`symbol`/`find` (Rust, TypeScript, TSX, Python, Kotlin, Prisma) ~ the rest are recognised by extension but only respond to `search` and `read`.
 
-### `diff [PATH]`
+### `diff [PATHS...]`
 
 Review uncommitted changes (working tree vs `HEAD` by default). Shells out to `git` ~ requires a git repo. With no `PATH`, prints a one-entry-per-file overview; with a `PATH`, prints structured hunks annotated by enclosing symbol.
 
@@ -265,7 +265,8 @@ R src/renamed.rs +3 -3 ← src/orig.rs • unstaged
 ? notes.txt
 ```
 
-Status codes: `M` modified, `A` added, `D` deleted, `R` renamed, `C` copied, `?` untracked. Untracked files have no `added`/`removed` (drilldown isn't supported for them ~ use `read` for content).
+Status codes: `M` modified, `A` added, `D` deleted, `R` renamed, `C` copied, `?` untracked. Untracked files have no `added`/`removed` in the overview, but path drilldown treats text files as synthetic additions.
+Default text overview groups combined-scope changes into `staged+unstaged`, `staged`, `unstaged`, and `untracked` sections when those states are present. JSON overview remains the stable flat `files` array.
 
 ```bash
 hitagi diff src/cli.rs
@@ -279,14 +280,31 @@ M src/cli.rs +12 -0 • rust
 +    Diff { ... }
 ```
 
-Each hunk's `symbol` / `kind` is the innermost parsed symbol that contains the hunk (Rust/TS/TSX/Python/Kotlin/Prisma only). Multi-symbol hunks include a `spans: [...]` field listing every overlapping qualname. Pure deletions still get annotated ~ the HEAD-side blob is fetched via `git show` and parsed in-memory (no cache write).
+Each hunk's `symbol` / `kind` is the innermost parsed symbol that contains the hunk (Rust/TS/TSX/Python/Kotlin/Prisma only). Multi-symbol hunks include a `spans: [...]` field listing every overlapping qualname. Pure deletions still get annotated ~ the HEAD-side blob is fetched via `git show` and parsed in-memory (no cache write). Untracked text files are drillable too: they render as synthetic added-file diffs, with symbols parsed from the working-tree file.
+
+```bash
+hitagi diff src/cli.rs src/output.rs
+```
+
+Multi-file drilldown concatenates file sections in text mode. JSON uses `{ "files": [ ... ] }`; one-file JSON stays the single `DiffFileResponse` shape for compatibility.
+
+```bash
+hitagi diff --summary --symbols
+```
+
+`--summary` emits compact per-file output for commit review. Add `--symbols` to include touched symbol names without hunk bodies.
 
 Flags:
 
 - `--symbol QUALNAME` ~ narrow drilldown to hunks overlapping one symbol. Same qualname/leaf semantics as the top-level `symbol` command (suggests near-misses on misspellings).
 - `--raw` ~ emit the unified diff text instead of structured hunks. Mutually exclusive with `--symbol`.
+- `--summary` ~ emit compact per-file summary output. With no paths, summarizes all visible diff entries; with paths, summarizes only those files.
+- `--symbols` ~ summary only: include touched symbols per file, capped to keep output small.
+- `--body full|changed-lines|added-only|none` ~ structured drilldown body detail. Default is `full`; `none` keeps ranges/symbols without hunk bodies.
+- `--snippet` ~ structured drilldown only: append the first changed line to each hunk header.
 - `--staged` ~ index vs base ref only.
 - `--unstaged` ~ working tree vs index only.
+- `--untracked` ~ untracked files only.
 - `--against REF` ~ compare against `REF` instead of `HEAD`. Validated; rejects leading `-`, `..`, NUL, and whitespace before any subprocess fires.
 - `--exclude PATTERN` (repeatable) ~ skip files in the overview. Same syntax as other commands.
 

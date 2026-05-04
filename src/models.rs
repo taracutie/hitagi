@@ -38,6 +38,10 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
 #[derive(Debug, Serialize)]
 pub struct OutputSymbol {
     pub kind: String,
@@ -314,6 +318,50 @@ pub struct DiffFileResponse {
 }
 
 #[derive(Debug, Serialize)]
+pub struct DiffMultiFileResponse {
+    pub files: Vec<DiffFileResponse>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DiffSummaryResponse {
+    pub files: Vec<DiffSummaryFile>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub against: Option<String>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub scope: String,
+    #[serde(skip_serializing_if = "is_false")]
+    pub clean: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DiffSummaryFile {
+    pub path: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub added: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub removed: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub symbols: Vec<String>,
+    #[serde(skip_serializing_if = "is_false")]
+    pub staged: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    pub unstaged: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    pub binary: bool,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub more_symbols: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct DiffHunk {
     /// Old-side line range [start, end_inclusive].
     pub old_lines: [usize; 2],
@@ -333,6 +381,9 @@ pub struct DiffHunk {
     /// single-symbol case.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub spans: Vec<String>,
+    /// Short first changed line. Emitted only when `diff --snippet` is used.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
     /// Hunk body (line-prefixed `+`/`-`/space). Suppressed only via the
     /// per-file size-cap fallback; in that case `note` on the file response
     /// explains.

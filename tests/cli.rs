@@ -1104,6 +1104,11 @@ fn long_help_includes_llm_prompt_sections() {
         "ANTI-PATTERNS",
         "JSON OUTPUT SHAPES",
         "--json",
+        "--summary",
+        "--symbols",
+        "--untracked",
+        "--body",
+        "multi-drilldown",
     ] {
         assert!(
             text.contains(needle),

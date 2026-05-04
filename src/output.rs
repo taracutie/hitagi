@@ -6,8 +6,9 @@ use crate::{
     error::{AppError, AppResult},
     models::{
         AgentPromptResponse, CacheClearResponse, CachePathResponse, CacheStatusResponse,
-        DiffFileResponse, DiffHunk, DiffOverviewResponse, FilesResponse, FindGroup, FindMatch,
-        FindMatches, FindResponse, LangsResponse, OutlineResponse, OutputSymbol, ReadFileResponse,
+        DiffFileResponse, DiffFileSummary, DiffHunk, DiffMultiFileResponse, DiffOverviewResponse,
+        DiffSummaryFile, DiffSummaryResponse, FilesResponse, FindGroup, FindMatch, FindMatches,
+        FindResponse, LangsResponse, OutlineResponse, OutputSymbol, ReadFileResponse,
         SearchResponse, SymbolResponse,
     },
 };
@@ -68,6 +69,14 @@ pub fn print_diff_overview(value: &DiffOverviewResponse, mode: OutputMode) -> Ap
 
 pub fn print_diff_file(path: &str, value: &DiffFileResponse, mode: OutputMode) -> AppResult<()> {
     emit(value, mode, || render_diff_file(path, value))
+}
+
+pub fn print_diff_files(value: &DiffMultiFileResponse, mode: OutputMode) -> AppResult<()> {
+    emit(value, mode, || render_diff_files(value))
+}
+
+pub fn print_diff_summary(value: &DiffSummaryResponse, mode: OutputMode) -> AppResult<()> {
+    emit(value, mode, || render_diff_summary(value))
 }
 
 fn emit<T, F>(value: &T, mode: OutputMode, render_text: F) -> AppResult<()>
@@ -440,34 +449,77 @@ fn render_diff_overview(value: &DiffOverviewResponse) -> String {
     if let Some(note) = &value.note {
         let _ = writeln!(out, "note • {note}");
     }
-    for file in &value.files {
-        let path = format!("{}{}", value.prefix, file.path);
-        let _ = write!(out, "{} {path}", file.status);
-        if let (Some(added), Some(removed)) = (file.added, file.removed) {
-            let _ = write!(out, " +{added} -{removed}");
-        }
-        if let Some(old_path) = &file.old_path {
-            if file.old_path_needs_prefix {
-                let _ = write!(out, " ← {}{}", value.prefix, old_path);
-            } else {
-                let _ = write!(out, " ← {old_path}");
+
+    let grouped = value.scope.is_empty()
+        && value
+            .files
+            .iter()
+            .any(|file| file.staged || file.unstaged || file.status == "?");
+    if grouped {
+        for (label, predicate) in [
+            ("staged+unstaged", 0u8),
+            ("staged", 1),
+            ("unstaged", 2),
+            ("untracked", 3),
+            ("other", 4),
+        ] {
+            let bucket: Vec<_> = value
+                .files
+                .iter()
+                .filter(|file| match predicate {
+                    0 => file.staged && file.unstaged,
+                    1 => file.staged && !file.unstaged,
+                    2 => file.unstaged && !file.staged,
+                    3 => file.status == "?",
+                    _ => !file.staged && !file.unstaged && file.status != "?",
+                })
+                .collect();
+            if bucket.is_empty() {
+                continue;
+            }
+            let _ = writeln!(out, "{label}");
+            for file in bucket {
+                render_diff_overview_file(&mut out, value, file);
             }
         }
-        if file.staged {
-            out.push_str(" • staged");
+    } else {
+        for file in &value.files {
+            render_diff_overview_file(&mut out, value, file);
         }
-        if file.unstaged {
-            out.push_str(" • unstaged");
-        }
-        if file.binary {
-            out.push_str(" • binary");
-        }
-        if let Some(note) = &file.note {
-            let _ = write!(out, " • {note}");
-        }
-        out.push('\n');
     }
     out
+}
+
+fn render_diff_overview_file(
+    out: &mut String,
+    value: &DiffOverviewResponse,
+    file: &DiffFileSummary,
+) {
+    let path = format!("{}{}", value.prefix, file.path);
+    let _ = write!(out, "{} {path}", file.status);
+    if let (Some(added), Some(removed)) = (file.added, file.removed) {
+        let _ = write!(out, " +{added} -{removed}");
+    }
+    if let Some(old_path) = &file.old_path {
+        if file.old_path_needs_prefix {
+            let _ = write!(out, " ← {}{}", value.prefix, old_path);
+        } else {
+            let _ = write!(out, " ← {old_path}");
+        }
+    }
+    if file.staged {
+        out.push_str(" • staged");
+    }
+    if file.unstaged {
+        out.push_str(" • unstaged");
+    }
+    if file.binary {
+        out.push_str(" • binary");
+    }
+    if let Some(note) = &file.note {
+        let _ = write!(out, " • {note}");
+    }
+    out.push('\n');
 }
 
 fn render_diff_file(path: &str, value: &DiffFileResponse) -> String {
@@ -502,6 +554,73 @@ fn render_diff_file(path: &str, value: &DiffFileResponse) -> String {
     out
 }
 
+fn render_diff_files(value: &DiffMultiFileResponse) -> String {
+    let mut out = String::new();
+    for (index, file) in value.files.iter().enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        out.push_str(&render_diff_file(&file.path, file));
+    }
+    out
+}
+
+fn render_diff_summary(value: &DiffSummaryResponse) -> String {
+    let mut out = String::new();
+    let mut header = "diff summary".to_string();
+    if let Some(against) = &value.against {
+        let _ = write!(header, " against {against}");
+    }
+    if !value.scope.is_empty() {
+        let _ = write!(header, " {}", value.scope);
+    }
+    let _ = writeln!(out, "{header}");
+    if value.clean {
+        out.push_str("clean\n");
+    } else {
+        let _ = writeln!(out, "{} files", value.files.len());
+    }
+    if let Some(note) = &value.note {
+        let _ = writeln!(out, "note • {note}");
+    }
+    for file in &value.files {
+        render_diff_summary_file(&mut out, file);
+    }
+    out
+}
+
+fn render_diff_summary_file(out: &mut String, file: &DiffSummaryFile) {
+    let _ = write!(out, "{} {}", file.status, file.path);
+    if let (Some(added), Some(removed)) = (file.added, file.removed) {
+        let _ = write!(out, " +{added} -{removed}");
+    }
+    if let Some(old_path) = &file.old_path {
+        let _ = write!(out, " ← {old_path}");
+    }
+    if let Some(language) = &file.language {
+        let _ = write!(out, " • {language}");
+    }
+    if !file.symbols.is_empty() {
+        let _ = write!(out, " • {}", file.symbols.join(", "));
+        if file.more_symbols > 0 {
+            let _ = write!(out, ", +{} more", file.more_symbols);
+        }
+    }
+    if file.staged {
+        out.push_str(" • staged");
+    }
+    if file.unstaged {
+        out.push_str(" • unstaged");
+    }
+    if file.binary {
+        out.push_str(" • binary");
+    }
+    if let Some(note) = &file.note {
+        let _ = write!(out, " • {note}");
+    }
+    out.push('\n');
+}
+
 fn render_diff_hunk(out: &mut String, hunk: &DiffHunk) {
     let _ = write!(
         out,
@@ -521,6 +640,9 @@ fn render_diff_hunk(out: &mut String, hunk: &DiffHunk) {
     }
     if !hunk.spans.is_empty() {
         let _ = write!(out, " • spans {}", hunk.spans.join(", "));
+    }
+    if let Some(snippet) = &hunk.snippet {
+        let _ = write!(out, " :: {snippet}");
     }
     out.push('\n');
     if let Some(body) = &hunk.body {

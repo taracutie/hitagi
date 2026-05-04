@@ -1,12 +1,12 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::{
     agent_prompt::{self, AgentKind},
     commands::{
-        self, DiffFileOptions, DiffOptions, DiffScope, FilesOptions, FindOptions, OutlineOptions,
-        ReadOptions, SearchOptions, SymbolOptions,
+        self, DiffBodyMode, DiffFileOptions, DiffOptions, DiffScope, DiffSummaryOptions,
+        FilesOptions, FindOptions, OutlineOptions, ReadOptions, SearchOptions, SymbolOptions,
     },
     error::{AppError, AppResult},
     output::{self, OutputMode},
@@ -38,7 +38,7 @@ RECOMMENDED WORKFLOW
   5. symbol <FILE> <Q>     read one symbol's body in isolation
   6. search <STR>          substring search with scope + match-line annotation
   7. read <FILE>           dump a file (use --lines to slice big files)
-  8. diff [FILE]           review uncommitted changes (overview, then drill)
+  8. diff [FILES...]       review uncommitted changes (overview, summary, or drill)
 
 SUPPORTED LANGUAGES
   PARSEABLE (full outline / symbol / find): Rust (.rs), TypeScript (.ts), TSX \
@@ -162,18 +162,20 @@ TIPS
 
   Uncommitted changes (`diff`)
     `diff` (no PATH) prints a per-file overview ~ status code (M/A/D/R/C/?),
-    ±line counts, staged/unstaged flags. Untracked files appear as `?` with no
-    counts (drilldown not supported; use `read` for content). `diff <PATH>`
-    prints structured hunks with the enclosing symbol annotated; pass --raw for
-    the unified diff text instead. `--symbol Q` filters hunks to those
-    overlapping one symbol (uses the same qualname/leaf semantics as `symbol`).
-    `--staged` / `--unstaged` narrow the scope; default combines both. Use
-    `--against REF` to compare against something other than HEAD (e.g. main).
-    Deleted files get their HEAD-side blob parsed in-memory so `symbol`
-    annotations still appear. The structured-hunks response degrades to ranges
-    + symbols (no `body`) when one file's diff exceeds the size cap; a top-
-    level `note` explains. Subprocess overhead is small (a few `git diff`
-    invocations).
+    ±line counts, staged/unstaged flags, and grouped text sections in the default
+    combined scope. `diff <PATH...>` prints structured hunks for one or more
+    files; one-path JSON remains the single-file response, multi-path JSON is
+    `{ \"files\": [...] }`. Untracked files are drillable as synthetic additions.
+    `--summary` emits compact per-file output for commit review; add `--symbols`
+    to include touched symbols. `--body full|changed-lines|added-only|none`
+    controls structured hunk bodies, and `--snippet` adds the first changed line
+    to each hunk header. Pass --raw for unified diff text instead. `--symbol Q`
+    filters a one-file drilldown to hunks overlapping one symbol. `--staged` /
+    `--unstaged` / `--untracked` narrow the scope. Use `--against REF` to compare
+    against something other than HEAD (e.g. main). Deleted files get their
+    HEAD-side blob parsed in-memory so `symbol` annotations still appear. The
+    structured-hunks response degrades to ranges + symbols (no `body`) when one
+    file's diff exceeds the size cap; a top-level `note` explains.
 
   Monorepo / repo-subdir scoping
     `diff` only ever surfaces changes inside the hitagi `--repo` subtree. When
@@ -207,8 +209,12 @@ COMMON PATTERNS
   Diverse sweep (cap hot files)   hitagi find X --terse --per-file 3
   What's uncommitted?             hitagi diff
   Hunks for one file?             hitagi diff src/foo.rs
+  Hunks for several files?        hitagi diff src/foo.rs src/bar.rs
   Diff for one symbol?            hitagi diff src/foo.rs --symbol Foo.bar
+  Commit-oriented summary?        hitagi diff --summary --symbols
+  Ranges without hunk bodies?      hitagi diff src/foo.rs --body none --snippet
   Just staged changes             hitagi diff --staged
+  Just untracked changes          hitagi diff --untracked
   Compare against main            hitagi diff --against main
 
 ANTI-PATTERNS (token waste)
@@ -251,12 +257,17 @@ JSON OUTPUT SHAPES (--json; compact form ~ omitted optional fields appear only w
             \"status\":\"M|A|D|R|C|?\",\"old_path\":\"...\"?,\"added\":N?,
             \"removed\":N?,\"staged\":bool?,\"unstaged\":bool?,\"binary\":
             bool?,\"note\":\"...\"?},...],\"against\":\"...\"?,
-            \"scope\":\"staged|unstaged\"?,\"clean\":bool?,\"note\":\"...\"?}
+            \"scope\":\"staged|unstaged|untracked\"?,\"clean\":bool?,\"note\":\"...\"?}
             drilldown: {\"path\":\"...\",\"status\":\"...\",\"old_path\":\"...\"?,
             \"added\":N?,\"removed\":N?,\"language\":\"...\"?,\"hunks\":
             [{\"old_lines\":[s,e],\"new_lines\":[s,e],\"added\":N,\"removed\":N,
-            \"symbol\":\"...\"?,\"kind\":\"...\"?,\"spans\":[\"...\"]?,\"body\":
-            \"...\"?}],\"raw\":\"...\"?,\"binary\":bool?,\"note\":\"...\"?}
+            \"symbol\":\"...\"?,\"kind\":\"...\"?,\"spans\":[\"...\"]?,
+            \"snippet\":\"...\"?,\"body\":\"...\"?}],\"raw\":\"...\"?,\"binary\":
+            bool?,\"note\":\"...\"?}
+            multi-drilldown: {\"files\":[{...drilldown...},...]}
+            summary: {\"files\":[{\"path\":\"...\",\"status\":\"...\",\"added\":N?,
+            \"removed\":N?,\"language\":\"...\"?,\"symbols\":[\"...\"]?,
+            \"more_symbols\":N?}],\"scope\":\"...\"?,\"against\":\"...\"?}
 
   find --terse override:
     matches (and each group's matches when grouped) becomes a flat list of
@@ -443,29 +454,45 @@ enum Commands {
     /// Show uncommitted changes (working tree vs HEAD by default).
     ///
     /// With no PATH, prints a one-entry-per-file overview (status, ±line counts,
-    /// staged/unstaged flags, untracked files). With PATH, prints structured
-    /// hunks annotated by enclosing symbol; pass --raw for the unified diff text
-    /// instead. Untracked files appear in the overview but cannot be drilled
-    /// into ~ use `read` for their content.
+    /// staged/unstaged flags, untracked files). With PATHS, prints structured
+    /// hunks annotated by enclosing symbol; pass --summary for compact commit
+    /// review, or --raw for unified diff text. Untracked files are drillable as
+    /// synthetic additions.
     Diff {
-        /// Optional file path. Repo-relative; suffix resolution operates against
+        /// Optional file paths. Repo-relative; suffix resolution operates against
         /// the diff's own file list (so `Button.tsx` resolves like `outline`,
         /// and deleted files resolve too). Omit to print the overview.
-        path: Option<String>,
+        paths: Vec<String>,
         /// Narrow drilldown to hunks overlapping one symbol (qualname or unique
-        /// leaf). Requires PATH. Mutually exclusive with --raw.
+        /// leaf). Requires exactly one PATH. Mutually exclusive with --raw.
         #[arg(long, value_name = "QUALNAME", conflicts_with = "raw")]
         symbol: Option<String>,
         /// Drilldown only: emit raw unified diff text instead of structured
-        /// hunks. Requires PATH.
+        /// hunks. Requires one or more PATHS.
         #[arg(long)]
         raw: bool,
+        /// Summary mode: compact per-file output for commit review. With
+        /// --symbols, includes touched symbol names instead of hunk bodies.
+        #[arg(long)]
+        summary: bool,
+        /// Summary only: include touched symbols per file.
+        #[arg(long, requires = "summary")]
+        symbols: bool,
+        /// Structured drilldown body detail.
+        #[arg(long, value_enum, default_value_t = CliDiffBodyMode::Full)]
+        body: CliDiffBodyMode,
+        /// Structured drilldown only: add the first changed line to each hunk header.
+        #[arg(long)]
+        snippet: bool,
         /// Show only staged changes (index vs the base ref).
-        #[arg(long, conflicts_with = "unstaged")]
+        #[arg(long, conflicts_with_all = ["unstaged", "untracked"])]
         staged: bool,
         /// Show only unstaged changes (working tree vs index).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "untracked")]
         unstaged: bool,
+        /// Show only untracked files.
+        #[arg(long)]
+        untracked: bool,
         /// Compare against this ref instead of HEAD (e.g. `--against main`).
         #[arg(long, value_name = "REF", default_value = "HEAD")]
         against: String,
@@ -474,6 +501,25 @@ enum Commands {
         #[arg(long, value_name = "PATTERN")]
         exclude: Vec<String>,
     },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum CliDiffBodyMode {
+    Full,
+    ChangedLines,
+    AddedOnly,
+    None,
+}
+
+impl From<CliDiffBodyMode> for DiffBodyMode {
+    fn from(value: CliDiffBodyMode) -> Self {
+        match value {
+            CliDiffBodyMode::Full => DiffBodyMode::Full,
+            CliDiffBodyMode::ChangedLines => DiffBodyMode::ChangedLines,
+            CliDiffBodyMode::AddedOnly => DiffBodyMode::AddedOnly,
+            CliDiffBodyMode::None => DiffBodyMode::None,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -620,11 +666,16 @@ pub fn run() -> AppResult<()> {
                     }
                 },
                 Commands::Diff {
-                    path,
+                    paths,
                     symbol,
                     raw,
+                    summary,
+                    symbols,
+                    body,
+                    snippet,
                     staged,
                     unstaged,
+                    untracked,
                     against,
                     exclude,
                 } => {
@@ -632,6 +683,8 @@ pub fn run() -> AppResult<()> {
                         DiffScope::Staged
                     } else if unstaged {
                         DiffScope::Unstaged
+                    } else if untracked {
+                        DiffScope::Untracked
                     } else {
                         DiffScope::All
                     };
@@ -640,16 +693,74 @@ pub fn run() -> AppResult<()> {
                         against,
                         excludes: exclude,
                     };
-                    match path {
-                        None => {
-                            let response = commands::diff_overview(&repo, opts)?;
-                            output::print_diff_overview(&response, mode)
+                    let body = DiffBodyMode::from(body);
+                    if summary {
+                        if raw {
+                            return Err(AppError::bad_request(
+                                "--summary and --raw cannot be combined",
+                            ));
                         }
-                        Some(p) => {
-                            let drill = DiffFileOptions { symbol, raw };
-                            let response = commands::diff_file(&repo, &p, opts, drill)?;
-                            output::print_diff_file(&p, &response, mode)
+                        if symbol.is_some() {
+                            return Err(AppError::bad_request(
+                                "--summary and --symbol cannot be combined",
+                            ));
                         }
+                        if body != DiffBodyMode::Full {
+                            return Err(AppError::bad_request(
+                                "--summary and --body cannot be combined",
+                            ));
+                        }
+                        if snippet {
+                            return Err(AppError::bad_request(
+                                "--summary and --snippet cannot be combined",
+                            ));
+                        }
+                        let response = commands::diff_summary(
+                            &repo,
+                            &paths,
+                            opts,
+                            DiffSummaryOptions { symbols },
+                        )?;
+                        return output::print_diff_summary(&response, mode);
+                    }
+                    if paths.is_empty() {
+                        if raw {
+                            return Err(AppError::bad_request("--raw requires PATH"));
+                        }
+                        if symbol.is_some() {
+                            return Err(AppError::bad_request("--symbol requires PATH"));
+                        }
+                        if body != DiffBodyMode::Full {
+                            return Err(AppError::bad_request("--body requires PATH"));
+                        }
+                        if snippet {
+                            return Err(AppError::bad_request("--snippet requires PATH"));
+                        }
+                        let response = commands::diff_overview(&repo, opts)?;
+                        output::print_diff_overview(&response, mode)
+                    } else if paths.len() == 1 {
+                        let drill = DiffFileOptions {
+                            symbol,
+                            raw,
+                            body,
+                            snippet,
+                        };
+                        let response = commands::diff_file(&repo, &paths[0], opts, drill)?;
+                        output::print_diff_file(&paths[0], &response, mode)
+                    } else {
+                        if symbol.is_some() {
+                            return Err(AppError::bad_request(
+                                "--symbol requires exactly one PATH",
+                            ));
+                        }
+                        let drill = DiffFileOptions {
+                            symbol: None,
+                            raw,
+                            body,
+                            snippet,
+                        };
+                        let response = commands::diff_files(&repo, &paths, opts, drill)?;
+                        output::print_diff_files(&response, mode)
                     }
                 }
                 Commands::Install { .. } | Commands::Uninstall { .. } => unreachable!(),

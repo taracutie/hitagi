@@ -561,6 +561,91 @@ fn drilldown_binary_file_marks_binary_true_no_hunks() {
     assert!(v.get("hunks").is_none());
 }
 
+#[test]
+fn multi_file_drilldown_returns_files_array_without_changing_single_file_shape() {
+    let r = DiffRepo::new("multi-file");
+    r.write("a.rs", "pub fn a() {}\n");
+    r.write("b.rs", "pub fn b() {}\n");
+    r.commit("base");
+    r.write("a.rs", "pub fn aa() {}\n");
+    r.write("b.rs", "pub fn bb() {}\n");
+
+    let single = r.run(&["diff", "a.rs"]);
+    assert_eq!(single["path"], "a.rs");
+    assert!(single.get("files").is_none());
+
+    let multi = r.run(&["diff", "a.rs", "b.rs"]);
+    let files = multi["files"].as_array().unwrap();
+    assert_eq!(files.len(), 2);
+    assert_eq!(files[0]["path"], "a.rs");
+    assert_eq!(files[1]["path"], "b.rs");
+    assert!(files[0]["hunks"].is_array());
+    assert!(files[1]["hunks"].is_array());
+}
+
+#[test]
+fn summary_mode_returns_compact_files_and_symbols_when_requested() {
+    let r = DiffRepo::new("summary");
+    r.write(
+        "a.rs",
+        "pub fn alpha() {\n    let x = 1;\n}\n\npub fn beta() {\n    let y = 2;\n}\n",
+    );
+    r.commit("base");
+    r.write(
+        "a.rs",
+        "pub fn alpha() {\n    let x = 11;\n}\n\npub fn beta() {\n    let y = 2;\n}\n",
+    );
+
+    let compact = r.run(&["diff", "--summary"]);
+    let files = compact["files"].as_array().unwrap();
+    assert_eq!(files.len(), 1);
+    assert!(files[0].get("hunks").is_none());
+    assert!(files[0].get("symbols").is_none());
+
+    let with_symbols = r.run(&["diff", "--summary", "--symbols"]);
+    let symbols = with_symbols["files"][0]["symbols"].as_array().unwrap();
+    assert!(symbols.iter().any(|s| s == "alpha"));
+}
+
+#[test]
+fn drilldown_body_modes_and_snippet_reduce_hunk_context() {
+    let r = DiffRepo::new("body-modes");
+    r.write("a.rs", "pub fn a() {\n    let x = 1;\n}\n");
+    r.commit("base");
+    r.write("a.rs", "pub fn a() {\n    let x = 2;\n}\n");
+
+    let none = r.run(&["diff", "a.rs", "--body", "none"]);
+    let hunk = &none["hunks"].as_array().unwrap()[0];
+    assert!(hunk.get("body").is_none());
+
+    let added_only = r.run(&["diff", "a.rs", "--body", "added-only"]);
+    let body = added_only["hunks"][0]["body"].as_str().unwrap();
+    assert!(body.contains("+    let x = 2;"));
+    assert!(!body.contains("-    let x = 1;"));
+
+    let snippet = r.run(&["diff", "a.rs", "--body", "none", "--snippet"]);
+    assert_eq!(snippet["hunks"][0]["snippet"], "-    let x = 1;");
+}
+
+#[test]
+fn invalid_diff_flag_combinations_fail_clearly() {
+    let r = DiffRepo::new("invalid-flags");
+    r.write("a.rs", "pub fn a() {}\n");
+    r.write("b.rs", "pub fn b() {}\n");
+    r.commit("base");
+    r.write("a.rs", "pub fn aa() {}\n");
+    r.write("b.rs", "pub fn bb() {}\n");
+
+    let stderr = r.run_failure(&["diff", "--raw"]);
+    assert!(stderr.contains("--raw requires PATH"));
+
+    let stderr = r.run_failure(&["diff", "a.rs", "b.rs", "--symbol", "a"]);
+    assert!(stderr.contains("--symbol requires exactly one PATH"));
+
+    let stderr = r.run_failure(&["diff", "a.rs", "--raw", "--snippet"]);
+    assert!(stderr.contains("--raw and --snippet cannot be combined"));
+}
+
 // ~~ Edge cases ~~
 
 #[test]
@@ -640,15 +725,54 @@ fn drilldown_ambiguous_suffix_errors_with_candidates() {
 }
 
 #[test]
-fn drilldown_untracked_file_returns_helpful_note() {
+fn drilldown_untracked_file_emits_added_hunk_with_symbol_annotation() {
     let r = DiffRepo::new("drill-untracked");
     r.write("a.rs", "pub fn a() {}\n");
     r.commit("base");
-    r.write("notes.txt", "fresh untracked content\n");
+    r.write("new.rs", "pub fn fresh() {\n    let x = 1;\n}\n");
 
-    let v = r.run(&["diff", "notes.txt"]);
+    let v = r.run(&["diff", "new.rs"]);
     assert_eq!(v["status"], "?");
-    assert!(v["note"].as_str().unwrap().contains("untracked"));
+    assert_eq!(v["added"], 3);
+    assert_eq!(v["removed"], 0);
+    let hunks = v["hunks"].as_array().unwrap();
+    assert_eq!(hunks[0]["symbol"], "fresh");
+    assert!(hunks[0]["body"].as_str().unwrap().contains("+pub fn fresh"));
+}
+
+#[test]
+fn drilldown_untracked_raw_returns_synthetic_unified_diff() {
+    let r = DiffRepo::new("drill-untracked-raw");
+    r.write("a.rs", "pub fn a() {}\n");
+    r.commit("base");
+    r.write("new.rs", "pub fn fresh() {}\n");
+
+    let v = r.run(&["diff", "new.rs", "--raw"]);
+    assert_eq!(v["status"], "?");
+    assert!(v.get("hunks").is_none());
+    let raw = v["raw"].as_str().unwrap();
+    assert!(raw.contains("new file mode 100644"));
+    assert!(raw.contains("--- /dev/null"));
+    assert!(raw.contains("+pub fn fresh"));
+}
+
+#[test]
+fn overview_untracked_scope_only_lists_untracked_files() {
+    let r = DiffRepo::new("scope-untracked");
+    r.write("a.rs", "pub fn a() {}\n");
+    r.commit("base");
+    r.write("a.rs", "pub fn aa() {}\n");
+    r.write("new.rs", "pub fn fresh() {}\n");
+
+    let v = r.run(&["diff", "--untracked"]);
+    assert_eq!(v["scope"], "untracked");
+    let paths: Vec<&str> = v["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, vec!["new.rs"]);
 }
 
 #[test]
@@ -911,6 +1035,25 @@ fn default_diff_output_is_concise_text() {
         serde_json::from_str::<Value>(&text).is_err(),
         "default diff output should not be JSON"
     );
+}
+
+#[test]
+fn default_diff_text_groups_combined_scope_by_change_state() {
+    let r = DiffRepo::new("text-groups");
+    r.write("a.rs", "pub fn a() {}\n");
+    r.write("b.rs", "pub fn b() {}\n");
+    r.commit("base");
+
+    r.write("a.rs", "pub fn aa() {}\n");
+    r.add("a.rs");
+    r.write("a.rs", "pub fn aaa() {}\n");
+    r.write("b.rs", "pub fn bb() {}\n");
+    r.write("new.rs", "pub fn fresh() {}\n");
+
+    let text = r.run_text(&["diff"]);
+    assert!(text.contains("staged+unstaged\n"), "{text}");
+    assert!(text.contains("unstaged\n"), "{text}");
+    assert!(text.contains("untracked\n"), "{text}");
 }
 
 #[test]

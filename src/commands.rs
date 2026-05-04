@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::fmt::Write;
 use std::fs::Metadata;
 use std::path::{Path, PathBuf};
 
@@ -12,10 +13,11 @@ use crate::{
     lang::{count_lines, Language, LineStats},
     models::{
         CacheClearResponse, CacheLangCount, CachePathResponse, CacheStatusResponse,
-        DiffFileResponse, DiffFileSummary, DiffHunk, DiffOverviewResponse, FilesResponse,
-        FindGroup, FindMatch, FindMatches, FindResponse, LangSummary, LangsResponse,
-        OutlineResponse, OutputSymbol, OutputSymbolDetail, ReadFileResponse, SearchGroup,
-        SearchResponse, SymbolDetail, SymbolInfo, SymbolResponse,
+        DiffFileResponse, DiffFileSummary, DiffHunk, DiffMultiFileResponse, DiffOverviewResponse,
+        DiffSummaryFile, DiffSummaryResponse, FilesResponse, FindGroup, FindMatch, FindMatches,
+        FindResponse, LangSummary, LangsResponse, OutlineResponse, OutputSymbol,
+        OutputSymbolDetail, ReadFileResponse, SearchGroup, SearchResponse, SymbolDetail,
+        SymbolInfo, SymbolResponse,
     },
     parser::{parse_source, ParsedFile},
     queries::{
@@ -92,6 +94,21 @@ pub enum DiffScope {
     All,
     Staged,
     Unstaged,
+    Untracked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffBodyMode {
+    Full,
+    ChangedLines,
+    AddedOnly,
+    None,
+}
+
+impl Default for DiffBodyMode {
+    fn default() -> Self {
+        Self::Full
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -106,6 +123,13 @@ pub struct DiffOptions {
 pub struct DiffFileOptions {
     pub symbol: Option<String>,
     pub raw: bool,
+    pub body: DiffBodyMode,
+    pub snippet: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DiffSummaryOptions {
+    pub symbols: bool,
 }
 
 struct LoadedSource {
@@ -952,8 +976,14 @@ pub fn diff_overview(repo: &RepoRoot, opts: DiffOptions) -> AppResult<DiffOvervi
     // additionally probes staged-only and unstaged-only sets so per-file
     // staged/unstaged booleans are accurate; narrow scopes skip those probes.
     let (cached, base_ref) = scope_to_diff_args(&opts);
-    let primary_entries = git::name_status(&git_root.toplevel, base_ref, cached)?;
-    let primary_numstat = git::numstat(&git_root.toplevel, base_ref, cached)?;
+    let (primary_entries, primary_numstat) = if opts.scope == DiffScope::Untracked {
+        (Vec::new(), Vec::new())
+    } else {
+        (
+            git::name_status(&git_root.toplevel, base_ref, cached)?,
+            git::numstat(&git_root.toplevel, base_ref, cached)?,
+        )
+    };
 
     let (staged_set, unstaged_set) = if opts.scope == DiffScope::All {
         // Renames have two endpoints; insert both so cross-subtree rename
@@ -1152,6 +1182,7 @@ pub fn diff_overview(repo: &RepoRoot, opts: DiffOptions) -> AppResult<DiffOvervi
         DiffScope::All => String::new(),
         DiffScope::Staged => "staged".to_string(),
         DiffScope::Unstaged => "unstaged".to_string(),
+        DiffScope::Untracked => "untracked".to_string(),
     };
     let note = if filtered_count > 0 {
         Some(format!(
@@ -1183,6 +1214,14 @@ pub fn diff_file(
             "--symbol and --raw cannot be combined",
         ));
     }
+    if drill.raw && drill.body != DiffBodyMode::Full {
+        return Err(AppError::bad_request("--raw and --body cannot be combined"));
+    }
+    if drill.raw && drill.snippet {
+        return Err(AppError::bad_request(
+            "--raw and --snippet cannot be combined",
+        ));
+    }
 
     git::validate_ref(&opts.against)?;
     let git_root = git::resolve_git_root(repo.root())?;
@@ -1197,25 +1236,8 @@ pub fn diff_file(
     let candidates = collect_diff_candidates(&git_root, &opts)?;
     let candidate = resolve_diff_path(&candidates, &normalized, path)?.clone();
 
-    // Untracked files have no diff to show ~ surface a clear note.
     if candidate.status == UNTRACKED_STATUS {
-        let language = Language::detect(Path::new(&candidate.repo_relative))
-            .ok()
-            .map(|l| l.as_str().to_string());
-        return Ok(DiffFileResponse {
-            path: candidate.repo_relative,
-            status: UNTRACKED_STATUS.to_string(),
-            old_path: None,
-            added: None,
-            removed: None,
-            language,
-            raw: None,
-            hunks: None,
-            note: Some(
-                "untracked file ~ no diff to show, use `hitagi read` for content".to_string(),
-            ),
-            binary: false,
-        });
+        return diff_untracked_file(repo, &git_root, &candidate, drill);
     }
 
     let (cached, base_ref) = scope_to_diff_args(&opts);
@@ -1318,7 +1340,7 @@ pub fn diff_file(
     let mut hunks: Vec<DiffHunk> = parsed_unified
         .hunks
         .iter()
-        .map(|h| build_diff_hunk(h, &symbols))
+        .map(|h| build_diff_hunk(h, &symbols, drill.body, drill.snippet))
         .collect();
 
     if let Some(query) = drill.symbol.as_deref() {
@@ -1367,6 +1389,241 @@ pub fn diff_file(
     })
 }
 
+pub fn diff_files(
+    repo: &RepoRoot,
+    paths: &[String],
+    opts: DiffOptions,
+    drill: DiffFileOptions,
+) -> AppResult<DiffMultiFileResponse> {
+    let mut files = Vec::with_capacity(paths.len());
+    for path in paths {
+        files.push(diff_file(repo, path, opts.clone(), drill.clone())?);
+    }
+    Ok(DiffMultiFileResponse { files })
+}
+
+pub fn diff_summary(
+    repo: &RepoRoot,
+    paths: &[String],
+    opts: DiffOptions,
+    summary: DiffSummaryOptions,
+) -> AppResult<DiffSummaryResponse> {
+    let against = if opts.against == DEFAULT_AGAINST_REF {
+        None
+    } else {
+        Some(opts.against.clone())
+    };
+    let scope = match opts.scope {
+        DiffScope::All => String::new(),
+        DiffScope::Staged => "staged".to_string(),
+        DiffScope::Unstaged => "unstaged".to_string(),
+        DiffScope::Untracked => "untracked".to_string(),
+    };
+
+    if paths.is_empty() && !summary.symbols {
+        let overview = diff_overview(repo, opts)?;
+        let prefix = overview.prefix.clone();
+        let files = overview
+            .files
+            .into_iter()
+            .map(|f| {
+                let old_path_needs_prefix = f.old_path_needs_prefix;
+                DiffSummaryFile {
+                    path: format!("{}{}", prefix, f.path),
+                    status: f.status,
+                    old_path: f.old_path.map(|old| {
+                        if old_path_needs_prefix {
+                            format!("{}{}", prefix, old)
+                        } else {
+                            old
+                        }
+                    }),
+                    added: f.added,
+                    removed: f.removed,
+                    language: None,
+                    symbols: Vec::new(),
+                    staged: f.staged,
+                    unstaged: f.unstaged,
+                    binary: f.binary,
+                    more_symbols: 0,
+                    note: f.note,
+                }
+            })
+            .collect();
+        return Ok(DiffSummaryResponse {
+            files,
+            against: overview.against,
+            scope: overview.scope,
+            clean: overview.clean,
+            note: overview.note,
+        });
+    }
+
+    let target_paths = if paths.is_empty() {
+        let overview = diff_overview(repo, opts.clone())?;
+        let prefix = overview.prefix;
+        overview
+            .files
+            .into_iter()
+            .map(|f| format!("{}{}", prefix, f.path))
+            .collect::<Vec<_>>()
+    } else {
+        paths.to_vec()
+    };
+
+    let drill = DiffFileOptions {
+        symbol: None,
+        raw: false,
+        body: DiffBodyMode::None,
+        snippet: false,
+    };
+    let mut files = Vec::with_capacity(target_paths.len());
+    for path in target_paths {
+        let file = diff_file(repo, &path, opts.clone(), drill.clone())?;
+        files.push(summary_from_file(file, summary.symbols));
+    }
+    Ok(DiffSummaryResponse {
+        clean: files.is_empty(),
+        files,
+        against,
+        scope,
+        note: None,
+    })
+}
+
+fn diff_untracked_file(
+    repo: &RepoRoot,
+    git_root: &git::GitRoot,
+    candidate: &DiffCandidate,
+    drill: DiffFileOptions,
+) -> AppResult<DiffFileResponse> {
+    let full_path = repo.root().join(&candidate.repo_relative);
+    let language_label = Language::detect(Path::new(&candidate.repo_relative))
+        .ok()
+        .map(|l| l.as_str().to_string());
+
+    let bytes = std::fs::read(&full_path)?;
+    if bytes.len() > MAX_FILE_BYTES {
+        return Ok(DiffFileResponse {
+            path: candidate.repo_relative.clone(),
+            status: UNTRACKED_STATUS.to_string(),
+            old_path: None,
+            added: None,
+            removed: None,
+            language: language_label,
+            raw: None,
+            hunks: None,
+            note: Some(format!(
+                "untracked file exceeded size limit ({} bytes); use `hitagi read --lines` to inspect slices",
+                bytes.len()
+            )),
+            binary: false,
+        });
+    }
+    if bytes.contains(&0) {
+        return Ok(DiffFileResponse {
+            path: candidate.repo_relative.clone(),
+            status: UNTRACKED_STATUS.to_string(),
+            old_path: None,
+            added: None,
+            removed: None,
+            language: language_label,
+            raw: None,
+            hunks: None,
+            note: Some("binary untracked file ~ no diff content".to_string()),
+            binary: true,
+        });
+    }
+    let content = match std::str::from_utf8(&bytes) {
+        Ok(content) => content,
+        Err(_) => {
+            return Ok(DiffFileResponse {
+                path: candidate.repo_relative.clone(),
+                status: UNTRACKED_STATUS.to_string(),
+                old_path: None,
+                added: None,
+                removed: None,
+                language: language_label,
+                raw: None,
+                hunks: None,
+                note: Some("non-UTF-8 untracked file ~ no diff content".to_string()),
+                binary: true,
+            });
+        }
+    };
+
+    let added = count_added_lines(content);
+    if drill.raw {
+        let raw = synthetic_untracked_raw(&candidate.repo_relative, content, added);
+        return Ok(DiffFileResponse {
+            path: candidate.repo_relative.clone(),
+            status: UNTRACKED_STATUS.to_string(),
+            old_path: None,
+            added: Some(added),
+            removed: Some(0),
+            language: language_label,
+            raw: Some(raw),
+            hunks: None,
+            note: None,
+            binary: false,
+        });
+    }
+
+    let (lang_label, language, symbols) =
+        collect_symbols_for_diff(repo, git_root, candidate, DEFAULT_AGAINST_REF)?;
+    let mut hunks = if content.is_empty() {
+        Vec::new()
+    } else {
+        let parsed = git::ParsedHunk {
+            raw: git::RawHunk {
+                old_start: 0,
+                old_len: 0,
+                new_start: 1,
+                new_len: added,
+            },
+            body: synthetic_added_body(content),
+            added,
+            removed: 0,
+        };
+        vec![build_diff_hunk(
+            &parsed,
+            &symbols,
+            drill.body,
+            drill.snippet,
+        )]
+    };
+
+    if let Some(query) = drill.symbol.as_deref() {
+        let language = language.ok_or_else(|| {
+            AppError::unsupported(format!(
+                "no parser for {} (cannot filter by --symbol on non-parseable files)",
+                candidate.repo_relative
+            ))
+        })?;
+        let parsed_file = ParsedFile {
+            language,
+            symbols: symbols.clone(),
+        };
+        let target = resolve_symbol(&parsed_file, query)?;
+        let lo = target.range.start_line;
+        let hi = target.range.end_line;
+        hunks.retain(|h| h.new_lines[0] <= hi && h.new_lines[1] >= lo);
+    }
+
+    Ok(DiffFileResponse {
+        path: candidate.repo_relative.clone(),
+        status: UNTRACKED_STATUS.to_string(),
+        old_path: None,
+        added: Some(added),
+        removed: Some(0),
+        language: lang_label,
+        raw: None,
+        hunks: Some(hunks),
+        note: None,
+        binary: false,
+    })
+}
+
 #[derive(Debug, Clone)]
 struct DiffCandidate {
     repo_relative: String,
@@ -1380,6 +1637,7 @@ fn scope_to_diff_args(opts: &DiffOptions) -> (bool, Option<&str>) {
         DiffScope::All => (false, Some(opts.against.as_str())),
         DiffScope::Staged => (true, Some(opts.against.as_str())),
         DiffScope::Unstaged => (false, None),
+        DiffScope::Untracked => (false, None),
     }
 }
 
@@ -1398,39 +1656,41 @@ fn collect_diff_candidates(
     git_root: &git::GitRoot,
     opts: &DiffOptions,
 ) -> AppResult<Vec<DiffCandidate>> {
-    let (cached, base_ref) = scope_to_diff_args(opts);
-    let entries = git::name_status(&git_root.toplevel, base_ref, cached)?;
-
     let mut candidates: Vec<DiffCandidate> = Vec::new();
-    for e in entries.into_iter() {
-        let new_in = rebase_to_subdir(&e.path, &git_root.repo_subdir);
-        let old_in = e
-            .old_path
-            .as_deref()
-            .and_then(|p| rebase_to_subdir(p, &git_root.repo_subdir));
-        let is_rename = e.old_path.is_some();
-        match (new_in, old_in, is_rename) {
-            (Some(repo_relative), _, _) => {
-                // Destination of a rename, OR a plain in-subtree change.
-                candidates.push(DiffCandidate {
-                    repo_relative,
-                    toplevel_relative: e.path,
-                    status: e.status,
-                    old_path: e.old_path,
-                });
+    if opts.scope != DiffScope::Untracked {
+        let (cached, base_ref) = scope_to_diff_args(opts);
+        let entries = git::name_status(&git_root.toplevel, base_ref, cached)?;
+
+        for e in entries.into_iter() {
+            let new_in = rebase_to_subdir(&e.path, &git_root.repo_subdir);
+            let old_in = e
+                .old_path
+                .as_deref()
+                .and_then(|p| rebase_to_subdir(p, &git_root.repo_subdir));
+            let is_rename = e.old_path.is_some();
+            match (new_in, old_in, is_rename) {
+                (Some(repo_relative), _, _) => {
+                    // Destination of a rename, OR a plain in-subtree change.
+                    candidates.push(DiffCandidate {
+                        repo_relative,
+                        toplevel_relative: e.path,
+                        status: e.status,
+                        old_path: e.old_path,
+                    });
+                }
+                (None, Some(repo_relative), true) => {
+                    // Cross-subtree rename departing ~ surface the old side as D
+                    // so `hitagi diff <old-path>` resolves and drills the deletion.
+                    let toplevel_relative = e.old_path.expect("rename has old_path");
+                    candidates.push(DiffCandidate {
+                        repo_relative,
+                        toplevel_relative,
+                        status: 'D',
+                        old_path: None,
+                    });
+                }
+                _ => {}
             }
-            (None, Some(repo_relative), true) => {
-                // Cross-subtree rename departing ~ surface the old side as D
-                // so `hitagi diff <old-path>` resolves and drills the deletion.
-                let toplevel_relative = e.old_path.expect("rename has old_path");
-                candidates.push(DiffCandidate {
-                    repo_relative,
-                    toplevel_relative,
-                    status: 'D',
-                    old_path: None,
-                });
-            }
-            _ => {}
         }
     }
 
@@ -1552,7 +1812,12 @@ fn collect_symbols_for_diff(
     }
 }
 
-fn build_diff_hunk(h: &git::ParsedHunk, symbols: &[SymbolInfo]) -> DiffHunk {
+fn build_diff_hunk(
+    h: &git::ParsedHunk,
+    symbols: &[SymbolInfo],
+    body_mode: DiffBodyMode,
+    include_snippet: bool,
+) -> DiffHunk {
     let new_lo = if h.raw.new_len == 0 {
         // Pure deletion at this anchor ~ pin to the new-side line.
         h.raw.new_start.max(1)
@@ -1586,8 +1851,115 @@ fn build_diff_hunk(h: &git::ParsedHunk, symbols: &[SymbolInfo]) -> DiffHunk {
         symbol: primary.map(|s| s.qualname.clone()),
         kind: primary.map(|s| s.kind.clone()),
         spans,
-        body: Some(h.body.clone()),
+        snippet: include_snippet
+            .then(|| diff_hunk_snippet(&h.body))
+            .flatten(),
+        body: filtered_diff_body(&h.body, body_mode),
     }
+}
+
+fn filtered_diff_body(body: &str, mode: DiffBodyMode) -> Option<String> {
+    match mode {
+        DiffBodyMode::Full => Some(body.to_string()),
+        DiffBodyMode::ChangedLines => Some(
+            body.lines()
+                .filter(|line| line.starts_with('+') || line.starts_with('-'))
+                .map(|line| format!("{line}\n"))
+                .collect(),
+        ),
+        DiffBodyMode::AddedOnly => Some(
+            body.lines()
+                .filter(|line| line.starts_with('+'))
+                .map(|line| format!("{line}\n"))
+                .collect(),
+        ),
+        DiffBodyMode::None => None,
+    }
+}
+
+fn diff_hunk_snippet(body: &str) -> Option<String> {
+    body.lines()
+        .find(|line| line.starts_with('+') || line.starts_with('-'))
+        .map(|line| {
+            let trimmed = line.trim();
+            trimmed.chars().take(100).collect::<String>()
+        })
+}
+
+fn count_added_lines(content: &str) -> usize {
+    if content.is_empty() {
+        0
+    } else {
+        content.lines().count()
+    }
+}
+
+fn synthetic_added_body(content: &str) -> String {
+    let mut body = String::new();
+    for line in content.split_inclusive('\n') {
+        body.push('+');
+        body.push_str(line);
+    }
+    body
+}
+
+fn synthetic_untracked_raw(path: &str, content: &str, added: usize) -> String {
+    let mut raw = String::new();
+    let _ = writeln!(raw, "diff --git a/{path} b/{path}");
+    raw.push_str("new file mode 100644\n");
+    raw.push_str("--- /dev/null\n");
+    let _ = writeln!(raw, "+++ b/{path}");
+    if added > 0 {
+        let _ = writeln!(raw, "@@ -0,0 +1,{added} @@");
+        raw.push_str(&synthetic_added_body(content));
+        if !raw.ends_with('\n') {
+            raw.push('\n');
+        }
+    }
+    raw
+}
+
+const SUMMARY_SYMBOL_LIMIT: usize = 8;
+
+fn summary_from_file(file: DiffFileResponse, include_symbols: bool) -> DiffSummaryFile {
+    let (symbols, more_symbols) = if include_symbols {
+        summary_symbols(file.hunks.as_deref())
+    } else {
+        (Vec::new(), 0)
+    };
+
+    DiffSummaryFile {
+        path: file.path,
+        status: file.status,
+        old_path: file.old_path,
+        added: file.added,
+        removed: file.removed,
+        language: file.language,
+        symbols,
+        staged: false,
+        unstaged: false,
+        binary: file.binary,
+        more_symbols,
+        note: file.note,
+    }
+}
+
+fn summary_symbols(hunks: Option<&[DiffHunk]>) -> (Vec<String>, usize) {
+    let mut all = BTreeSet::new();
+    if let Some(hunks) = hunks {
+        for hunk in hunks {
+            if let Some(symbol) = &hunk.symbol {
+                all.insert(symbol.clone());
+            }
+            for span in &hunk.spans {
+                all.insert(span.clone());
+            }
+        }
+    }
+
+    let more = all.len().saturating_sub(SUMMARY_SYMBOL_LIMIT);
+    let symbols = all.into_iter().take(SUMMARY_SYMBOL_LIMIT).collect();
+    (symbols, more)
 }
 
 fn to_output_symbol(s: SymbolInfo, include_bytes: bool) -> OutputSymbol {
