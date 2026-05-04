@@ -15,6 +15,7 @@ use crate::{
 
 const DEFAULT_SEARCH_LIMIT: usize = 50;
 const DEFAULT_FIND_LIMIT: usize = 50;
+const DEFAULT_PER_FILE: usize = 5;
 const DEFAULT_FILES_LIMIT: usize = 2000;
 
 const LONG_ABOUT: &str = "\
@@ -101,7 +102,9 @@ TIPS
   --kind filter
     Case-insensitive (function, Function, FUNCTION all match). When --kind matches
     nothing, the response includes `available_kinds: [...]` so you know what was
-    actually present ~ no need for a second probe call.
+    actually present ~ no need for a second probe call. Aliases: callable =
+    function/method/arrow_function, container = class/struct/interface/enum/trait/
+    object, value = property/field/variant.
 
   outline --depth N
     Limits nesting depth: --depth 1 keeps top-level shapes only; --depth 2 also
@@ -111,11 +114,12 @@ TIPS
 
   find --terse
     Compact output mode. `matches` becomes a list of strings like
-    `path:line qualname(kind)` instead of structured objects ~ ~3x smaller for
-    sweep queries. With --snippet the line continues with ` :: <signature>`.
+    `path:line qualname(kind)` instead of structured objects. Most useful with
+    --json or grouped multi-prefix sweeps. With --snippet the line continues
+    with ` :: <signature>`.
 
   find --per-file N
-    Cap matches per file at N (default 0 = no cap). Useful when one file has
+    Cap matches per file at N (default 5; pass 0 for no cap). Useful when one file has
     a class with many methods that all match the query and would otherwise
     eat the global --limit budget. Suppressed match counts are reported per-
     file via `more_in_file: { \"path\": <count>, ... }` (top-level on flat
@@ -337,6 +341,12 @@ enum Commands {
         /// directory at any depth; use `vendor/**` for explicit globbing.
         #[arg(long, value_name = "PATTERN")]
         exclude: Vec<String>,
+        /// Keep matches that fall outside any parsed symbol scope (top-of-file
+        /// imports, top-level constants, comments). Default suppresses these
+        /// when the same file has inside-symbol matches ~ frees `--limit`
+        /// budget for more useful results. Plaintext files are unaffected.
+        #[arg(long)]
+        include_unscoped: bool,
     },
     /// Read a file's contents.
     Read {
@@ -356,6 +366,7 @@ enum Commands {
         /// Optional path prefixes to scope the find.
         paths: Vec<String>,
         /// Filter to symbols of these kinds (case-insensitive). Comma-separated.
+        /// Aliases: callable, container, value.
         #[arg(long, value_delimiter = ',', value_name = "KIND")]
         kind: Vec<String>,
         /// Maximum total matches to return. Response includes `truncated: true` when hit.
@@ -368,13 +379,13 @@ enum Commands {
         #[arg(long)]
         snippet: bool,
         /// Compact output mode: `matches` becomes a list of `"path:line qualname(kind)"`
-        /// strings instead of structured objects. ~3x smaller for sweep queries.
+        /// strings instead of structured objects.
         #[arg(long)]
         terse: bool,
-        /// Cap matches per file at N (0 = no cap, default). When the cap is hit,
+        /// Cap matches per file at N (0 = no cap, default 5). When the cap is hit,
         /// the count of suppressed matches per file is reported in `more_in_file`.
         /// Counted toward --limit ~ this is a diversity control, not a bypass.
-        #[arg(long, value_name = "N", default_value_t = 0)]
+        #[arg(long, value_name = "N", default_value_t = DEFAULT_PER_FILE)]
         per_file: usize,
         /// Glob patterns to exclude (repeatable). Bare names like `vendor` exclude that
         /// directory at any depth; use `vendor/**` for explicit globbing.

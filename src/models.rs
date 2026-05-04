@@ -27,7 +27,6 @@ pub struct SymbolInfo {
 #[derive(Debug, Clone)]
 pub struct SymbolDetail {
     pub kind: String,
-    pub name: String,
     pub qualname: String,
     pub content: String,
     pub range: RangeInfo,
@@ -42,7 +41,6 @@ fn is_false(b: &bool) -> bool {
 #[derive(Debug, Serialize)]
 pub struct OutputSymbol {
     pub kind: String,
-    pub name: String,
     pub qualname: String,
     pub lines: [usize; 2],
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -52,7 +50,6 @@ pub struct OutputSymbol {
 #[derive(Debug, Serialize)]
 pub struct OutputSymbolDetail {
     pub kind: String,
-    pub name: String,
     pub qualname: String,
     pub content: String,
     pub lines: [usize; 2],
@@ -175,7 +172,6 @@ pub struct FindResponse {
 pub struct FindMatch {
     pub path: String,
     pub kind: String,
-    pub name: String,
     pub qualname: String,
     pub lines: [usize; 2],
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -211,7 +207,12 @@ pub struct LangsResponse {
 pub struct LangSummary {
     pub language: String,
     pub files: usize,
+    /// Total physical lines (cloc-style: counts a final non-newline line).
     pub lines: usize,
+    pub blank: usize,
+    pub comment: usize,
+    /// `lines - blank - comment`. Pre-computed so JSON consumers don't have to.
+    pub code: usize,
     pub parseable: bool,
 }
 

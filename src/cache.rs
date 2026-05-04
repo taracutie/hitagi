@@ -8,7 +8,10 @@ use std::{
 
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
 
-use crate::{lang::Language, models::SymbolInfo};
+use crate::{
+    lang::{Language, LineStats},
+    models::SymbolInfo,
+};
 
 // Bumping the crate version invalidates all caches ~ cheapest proxy for
 // "visitor logic in parser.rs may have changed shape". Schema bumps just
@@ -17,8 +20,10 @@ use crate::{lang::Language, models::SymbolInfo};
 // v3 moved from a repo-wide bincode blob to a SQLite row store, so one-file
 // queries can fetch and update one cache entry instead of deserializing and
 // rewriting every cached file in the repo.
-const CACHE_VERSION_KEY: &str = concat!("v3-", env!("CARGO_PKG_VERSION"));
-const CACHE_FILE_NAME: &str = "index.v3.sqlite";
+// v4 split line_count into line_total / line_blank / line_comment so `langs`
+// can break out cloc-style code/comment/blank columns.
+const CACHE_VERSION_KEY: &str = concat!("v4-", env!("CARGO_PKG_VERSION"));
+const CACHE_FILE_NAME: &str = "index.v4.sqlite";
 
 #[derive(Clone)]
 struct FileEntry {
@@ -26,10 +31,9 @@ struct FileEntry {
     mtime_nanos: u32,
     size: u64,
     language: Language,
-    /// Newline count of the file's content as last seen. Capped at u32::MAX
-    /// (no real source file approaches that). Both parsed entries and
-    /// lang-only stamps populate this so `langs` warm runs are O(stat).
-    line_count: Option<u32>,
+    /// Line breakdown of the file's content as last seen. Both parsed entries
+    /// and lang-only stamps populate this so `langs` warm runs are O(stat).
+    line_stats: Option<LineStats>,
     /// True when `symbols` came from `parse_source`. False when this entry
     /// was stamped by `langs` (line_count only); the symbols vec is empty
     /// in that case and the next outline/find/symbol call must re-parse.
@@ -45,6 +49,16 @@ pub struct ParseCache {
     checked_existing: bool,
     reset_on_write: bool,
     pending: HashMap<String, FileEntry>,
+    /// On-disk rows hoisted into memory by `ensure_loaded`. Populated lazily
+    /// on the first `lookup_entry` call so a one-shot bulk SELECT replaces
+    /// the per-file SELECTs that used to dominate warm-cache walks. Stays
+    /// empty when the cache file doesn't exist or is unreadable ~ subsequent
+    /// lookups simply miss.
+    loaded: HashMap<String, FileEntry>,
+    /// Sticky flag: `true` once `ensure_loaded` has run, regardless of
+    /// outcome. Stops every subsequent lookup from re-attempting the bulk
+    /// read.
+    loaded_done: bool,
     seen: HashSet<String>,
     enabled: bool,
 }
@@ -94,6 +108,8 @@ impl ParseCache {
             checked_existing: false,
             reset_on_write: false,
             pending: HashMap::new(),
+            loaded: HashMap::new(),
+            loaded_done: false,
             seen: HashSet::new(),
             enabled: true,
         }
@@ -109,6 +125,8 @@ impl ParseCache {
             checked_existing: false,
             reset_on_write: false,
             pending: HashMap::new(),
+            loaded: HashMap::new(),
+            loaded_done: false,
             seen: HashSet::new(),
             enabled,
         }
@@ -135,14 +153,14 @@ impl ParseCache {
     /// Used by `langs` to skip re-reading every file's bytes on warm runs.
     /// Lang-only entries (symbols.is_empty()) populate this for non-parseable
     /// languages too.
-    pub fn lookup_line_count(
+    pub fn lookup_line_stats(
         &mut self,
         rel_path: &str,
         metadata: &Metadata,
         language: Language,
-    ) -> Option<u32> {
+    ) -> Option<LineStats> {
         let entry = self.lookup_entry(rel_path, metadata, language)?;
-        entry.line_count
+        entry.line_stats
     }
 
     fn lookup_entry(
@@ -160,18 +178,63 @@ impl ParseCache {
             return entry_matches(entry, metadata, language).then(|| entry.clone());
         }
 
-        let loaded = {
-            let conn = self.ensure_read_conn()?;
-            load_entry(conn, rel_path)
-        };
+        // First call materializes every row from the on-disk cache into
+        // `self.loaded` ~ subsequent lookups are HashMap O(1). Replaces the
+        // per-file SELECT round-trip that used to dominate warm walks (~3600
+        // SELECTs on a 4400-file repo).
+        self.ensure_loaded();
 
-        match loaded {
-            Ok(Some(entry)) => entry_matches(&entry, metadata, language).then_some(entry),
-            Ok(None) => None,
-            Err(_) => {
-                self.reset_on_write = true;
-                None
+        let entry = self.loaded.get(rel_path)?;
+        entry_matches(entry, metadata, language).then(|| entry.clone())
+    }
+
+    /// Bulk-load every row from `files` into `self.loaded`. Idempotent: the
+    /// `loaded_done` flag is set on the first call regardless of outcome, so
+    /// a missing/corrupt cache does not retry on every lookup.
+    fn ensure_loaded(&mut self) {
+        if self.loaded_done {
+            return;
+        }
+        self.loaded_done = true;
+
+        let mut loaded: HashMap<String, FileEntry> = HashMap::new();
+        let mut had_error = false;
+
+        {
+            let Some(conn) = self.ensure_read_conn() else {
+                return;
+            };
+            match conn.prepare(
+                "SELECT rel_path, mtime_secs, mtime_nanos, size, language,
+                        line_total, line_blank, line_comment, parsed_for_symbols, symbols_blob
+                 FROM files",
+            ) {
+                Ok(mut stmt) => match stmt.query_map([], read_raw_entry) {
+                    Ok(rows) => {
+                        for row in rows {
+                            match row {
+                                Ok(raw) => {
+                                    if let Some((rel_path, entry)) = decode_entry(raw) {
+                                        loaded.insert(rel_path, entry);
+                                    }
+                                    // Coercion failures (unknown language label,
+                                    // bincode mismatch) silently skip ~ same
+                                    // semantics as the per-row loader's
+                                    // `Ok(None)` branch.
+                                }
+                                Err(_) => had_error = true,
+                            }
+                        }
+                    }
+                    Err(_) => had_error = true,
+                },
+                Err(_) => had_error = true,
             }
+        }
+
+        self.loaded = loaded;
+        if had_error {
+            self.reset_on_write = true;
         }
     }
 
@@ -183,13 +246,13 @@ impl ParseCache {
         rel_path: String,
         metadata: &Metadata,
         language: Language,
-        line_count: Option<u32>,
+        line_stats: Option<LineStats>,
         symbols: Vec<SymbolInfo>,
     ) {
-        self.insert_entry(rel_path, metadata, language, line_count, symbols, true);
+        self.insert_entry(rel_path, metadata, language, line_stats, symbols, true);
     }
 
-    /// Insert a langs-only stamp: line_count without parsed symbols. The
+    /// Insert a langs-only stamp: line_stats without parsed symbols. The
     /// next outline/find/symbol call for this path treats it as a cache
     /// miss and re-parses, replacing this entry with a full one.
     pub fn insert_lang_only(
@@ -197,13 +260,13 @@ impl ParseCache {
         rel_path: String,
         metadata: &Metadata,
         language: Language,
-        line_count: u32,
+        line_stats: LineStats,
     ) {
         self.insert_entry(
             rel_path,
             metadata,
             language,
-            Some(line_count),
+            Some(line_stats),
             Vec::new(),
             false,
         );
@@ -214,7 +277,7 @@ impl ParseCache {
         rel_path: String,
         metadata: &Metadata,
         language: Language,
-        line_count: Option<u32>,
+        line_stats: Option<LineStats>,
         symbols: Vec<SymbolInfo>,
         parsed_for_symbols: bool,
     ) {
@@ -232,7 +295,7 @@ impl ParseCache {
                 mtime_nanos: nanos,
                 size: metadata.len(),
                 language,
-                line_count,
+                line_stats,
                 parsed_for_symbols,
                 symbols,
             },
@@ -543,7 +606,9 @@ fn init_db(conn: &Connection, repo_root: &str) -> rusqlite::Result<()> {
             mtime_nanos INTEGER NOT NULL,
             size INTEGER NOT NULL,
             language TEXT NOT NULL,
-            line_count INTEGER,
+            line_total INTEGER,
+            line_blank INTEGER,
+            line_comment INTEGER,
             parsed_for_symbols INTEGER NOT NULL,
             symbols_blob BLOB NOT NULL
         );
@@ -579,74 +644,79 @@ fn meta_value(conn: &Connection, key: &str) -> rusqlite::Result<Option<String>> 
 
 fn files_table_is_readable(conn: &Connection) -> bool {
     conn.prepare(
-        "SELECT rel_path, mtime_secs, mtime_nanos, size, language, line_count, parsed_for_symbols, symbols_blob
+        "SELECT rel_path, mtime_secs, mtime_nanos, size, language,
+                line_total, line_blank, line_comment, parsed_for_symbols, symbols_blob
          FROM files LIMIT 0",
     )
     .is_ok()
 }
 
-fn load_entry(conn: &Connection, rel_path: &str) -> rusqlite::Result<Option<FileEntry>> {
-    struct RawEntry {
-        mtime_secs: i64,
-        mtime_nanos: i64,
-        size: i64,
-        language: String,
-        line_count: Option<i64>,
-        parsed_for_symbols: i64,
-        symbols_blob: Vec<u8>,
-    }
+struct RawEntry {
+    rel_path: String,
+    mtime_secs: i64,
+    mtime_nanos: i64,
+    size: i64,
+    language: String,
+    line_total: Option<i64>,
+    line_blank: Option<i64>,
+    line_comment: Option<i64>,
+    parsed_for_symbols: i64,
+    symbols_blob: Vec<u8>,
+}
 
-    let Some(raw) = conn
-        .query_row(
-            "SELECT mtime_secs, mtime_nanos, size, language, line_count, parsed_for_symbols, symbols_blob
-             FROM files WHERE rel_path = ?1",
-            params![rel_path],
-            |row| {
-                Ok(RawEntry {
-                    mtime_secs: row.get(0)?,
-                    mtime_nanos: row.get(1)?,
-                    size: row.get(2)?,
-                    language: row.get(3)?,
-                    line_count: row.get(4)?,
-                    parsed_for_symbols: row.get(5)?,
-                    symbols_blob: row.get(6)?,
-                })
-            },
-        )
-        .optional()?
-    else {
-        return Ok(None);
-    };
+fn read_raw_entry(row: &rusqlite::Row) -> rusqlite::Result<RawEntry> {
+    Ok(RawEntry {
+        rel_path: row.get(0)?,
+        mtime_secs: row.get(1)?,
+        mtime_nanos: row.get(2)?,
+        size: row.get(3)?,
+        language: row.get(4)?,
+        line_total: row.get(5)?,
+        line_blank: row.get(6)?,
+        line_comment: row.get(7)?,
+        parsed_for_symbols: row.get(8)?,
+        symbols_blob: row.get(9)?,
+    })
+}
 
+/// Convert a raw SQLite row tuple into `(rel_path, FileEntry)`. Returns
+/// `None` on any coercion failure (unknown language, bincode mismatch,
+/// out-of-range integer) ~ the row is silently dropped, matching the
+/// pre-prefetch per-row loader's `Ok(None)` semantics.
+fn decode_entry(raw: RawEntry) -> Option<(String, FileEntry)> {
     let parsed_for_symbols = raw.parsed_for_symbols != 0;
     let symbols = if parsed_for_symbols {
-        match bincode::deserialize(&raw.symbols_blob) {
-            Ok(symbols) => symbols,
-            Err(_) => return Ok(None),
-        }
+        bincode::deserialize(&raw.symbols_blob).ok()?
     } else {
         Vec::new()
     };
 
-    let Some(mtime_nanos) = u32::try_from(raw.mtime_nanos).ok() else {
-        return Ok(None);
-    };
-    let Some(size) = u64::try_from(raw.size).ok() else {
-        return Ok(None);
-    };
-    let Some(language) = language_from_str(&raw.language) else {
-        return Ok(None);
-    };
+    let mtime_nanos = u32::try_from(raw.mtime_nanos).ok()?;
+    let size = u64::try_from(raw.size).ok()?;
+    let language = language_from_str(&raw.language)?;
+    let line_stats = raw.line_total.and_then(|t| {
+        let total = u32::try_from(t).ok()?;
+        let blank = u32::try_from(raw.line_blank.unwrap_or(0)).ok()?;
+        let comment = u32::try_from(raw.line_comment.unwrap_or(0)).ok()?;
+        Some(LineStats {
+            total,
+            blank,
+            comment,
+        })
+    });
 
-    Ok(Some(FileEntry {
-        mtime_secs: raw.mtime_secs,
-        mtime_nanos,
-        size,
-        language,
-        line_count: raw.line_count.and_then(|n| u32::try_from(n).ok()),
-        parsed_for_symbols,
-        symbols,
-    }))
+    Some((
+        raw.rel_path,
+        FileEntry {
+            mtime_secs: raw.mtime_secs,
+            mtime_nanos,
+            size,
+            language,
+            line_stats,
+            parsed_for_symbols,
+            symbols,
+        },
+    ))
 }
 
 fn write_entries(
@@ -674,21 +744,25 @@ fn upsert_entry(tx: &Transaction<'_>, rel_path: &str, entry: &FileEntry) -> rusq
     let mtime_nanos = i64::from(entry.mtime_nanos);
     let size = i64::try_from(entry.size)
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-    let line_count = entry.line_count.map(i64::from);
+    let line_total = entry.line_stats.map(|s| i64::from(s.total));
+    let line_blank = entry.line_stats.map(|s| i64::from(s.blank));
+    let line_comment = entry.line_stats.map(|s| i64::from(s.comment));
     let parsed_for_symbols = if entry.parsed_for_symbols { 1i64 } else { 0i64 };
 
     tx.execute(
         "
         INSERT INTO files (
             rel_path, mtime_secs, mtime_nanos, size, language,
-            line_count, parsed_for_symbols, symbols_blob
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            line_total, line_blank, line_comment, parsed_for_symbols, symbols_blob
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
         ON CONFLICT(rel_path) DO UPDATE SET
             mtime_secs = excluded.mtime_secs,
             mtime_nanos = excluded.mtime_nanos,
             size = excluded.size,
             language = excluded.language,
-            line_count = excluded.line_count,
+            line_total = excluded.line_total,
+            line_blank = excluded.line_blank,
+            line_comment = excluded.line_comment,
             parsed_for_symbols = excluded.parsed_for_symbols,
             symbols_blob = excluded.symbols_blob
         ",
@@ -698,7 +772,9 @@ fn upsert_entry(tx: &Transaction<'_>, rel_path: &str, entry: &FileEntry) -> rusq
             mtime_nanos,
             size,
             entry.language.as_str(),
-            line_count,
+            line_total,
+            line_blank,
+            line_comment,
             parsed_for_symbols,
             symbols_blob,
         ],
@@ -1210,8 +1286,12 @@ mod tests {
         );
     }
 
+    fn ls(total: u32, blank: u32, comment: u32) -> LineStats {
+        LineStats { total, blank, comment }
+    }
+
     #[test]
-    fn lookup_line_count_returns_stored_value() {
+    fn lookup_line_stats_returns_stored_value() {
         let tmp = CacheTmp::new("line-count");
         let metadata = write_file(&tmp.repo_root, "a.rs", "fn foo() {}\nfn bar() {}\n");
 
@@ -1221,7 +1301,7 @@ mod tests {
                 "a.rs".to_string(),
                 &metadata,
                 Language::Rust,
-                Some(2),
+                Some(ls(2, 0, 0)),
                 sample_symbols(),
             );
             cache.save(false);
@@ -1229,13 +1309,13 @@ mod tests {
 
         let mut cache = tmp.open();
         assert_eq!(
-            cache.lookup_line_count("a.rs", &metadata, Language::Rust),
-            Some(2)
+            cache.lookup_line_stats("a.rs", &metadata, Language::Rust),
+            Some(ls(2, 0, 0))
         );
     }
 
     #[test]
-    fn lookup_line_count_misses_on_size_change() {
+    fn lookup_line_stats_misses_on_size_change() {
         let tmp = CacheTmp::new("line-count-invalidate");
         let metadata = write_file(&tmp.repo_root, "a.rs", "fn foo() {}\n");
 
@@ -1244,31 +1324,31 @@ mod tests {
             "a.rs".to_string(),
             &metadata,
             Language::Rust,
-            Some(1),
+            Some(ls(1, 0, 0)),
             sample_symbols(),
         );
 
         let bigger = write_file(&tmp.repo_root, "a.rs", "fn foo() {}\nfn bar() {}\n");
         assert_eq!(
-            cache.lookup_line_count("a.rs", &bigger, Language::Rust),
+            cache.lookup_line_stats("a.rs", &bigger, Language::Rust),
             None
         );
     }
 
     #[test]
     fn langs_only_stamp_does_not_satisfy_lookup() {
-        // When langs writes a line-count stamp for a parseable file, a
+        // When langs writes a line-stats stamp for a parseable file, a
         // later outline/find/symbol call must MISS the symbol lookup so it
-        // re-parses and writes a full entry. lookup_line_count still hits.
+        // re-parses and writes a full entry. lookup_line_stats still hits.
         let tmp = CacheTmp::new("langs-stamp");
         let metadata = write_file(&tmp.repo_root, "a.rs", "fn foo() {}\n");
 
         let mut cache = tmp.open();
-        cache.insert_lang_only("a.rs".to_string(), &metadata, Language::Rust, 1);
+        cache.insert_lang_only("a.rs".to_string(), &metadata, Language::Rust, ls(1, 0, 0));
 
         assert_eq!(
-            cache.lookup_line_count("a.rs", &metadata, Language::Rust),
-            Some(1),
+            cache.lookup_line_stats("a.rs", &metadata, Language::Rust),
+            Some(ls(1, 0, 0)),
             "lang-only stamp serves line counts"
         );
         assert!(
@@ -1281,12 +1361,12 @@ mod tests {
             "a.rs".to_string(),
             &metadata,
             Language::Rust,
-            Some(1),
+            Some(ls(1, 0, 0)),
             sample_symbols(),
         );
         assert_eq!(
-            cache.lookup_line_count("a.rs", &metadata, Language::Rust),
-            Some(1)
+            cache.lookup_line_stats("a.rs", &metadata, Language::Rust),
+            Some(ls(1, 0, 0))
         );
         assert_eq!(
             cache.lookup("a.rs", &metadata, Language::Rust),
@@ -1295,8 +1375,8 @@ mod tests {
     }
 
     #[test]
-    fn lookup_line_count_returns_none_when_field_unset() {
-        // Forward-compat: an entry without line_count (Option::None) should
+    fn lookup_line_stats_returns_none_when_field_unset() {
+        // Forward-compat: an entry without line_stats (Option::None) should
         // miss the lookup so the caller falls back to reading the file.
         let tmp = CacheTmp::new("line-count-missing");
         let metadata = write_file(&tmp.repo_root, "a.rs", "fn foo() {}\n");
@@ -1311,7 +1391,7 @@ mod tests {
         );
 
         assert_eq!(
-            cache.lookup_line_count("a.rs", &metadata, Language::Rust),
+            cache.lookup_line_stats("a.rs", &metadata, Language::Rust),
             None
         );
     }

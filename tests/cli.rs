@@ -239,14 +239,14 @@ fn outline_emits_compact_symbols() {
     assert!(first.get("bytes").is_none(), "bytes hidden by default");
     assert!(first.get("parent").is_none(), "parent hidden by default");
     assert!(first.get("range").is_none(), "old range field removed");
-    let names: Vec<&str> = value["symbols"]
+    let qualnames: Vec<&str> = value["symbols"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|s| s["name"].as_str().unwrap())
+        .map(|s| s["qualname"].as_str().unwrap())
         .collect();
-    assert!(names.contains(&"AuthService"));
-    assert!(names.contains(&"handleAuth"));
+    assert!(qualnames.contains(&"AuthService"));
+    assert!(qualnames.contains(&"AuthService.handleAuth"));
 }
 
 #[test]
@@ -340,6 +340,13 @@ fn symbol_missing_includes_suggestions_when_available() {
 }
 
 #[test]
+fn symbol_missing_typo_includes_suggestions_when_available() {
+    let stderr = run_failure(&["symbol", "src/auth.ts", "handelAuth"]);
+    assert!(stderr.contains("symbol not found: handelAuth"));
+    assert!(stderr.contains("AuthService.handleAuth"));
+}
+
+#[test]
 fn search_finds_match() {
     let value = run(&["search", "AuthService"]);
     let results = value["results"].as_object().unwrap();
@@ -390,6 +397,80 @@ fn search_with_snippet_appends_matched_line() {
         "snippet separator missing in {entry}"
     );
     assert!(entry.contains("TOKEN_DUP"), "snippet should contain match");
+}
+
+#[test]
+fn search_drops_unscoped_matches_when_file_also_has_scoped_match() {
+    let scratch = ScratchRepo::new("search-unscoped-suppression");
+    // Two occurrences of `useState` ~ one outside any symbol (top-of-file
+    // import line, where most TSX files would have it) and one inside a
+    // function body. The default behavior should keep only the inside-symbol
+    // match; --include-unscoped restores both.
+    scratch.write(
+        "App.tsx",
+        "import { useState } from 'react';\n\
+         export function App() {\n\
+             const [n] = useState(0);\n\
+             return n;\n\
+         }\n",
+    );
+
+    let default_value = scratch.run(&["search", "useState"]);
+    let default_entries: Vec<String> = default_value["results"]
+        .as_object()
+        .unwrap()
+        .values()
+        .flat_map(|v| v.as_array().unwrap().iter())
+        .map(|s| s.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        default_entries.len(),
+        1,
+        "import-line match should be dropped when an inside-symbol match exists in the same file: {default_entries:?}"
+    );
+    assert!(
+        default_entries[0].contains("App(function)"),
+        "remaining entry should be the inside-function match: {default_entries:?}"
+    );
+
+    let opt_in_value = scratch.run(&["search", "useState", "--include-unscoped"]);
+    let opt_in_entries: Vec<String> = opt_in_value["results"]
+        .as_object()
+        .unwrap()
+        .values()
+        .flat_map(|v| v.as_array().unwrap().iter())
+        .map(|s| s.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        opt_in_entries.len(),
+        2,
+        "--include-unscoped should keep both the import-line and inside-function matches: {opt_in_entries:?}"
+    );
+    assert!(opt_in_entries.iter().any(|e| e.contains("App(function)")));
+    assert!(
+        opt_in_entries
+            .iter()
+            .any(|e| !e.contains("(function)") && e.contains("@L1")),
+        "expected the import-line `@L1` entry to come back, got {opt_in_entries:?}"
+    );
+}
+
+#[test]
+fn search_keeps_unscoped_matches_in_plaintext_files() {
+    // Plaintext files have no symbol info, so the suppression rule never
+    // fires (zero scoped matches). The match should always come back.
+    let scratch = ScratchRepo::new("search-unscoped-plaintext");
+    scratch.write("notes.md", "use useState here\n");
+
+    let value = scratch.run(&["search", "useState"]);
+    let entries: Vec<String> = value["results"]
+        .as_object()
+        .unwrap()
+        .values()
+        .flat_map(|v| v.as_array().unwrap().iter())
+        .map(|s| s.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(entries.len(), 1, "{entries:?}");
 }
 
 #[test]
@@ -763,6 +844,41 @@ fn find_kind_filter_is_case_insensitive() {
 }
 
 #[test]
+fn find_kind_alias_callable_matches_functions_and_methods() {
+    let value = run(&["find", "Auth", "--kind", "callable", "--per-file", "0"]);
+    let matches = flatten_find_matches(&value);
+    assert!(!matches.is_empty());
+    for m in matches {
+        let kind = m["kind"].as_str().unwrap();
+        assert!(matches!(kind, "function" | "method" | "arrow_function"));
+    }
+}
+
+#[test]
+fn outline_kind_alias_container_matches_classes() {
+    let value = run(&["outline", "src/auth.ts", "--kind", "container"]);
+    let symbols = value["symbols"].as_array().unwrap();
+    assert!(!symbols.is_empty());
+    for symbol in symbols {
+        assert_eq!(symbol["kind"], "class");
+    }
+}
+
+#[test]
+fn outline_kind_alias_value_matches_fields() {
+    let value = run(&["outline", "src/schema.prisma", "--kind", "value"]);
+    let symbols = value["symbols"].as_array().unwrap();
+    assert!(!symbols.is_empty());
+    let mut saw_field = false;
+    for symbol in symbols {
+        let kind = symbol["kind"].as_str().unwrap();
+        saw_field |= kind == "field";
+        assert!(matches!(kind, "property" | "field" | "variant" | "value"));
+    }
+    assert!(saw_field, "value alias should include field symbols");
+}
+
+#[test]
 fn find_unknown_kind_returns_available_kinds_hint() {
     let value = run(&["find", "AuthService", "--kind", "zzznope"]);
     assert!(value["matches"].as_array().unwrap().is_empty());
@@ -838,7 +954,8 @@ fn default_find_output_is_concise_text() {
     let text = run_text(&["find", "AuthService", "--snippet"]);
     assert!(text.starts_with("find \"AuthService\""));
     assert!(text.contains("matches •"));
-    assert!(text.contains("• src/auth.ts:L1-11 class AuthService"));
+    assert!(text.contains("src/\n"));
+    assert!(text.contains("• auth.ts:L1-11 class AuthService"));
     assert!(text.contains(":: class AuthService {"));
 }
 
@@ -846,8 +963,8 @@ fn default_find_output_is_concise_text() {
 fn default_search_output_groups_matches_as_text() {
     let text = run_text(&["search", "Button", "--snippet", "--limit", "5"]);
     assert!(text.starts_with("search \"Button\""));
-    assert!(text.contains("apps/desktop/src/components/Button.tsx"));
-    assert!(text.contains("packages/mobile/src/components/Button.tsx"));
+    assert!(text.contains("apps/desktop/src/components/\nButton.tsx"));
+    assert!(text.contains("packages/mobile/src/components/\nButton.tsx"));
     assert!(text.contains("• DesktopButton(function) @L1"));
 }
 
@@ -1789,11 +1906,32 @@ fn find_per_file_caps_matches_and_reports_overflow() {
 }
 
 #[test]
+fn find_per_file_defaults_to_five() {
+    let scratch = ScratchRepo::new("find-default-per-file");
+    scratch.write(
+        "src/many.rs",
+        "pub struct TargetOne {}\npub struct TargetTwo {}\npub struct TargetThree {}\npub struct TargetFour {}\npub struct TargetFive {}\npub struct TargetSix {}\n",
+    );
+
+    let value = scratch.run(&["find", "Target", "src/many.rs"]);
+    let matches = flatten_find_matches(&value);
+    assert_eq!(matches.len(), 5);
+    let suppressed: u64 = value["more_in_file"]
+        .as_object()
+        .expect("default --per-file should report overflow")
+        .values()
+        .next()
+        .and_then(|v| v.as_u64())
+        .unwrap();
+    assert_eq!(suppressed, 1);
+}
+
+#[test]
 fn find_per_file_zero_means_no_cap() {
-    let value = run(&["find", "Auth", "src/auth.ts"]);
+    let value = run(&["find", "Auth", "--per-file", "0", "src/auth.ts"]);
     assert!(
         value.get("more_in_file").is_none(),
-        "more_in_file should be omitted when --per-file is 0 (default)"
+        "more_in_file should be omitted when --per-file is 0"
     );
     if let Some(groups) = value.get("groups").and_then(|v| v.as_array()) {
         for g in groups {
@@ -1940,6 +2078,9 @@ fn langs_reuses_line_counts_after_find_warms_cache() {
         .collect();
     assert_eq!(by_lang["rust"]["files"], 2);
     assert_eq!(by_lang["rust"]["lines"], 3);
+    assert_eq!(by_lang["rust"]["blank"], 0);
+    assert_eq!(by_lang["rust"]["comment"], 0);
+    assert_eq!(by_lang["rust"]["code"], 3);
 
     // outline still works after langs ran ~ verifies langs didn't stamp
     // empty-symbols entries over parseable files.
@@ -1953,6 +2094,30 @@ fn langs_reuses_line_counts_after_find_warms_cache() {
         .collect();
     assert!(qualnames.contains(&"one".to_string()));
     assert!(qualnames.contains(&"two".to_string()));
+}
+
+#[test]
+fn langs_breaks_out_blank_and_comment() {
+    let scratch = ScratchRepo::new("langs-blank-comment");
+    // 6 lines: 1 line-comment, 1 blank, 1 code, 2 block-comment, 1 code
+    scratch.write(
+        "a.rs",
+        "// hi\n\nfn x() {}\n/* multi\n   line */\nfn y() {}\n",
+    );
+
+    let langs = scratch.run(&["langs"]);
+    let rust = langs["languages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["language"] == "rust")
+        .expect("rust entry");
+
+    assert_eq!(rust["files"], 1);
+    assert_eq!(rust["lines"], 6);
+    assert_eq!(rust["blank"], 1);
+    assert_eq!(rust["comment"], 3);
+    assert_eq!(rust["code"], 2);
 }
 
 #[test]

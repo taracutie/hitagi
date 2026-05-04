@@ -49,7 +49,6 @@ pub fn symbol_detail(
 
     Ok(SymbolDetail {
         kind: symbol.kind.clone(),
-        name: symbol.name.clone(),
         qualname: symbol.qualname.clone(),
         content,
         range: symbol.range.clone(),
@@ -66,6 +65,7 @@ pub fn search_file(
     query: &str,
     max_results: usize,
     snippet: bool,
+    include_unscoped: bool,
 ) -> Vec<String> {
     if query.is_empty() {
         return Vec::new();
@@ -77,18 +77,28 @@ pub fn search_file(
         .filter(|t| !t.is_empty())
         .collect();
 
-    let mut results = Vec::new();
+    // Headroom over max_results so the unscoped-suppression rule below has a
+    // chance to surface inside-symbol matches when the file's first hits
+    // happen to be imports.
+    let raw_cap = max_results.saturating_mul(2).max(64);
+
+    struct RawMatch {
+        scoped: bool,
+        entry: String,
+    }
+    let mut raw: Vec<RawMatch> = Vec::new();
     let mut seen = HashSet::new();
 
-    for term in &terms {
+    'terms: for term in &terms {
         let mut offset = 0;
-        while offset < source.len() && results.len() < max_results {
+        while offset < source.len() && raw.len() < raw_cap {
             let Some(found) = source[offset..].find(term) else {
                 break;
             };
 
             let start_byte = offset + found;
-            let dedup_key = if let Some(symbol) = enclosing_symbol(parsed, start_byte) {
+            let scoped_sym = enclosing_symbol(parsed, start_byte);
+            let dedup_key = if let Some(symbol) = scoped_sym {
                 format!("{path}:{}:{}", symbol.qualname, symbol.range.start_byte)
             } else {
                 let line = line_at_byte(source, start_byte);
@@ -96,14 +106,24 @@ pub fn search_file(
             };
 
             if seen.insert(dedup_key) {
-                results.push(format_match(parsed, source, start_byte, snippet));
+                raw.push(RawMatch {
+                    scoped: scoped_sym.is_some(),
+                    entry: format_match(parsed, source, start_byte, snippet),
+                });
             }
 
             offset = start_byte + term.len().max(1);
         }
+        if raw.len() >= raw_cap {
+            break 'terms;
+        }
     }
 
-    results
+    if !include_unscoped && raw.iter().any(|m| m.scoped) {
+        raw.retain(|m| m.scoped);
+    }
+
+    raw.into_iter().take(max_results).map(|m| m.entry).collect()
 }
 
 pub fn search_file_plain(
@@ -330,13 +350,90 @@ fn ambiguous_symbol_message(query: &str, candidates: &[&SymbolInfo]) -> String {
 
 fn suggest_symbols(parsed: &ParsedFile, query: &str, max: usize) -> Vec<String> {
     let needle = query.to_lowercase();
-    parsed
+    let substring_matches: Vec<String> = parsed
         .symbols
         .iter()
         .filter(|s| s.qualname.to_lowercase().contains(&needle))
         .take(max)
         .map(|s| s.qualname.clone())
+        .collect();
+    if !substring_matches.is_empty() {
+        return substring_matches;
+    }
+
+    let mut scored: Vec<ScoredSuggestion> = parsed
+        .symbols
+        .iter()
+        .filter_map(|symbol| score_symbol_suggestion(symbol, &needle))
+        .collect();
+    scored.sort_by(|a, b| {
+        a.distance
+            .cmp(&b.distance)
+            .then_with(|| b.similarity.total_cmp(&a.similarity))
+            .then_with(|| a.qualname.cmp(&b.qualname))
+    });
+    scored
+        .into_iter()
+        .take(max)
+        .map(|suggestion| suggestion.qualname)
         .collect()
+}
+
+struct ScoredSuggestion {
+    qualname: String,
+    distance: usize,
+    similarity: f64,
+}
+
+fn score_symbol_suggestion(symbol: &SymbolInfo, needle: &str) -> Option<ScoredSuggestion> {
+    let qualname = symbol.qualname.to_lowercase();
+    let leaf = qualname.rsplit('.').next().unwrap_or(&qualname);
+
+    let qualname_score = typo_score(needle, &qualname);
+    let leaf_score = typo_score(needle, leaf);
+    let (distance, similarity) = if leaf_score.0 < qualname_score.0
+        || (leaf_score.0 == qualname_score.0 && leaf_score.1 > qualname_score.1)
+    {
+        leaf_score
+    } else {
+        qualname_score
+    };
+
+    (distance <= 3 || similarity >= 0.6).then(|| ScoredSuggestion {
+        qualname: symbol.qualname.clone(),
+        distance,
+        similarity,
+    })
+}
+
+fn typo_score(a: &str, b: &str) -> (usize, f64) {
+    let distance = levenshtein(a, b);
+    let width = a.chars().count().max(b.chars().count()).max(1);
+    let similarity = 1.0 - (distance as f64 / width as f64);
+    (distance, similarity)
+}
+
+fn levenshtein(a: &str, b: &str) -> usize {
+    if a == b {
+        return 0;
+    }
+
+    let b_chars: Vec<char> = b.chars().collect();
+    let mut previous: Vec<usize> = (0..=b_chars.len()).collect();
+    let mut current = vec![0; b_chars.len() + 1];
+
+    for (i, a_char) in a.chars().enumerate() {
+        current[0] = i + 1;
+        for (j, b_char) in b_chars.iter().enumerate() {
+            let substitution = usize::from(a_char != *b_char);
+            current[j + 1] = (previous[j + 1] + 1)
+                .min(current[j] + 1)
+                .min(previous[j] + substitution);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+
+    previous[b_chars.len()]
 }
 
 #[cfg(test)]
@@ -400,7 +497,7 @@ mod tests {
         let parsed = parse_source(Language::TypeScript, &source).unwrap();
         let symbol = symbol_detail(&parsed, &source, "AuthService.handleAuth", 1024).unwrap();
 
-        assert_eq!(symbol.name, "handleAuth");
+        assert_eq!(symbol.qualname, "AuthService.handleAuth");
         assert!(symbol.content.contains("TOKEN_DUP"));
     }
 
@@ -424,10 +521,28 @@ mod tests {
     }
 
     #[test]
+    fn missing_symbol_suggests_typo_matches() {
+        let source = sample_source();
+        let parsed = parse_source(Language::TypeScript, &source).unwrap();
+        let error = resolve_symbol(&parsed, "handelAuth").unwrap_err();
+        let msg = error.to_string();
+        assert!(msg.contains("symbol not found: handelAuth"));
+        assert!(msg.contains("AuthService.handleAuth"));
+    }
+
+    #[test]
     fn deduplicates_search_results_by_scope() {
         let source = sample_source();
         let parsed = parse_source(Language::TypeScript, &source).unwrap();
-        let results = search_file(&parsed, &source, "src/auth.ts", "TOKEN_DUP", 10, false);
+        let results = search_file(
+            &parsed,
+            &source,
+            "src/auth.ts",
+            "TOKEN_DUP",
+            10,
+            false,
+            false,
+        );
 
         assert_eq!(results.len(), 1);
         assert!(results[0].contains("AuthService.handleAuth"));
@@ -438,7 +553,15 @@ mod tests {
     fn search_includes_snippet_when_requested() {
         let source = sample_source();
         let parsed = parse_source(Language::TypeScript, &source).unwrap();
-        let results = search_file(&parsed, &source, "src/auth.ts", "TOKEN_DUP", 10, true);
+        let results = search_file(
+            &parsed,
+            &source,
+            "src/auth.ts",
+            "TOKEN_DUP",
+            10,
+            true,
+            false,
+        );
 
         assert_eq!(results.len(), 1);
         assert!(results[0].contains(" :: "));
@@ -456,7 +579,11 @@ mod tests {
         let span = symbols_for_line_range(&symbols, 22, 25);
         let primary = span.primary.expect("expected an enclosing symbol");
         assert_eq!(primary.qualname, "Outer.Inner.Leaf");
-        let names: Vec<&str> = span.overlapping.iter().map(|s| s.qualname.as_str()).collect();
+        let names: Vec<&str> = span
+            .overlapping
+            .iter()
+            .map(|s| s.qualname.as_str())
+            .collect();
         assert_eq!(names, vec!["Outer", "Outer.Inner", "Outer.Inner.Leaf"]);
     }
 
@@ -469,7 +596,11 @@ mod tests {
         // by tie-break ~ start_line).
         let primary = span.primary.expect("primary should fall back to overlap");
         assert_eq!(primary.qualname, "Foo");
-        let names: Vec<&str> = span.overlapping.iter().map(|s| s.qualname.as_str()).collect();
+        let names: Vec<&str> = span
+            .overlapping
+            .iter()
+            .map(|s| s.qualname.as_str())
+            .collect();
         assert_eq!(names, vec!["Foo", "Bar"]);
     }
 

@@ -111,7 +111,7 @@ Bodyless `mod foo;` declarations are intentionally omitted (they're imports, not
 Flags:
 
 - `--bytes` ~ also include `bytes: [start, end]` byte offsets per symbol (off by default; agents almost never need them).
-- `--kind K1,K2,...` ~ keep only symbols of these kinds. Comma-separated, case-insensitive. Common kinds: `function`, `method`, `struct`, `enum`, `variant`, `class`, `interface`, `property`, `trait`, `module`, `model`, `field`. When no symbol matches, the response includes `available_kinds: [...]` listing what the file actually contains.
+- `--kind K1,K2,...` ~ keep only symbols of these kinds. Comma-separated, case-insensitive. Common kinds: `function`, `method`, `struct`, `enum`, `variant`, `class`, `interface`, `property`, `trait`, `module`, `model`, `field`. Aliases: `callable` (`function`, `method`, `arrow_function`), `container` (`class`, `struct`, `interface`, `enum`, `trait`, `object`), `value` (`property`, `field`, `variant`). When no symbol matches, the response includes `available_kinds: [...]` listing what the file actually contains.
 - `--depth N` ~ limit nesting depth: `--depth 1` keeps top-level symbols only, `--depth 2` adds one nested level (e.g. methods inside a class, variants inside an enum). Counted by dots in the qualname. Useful for orientation on big files.
 
 ### `symbol <PATH> <QUALNAME>`
@@ -139,6 +139,8 @@ src/parser.rs
 
 Each entry follows the format `<scope>(<kind>) @L<match_line>` for matches inside a parsed symbol, or just `@L<match_line>` for matches outside any scope (top-of-file imports, comments, plaintext files). Pass `--snippet` to append the matched line.
 
+When a parseable file produces both a scoped match (inside a symbol) and an unscoped match (e.g. an import line) for the same query, the unscoped one is dropped by default to keep `--limit` budget focused on usage sites. Pass `--include-unscoped` to keep both. Plaintext files (no symbol info) are unaffected ~ the suppression rule only fires when at least one scoped match exists.
+
 Combine alternatives with ` OR ` ~ literal text, surrounded by spaces. `"foo OR bar"` searches for both terms; `"fooORbar"` is a literal substring.
 
 Pass extra positional paths to scope the search:
@@ -152,6 +154,7 @@ Flags:
 - `--limit N` ~ maximum total matches to return (default `50`). Response includes `"truncated": true` when the cap is hit.
 - `--snippet` ~ append the matched line as ` :: <line text>` (truncated at 100 chars).
 - `--exclude PATTERN` (repeatable) ~ skip files matching the pattern. Bare names like `--exclude vendor` skip that directory at any depth; full globs like `--exclude "vendor/**"` work too.
+- `--include-unscoped` ~ keep matches that fall outside any parsed symbol scope when the same file also has scoped matches. Off by default.
 
 When matches span multiple top-level dirs with no shared prefix, the response switches to a grouped shape: `{"groups": [{"prefix": "...", "results": {...}}, ...], "results": {}}`. Each group carries its own `prefix` with file keys stripped relative to it ~ avoids repeating long monorepo paths in every key. See "Response shapes" near the end of `--help`.
 
@@ -189,8 +192,8 @@ Flags:
 - `--kind K1,K2,...` ~ case-insensitive symbol-kind filter, same syntax as outline. Empty matches → `available_kinds` hint.
 - `--bytes` ~ include byte ranges.
 - `--snippet` ~ include each symbol's first-line signature as a `snippet` field.
-- `--terse` ~ compact output mode: `matches` becomes a flat list of strings like `"src/foo.rs:42 Foo.bar(method)"` (with snippet appended after ` :: ` if `--snippet` is also passed). ~3x smaller for sweep queries.
-- `--per-file N` ~ cap matches per file at `N` (default `0` = no cap). When set, suppressed match counts are reported in `more_in_file: { "path": <count>, ... }` (top-level on flat responses, inside the containing group on grouped responses). The cap counts toward `--limit` ~ this is a diversity control, not a bypass. Useful when one class with many methods would otherwise eat the whole budget.
+- `--terse` ~ compact output mode: `matches` becomes a flat list of strings like `"src/foo.rs:42 Foo.bar(method)"` (with snippet appended after ` :: ` if `--snippet` is also passed). Most useful with `--json` or grouped multi-prefix sweeps.
+- `--per-file N` ~ cap matches per file at `N` (default `5`; pass `0` for no cap). Suppressed match counts are reported in `more_in_file: { "path": <count>, ... }` (top-level on flat responses, inside the containing group on grouped responses). The cap counts toward `--limit` ~ this is a diversity control, not a bypass. Useful when one class with many methods would otherwise eat the whole budget.
 - `--exclude PATTERN` (repeatable) ~ skip matching files (same syntax as `search --exclude`).
 
 `searched_files` reports how many parseable files were inspected. When zero (e.g. `find foo vendor`), the response includes a `note` explaining why ~ usually "no parseable files at this path; for plaintext search across all file types, use `search`".

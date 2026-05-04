@@ -3,12 +3,13 @@ use std::fs::Metadata;
 use std::path::{Path, PathBuf};
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use rayon::prelude::*;
 
 use crate::{
     cache::ParseCache,
     error::{AppError, AppResult},
     git,
-    lang::Language,
+    lang::{count_lines, Language, LineStats},
     models::{
         CacheClearResponse, CacheLangCount, CachePathResponse, CacheStatusResponse,
         DiffFileResponse, DiffFileSummary, DiffHunk, DiffOverviewResponse, FilesResponse,
@@ -52,6 +53,12 @@ pub struct SearchOptions {
     pub excludes: Vec<String>,
     pub limit: usize,
     pub snippet: bool,
+    /// Keep matches that fall outside any parsed symbol scope (top-of-file
+    /// imports, top-level constants, comments). Default false ~ when a file
+    /// also has inside-symbol matches, the unscoped ones are dropped to free
+    /// budget for more useful results. Plaintext files (no symbol info) are
+    /// unaffected: the rule fires only when at least one scoped match exists.
+    pub include_unscoped: bool,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -106,6 +113,86 @@ struct LoadedSource {
     content: String,
 }
 
+struct ParseCacheUpdate {
+    relative_path: String,
+    metadata: Metadata,
+    language: Language,
+    line_stats: Option<LineStats>,
+    symbols: Vec<SymbolInfo>,
+}
+
+struct PreparedSearchFile {
+    resolved: ResolvedPath,
+    metadata: Metadata,
+    language: Option<Language>,
+    cached_symbols: Option<Vec<SymbolInfo>>,
+}
+
+enum SearchWorkItem {
+    Skip {
+        relative_path: String,
+    },
+    Error {
+        relative_path: String,
+        error: AppError,
+    },
+    Load(PreparedSearchFile),
+}
+
+struct SearchFileResult {
+    relative_path: String,
+    matches: Vec<String>,
+    cache_update: Option<ParseCacheUpdate>,
+}
+
+enum SearchWorkResult {
+    Skipped {
+        relative_path: String,
+    },
+    Error {
+        relative_path: String,
+        error: AppError,
+    },
+    Ready(SearchFileResult),
+}
+
+struct PreparedFindFile {
+    resolved: ResolvedPath,
+    metadata: Metadata,
+    language: Language,
+    cached_symbols: Option<Vec<SymbolInfo>>,
+    needs_content: bool,
+}
+
+enum FindWorkItem {
+    Skip {
+        relative_path: String,
+    },
+    Error {
+        relative_path: String,
+        error: AppError,
+    },
+    Load(PreparedFindFile),
+}
+
+struct FindFileResult {
+    relative_path: String,
+    symbols: Vec<SymbolInfo>,
+    content: Option<String>,
+    cache_update: Option<ParseCacheUpdate>,
+}
+
+enum FindWorkResult {
+    Skipped {
+        relative_path: String,
+    },
+    Error {
+        relative_path: String,
+        error: AppError,
+    },
+    Ready(FindFileResult),
+}
+
 pub fn outline(repo: &RepoRoot, path: &str, opts: OutlineOptions) -> AppResult<OutlineResponse> {
     let resolved = repo.resolve_file(path)?;
     let mut cache = ParseCache::open(repo.root());
@@ -129,8 +216,7 @@ pub fn outline(repo: &RepoRoot, path: &str, opts: OutlineOptions) -> AppResult<O
     // huge, collapse to top-level shapes. The caller can always re-issue with
     // explicit --depth N or --kind to drill in.
     let caller_constrained = opts.depth.is_some() || !opts.kinds.is_empty() || opts.bytes;
-    let auto_summarized =
-        !caller_constrained && total_symbols > OUTLINE_AUTO_SUMMARY_THRESHOLD;
+    let auto_summarized = !caller_constrained && total_symbols > OUTLINE_AUTO_SUMMARY_THRESHOLD;
     let effective_depth = if auto_summarized { Some(1) } else { opts.depth };
 
     let symbols: Vec<OutputSymbol> = symbols
@@ -223,7 +309,14 @@ pub fn search(repo: &RepoRoot, query: &str, opts: SearchOptions) -> AppResult<Se
     if opts.paths.is_empty() {
         files = interleave_by_top_level(files);
     }
-    let result = search_resolved_files(files, query, opts.limit, opts.snippet, &mut cache);
+    let result = search_resolved_files(
+        files,
+        query,
+        opts.limit,
+        opts.snippet,
+        opts.include_unscoped,
+        &mut cache,
+    );
     let should_prune = prune && matches!(result.as_ref(), Ok(response) if !response.truncated);
     cache.save(should_prune);
     result
@@ -234,6 +327,7 @@ fn search_resolved_files(
     query: &str,
     limit: usize,
     snippet: bool,
+    include_unscoped: bool,
     cache: &mut ParseCache,
 ) -> AppResult<SearchResponse> {
     let all_top_levels = collect_top_level_dirs(&files);
@@ -243,70 +337,65 @@ fn search_resolved_files(
     let mut total = 0usize;
     let mut truncated = false;
 
-    for resolved in files {
+    let chunk_size = parallel_parse_chunk_size();
+    let worker_limit = limit.saturating_add(1);
+    let mut index = 0usize;
+
+    'files: while index < files.len() {
         if total >= limit {
             truncated = true;
             break;
         }
-        if let Some(top) = top_level_dir(&resolved.relative_path) {
-            visited_top_levels.insert(top.to_string());
-        }
-        let remaining = limit - total;
-        let file_limit = remaining.saturating_add(1);
 
-        // search always needs content (substring grep on source). Stat first so
-        // we can use the metadata for the cache key, then read.
-        let stat = match stat_file(&resolved) {
-            Ok(value) => value,
-            Err(AppError::TooLarge(_)) | Err(AppError::InvalidUtf8(_)) => continue,
-            Err(error) => return Err(error),
-        };
+        let end = (index + chunk_size).min(files.len());
+        let prepared: Vec<SearchWorkItem> = files[index..end]
+            .iter()
+            .cloned()
+            .map(|resolved| prepare_search_file(cache, resolved))
+            .collect();
+        let outcomes: Vec<SearchWorkResult> = prepared
+            .into_par_iter()
+            .map(|item| execute_search_file(item, query, worker_limit, snippet, include_unscoped))
+            .collect();
 
-        let content = match read_after_stat(&resolved) {
-            Ok(value) => value,
-            Err(AppError::TooLarge(_)) | Err(AppError::InvalidUtf8(_)) => continue,
-            Err(error) => return Err(error),
-        };
+        index = end;
 
-        let mut matches: Vec<String> = match stat.language.filter(|l| l.is_parseable()) {
-            Some(language) => {
-                let symbols = match cached_or_parsed(
-                    cache,
-                    &resolved,
-                    &stat.metadata,
-                    language,
-                    Some(&content),
-                ) {
-                    Ok(s) => s,
-                    Err(AppError::Parse(_)) | Err(AppError::Unsupported(_)) => continue,
-                    Err(error) => return Err(error),
-                };
-                let parsed = ParsedFile { language, symbols };
-                search_file(
-                    &parsed,
-                    &content,
-                    &resolved.relative_path,
-                    query,
-                    file_limit,
-                    snippet,
-                )
+        for outcome in outcomes {
+            if total >= limit {
+                truncated = true;
+                break 'files;
             }
-            None => search_file_plain(&content, query, file_limit, snippet),
-        };
 
-        if matches.len() > remaining {
-            matches.truncate(remaining);
-            truncated = true;
-        }
+            let relative_path = search_result_path(&outcome).to_string();
+            if let Some(top) = top_level_dir(&relative_path) {
+                visited_top_levels.insert(top.to_string());
+            }
 
-        if matches.is_empty() {
-            continue;
-        }
+            let result = match outcome {
+                SearchWorkResult::Skipped { .. } => continue,
+                SearchWorkResult::Error { error, .. } => return Err(error),
+                SearchWorkResult::Ready(result) => result,
+            };
 
-        total += matches.len();
-        raw_results.push((resolved.relative_path.clone(), matches));
-        if truncated {
-            break;
+            if let Some(update) = result.cache_update {
+                insert_cache_update(cache, update);
+            }
+
+            let remaining = limit - total;
+            let mut matches = result.matches;
+            if matches.len() > remaining {
+                matches.truncate(remaining);
+                truncated = true;
+            }
+
+            if !matches.is_empty() {
+                total += matches.len();
+                raw_results.push((result.relative_path, matches));
+            }
+
+            if truncated {
+                break 'files;
+            }
         }
     }
 
@@ -339,8 +428,7 @@ fn search_resolved_files(
         } else {
             let mut groups: Vec<SearchGroup> = Vec::new();
             for (_bucket, items) in by_bucket {
-                let bucket_paths: Vec<String> =
-                    items.iter().map(|(p, _)| p.clone()).collect();
+                let bucket_paths: Vec<String> = items.iter().map(|(p, _)| p.clone()).collect();
                 let bp = common_prefix(&bucket_paths);
                 let mut group_results: BTreeMap<String, Vec<String>> = BTreeMap::new();
                 for (path, matches) in items {
@@ -483,105 +571,88 @@ fn find_resolved_files(
     // Keys are full repo-relative paths; prefix-strip happens at response build.
     let mut more_in_file: BTreeMap<String, usize> = BTreeMap::new();
 
-    'outer: for resolved in files {
+    let chunk_size = parallel_parse_chunk_size();
+    let mut index = 0usize;
+
+    'outer: while index < files.len() {
         if matches.len() >= limit {
             truncated = true;
             break;
         }
-        if let Some(top) = top_level_dir(&resolved.relative_path) {
-            visited_top_levels.insert(top.to_string());
-        }
 
-        let stat = match stat_file(&resolved) {
-            Ok(value) => value,
-            Err(AppError::TooLarge(_)) | Err(AppError::InvalidUtf8(_)) => continue,
-            Err(error) => return Err(error),
-        };
+        let end = (index + chunk_size).min(files.len());
+        let prepared: Vec<FindWorkItem> = files[index..end]
+            .iter()
+            .cloned()
+            .map(|resolved| prepare_find_file(cache, resolved, needs_content_for_output))
+            .collect();
+        let outcomes: Vec<FindWorkResult> =
+            prepared.into_par_iter().map(execute_find_file).collect();
 
-        let language = match stat.language.filter(|l| l.is_parseable()) {
-            Some(l) => l,
-            None => continue,
-        };
+        index = end;
 
-        // Try the cache first. On hit + no snippet, skip read+parse entirely.
-        // On hit + snippet, skip parse but still read for the snippet bytes.
-        // On miss, fall through to read+parse and populate cache.
-        let (symbols, content) = if let Some(symbols) =
-            cache.lookup(&resolved.relative_path, &stat.metadata, language)
-        {
-            let content = if needs_content_for_output {
-                match read_after_stat(&resolved) {
-                    Ok(c) => Some(c),
-                    Err(AppError::TooLarge(_)) | Err(AppError::InvalidUtf8(_)) => continue,
-                    Err(error) => return Err(error),
-                }
-            } else {
-                None
-            };
-            (symbols, content)
-        } else {
-            let content = match read_after_stat(&resolved) {
-                Ok(c) => c,
-                Err(AppError::TooLarge(_)) | Err(AppError::InvalidUtf8(_)) => continue,
-                Err(error) => return Err(error),
-            };
-            let parsed = match parse_source(language, &content) {
-                Ok(p) => p,
-                Err(AppError::Parse(_)) | Err(AppError::Unsupported(_)) => continue,
-                Err(error) => return Err(error),
-            };
-            let line_count = Some(count_newlines(content.as_bytes()));
-            cache.insert(
-                resolved.relative_path.clone(),
-                &stat.metadata,
-                language,
-                line_count,
-                parsed.symbols.clone(),
-            );
-            (parsed.symbols, Some(content))
-        };
-
-        searched_files += 1;
-
-        // Per-file diversity counter: resets per outer-loop iter (per file).
-        // When --per-file N caps a file, surplus matches are tallied into
-        // `more_in_file[path]` instead of being pushed.
-        let mut current_file_count = 0usize;
-        for symbol in symbols {
+        for outcome in outcomes {
             if matches.len() >= limit {
                 truncated = true;
                 break 'outer;
             }
-            if symbol.qualname.to_lowercase().contains(&needle) {
-                all_kinds.insert(symbol.kind.clone());
-                if !matches_kinds(&opts.kinds, &symbol.kind) {
-                    continue;
+
+            let relative_path = find_result_path(&outcome).to_string();
+            if let Some(top) = top_level_dir(&relative_path) {
+                visited_top_levels.insert(top.to_string());
+            }
+
+            let result = match outcome {
+                FindWorkResult::Skipped { .. } => continue,
+                FindWorkResult::Error { error, .. } => return Err(error),
+                FindWorkResult::Ready(result) => result,
+            };
+
+            if let Some(update) = result.cache_update {
+                insert_cache_update(cache, update);
+            }
+
+            searched_files += 1;
+
+            // Per-file diversity counter: resets per outer-loop iter (per file).
+            // When --per-file N caps a file, surplus matches are tallied into
+            // `more_in_file[path]` instead of being pushed.
+            let mut current_file_count = 0usize;
+            for symbol in result.symbols {
+                if matches.len() >= limit {
+                    truncated = true;
+                    break 'outer;
                 }
-                if opts.per_file > 0 && current_file_count >= opts.per_file {
-                    *more_in_file
-                        .entry(resolved.relative_path.clone())
-                        .or_insert(0) += 1;
-                    continue;
+                if symbol.qualname.to_lowercase().contains(&needle) {
+                    all_kinds.insert(symbol.kind.clone());
+                    if !matches_kinds(&opts.kinds, &symbol.kind) {
+                        continue;
+                    }
+                    if opts.per_file > 0 && current_file_count >= opts.per_file {
+                        *more_in_file
+                            .entry(result.relative_path.clone())
+                            .or_insert(0) += 1;
+                        continue;
+                    }
+                    let snippet = opts.snippet.then(|| {
+                        snippet_for_symbol_signature(
+                            result.content.as_deref().unwrap_or(""),
+                            symbol.range.start_byte,
+                            symbol.range.end_byte,
+                        )
+                    });
+                    matches.push(FindMatch {
+                        path: result.relative_path.clone(),
+                        kind: symbol.kind.clone(),
+                        qualname: symbol.qualname.clone(),
+                        lines: [symbol.range.start_line, symbol.range.end_line],
+                        bytes: opts
+                            .bytes
+                            .then_some([symbol.range.start_byte, symbol.range.end_byte]),
+                        snippet,
+                    });
+                    current_file_count += 1;
                 }
-                let snippet = opts.snippet.then(|| {
-                    snippet_for_symbol_signature(
-                        content.as_deref().unwrap_or(""),
-                        symbol.range.start_byte,
-                        symbol.range.end_byte,
-                    )
-                });
-                matches.push(FindMatch {
-                    path: resolved.relative_path.clone(),
-                    kind: symbol.kind.clone(),
-                    name: symbol.name.clone(),
-                    qualname: symbol.qualname.clone(),
-                    lines: [symbol.range.start_line, symbol.range.end_line],
-                    bytes: opts
-                        .bytes
-                        .then_some([symbol.range.start_byte, symbol.range.end_byte]),
-                    snippet,
-                });
-                current_file_count += 1;
             }
         }
     }
@@ -638,8 +709,7 @@ fn find_resolved_files(
         } else {
             let mut groups: Vec<FindGroup> = Vec::new();
             for (_bucket, mut bmatches) in by_bucket {
-                let bucket_paths: Vec<String> =
-                    bmatches.iter().map(|m| m.path.clone()).collect();
+                let bucket_paths: Vec<String> = bmatches.iter().map(|m| m.path.clone()).collect();
                 let bp = common_prefix(&bucket_paths);
                 let local_overflow: BTreeMap<String, usize> = more_in_file
                     .iter()
@@ -738,8 +808,8 @@ pub fn files(repo: &RepoRoot, opts: FilesOptions) -> AppResult<FilesResponse> {
 pub fn langs(repo: &RepoRoot) -> AppResult<LangsResponse> {
     let resolved_files = repo.collect_search_files(&[])?;
     let mut cache = ParseCache::open(repo.root());
-    // Tracks (files, lines, parseable) per language label.
-    let mut counts: BTreeMap<String, (usize, usize, bool)> = BTreeMap::new();
+    // Per language: (files, total, blank, comment, parseable).
+    let mut counts: BTreeMap<String, (usize, usize, usize, usize, bool)> = BTreeMap::new();
 
     for resolved in resolved_files {
         let metadata = match std::fs::metadata(&resolved.full_path) {
@@ -750,30 +820,42 @@ pub fn langs(repo: &RepoRoot) -> AppResult<LangsResponse> {
             continue;
         }
 
-        let language = Language::detect(Path::new(&resolved.full_path)).unwrap_or(Language::Plaintext);
+        let language =
+            Language::detect(Path::new(&resolved.full_path)).unwrap_or(Language::Plaintext);
         // Binary detection runs lazily inside the miss path of
-        // cache_line_count_for ~ on warm runs we never open the file.
-        let Some(lines) = cache_line_count_for(&mut cache, &resolved, &metadata, language) else {
+        // cache_line_stats_for ~ on warm runs we never open the file.
+        let Some(stats) = cache_line_stats_for(&mut cache, &resolved, &metadata, language) else {
             continue;
         };
 
-        let entry = counts
-            .entry(language.as_str().to_string())
-            .or_insert((0, 0, language.is_parseable()));
+        let entry = counts.entry(language.as_str().to_string()).or_insert((
+            0,
+            0,
+            0,
+            0,
+            language.is_parseable(),
+        ));
         entry.0 += 1;
-        entry.1 += lines as usize;
+        entry.1 += stats.total as usize;
+        entry.2 += stats.blank as usize;
+        entry.3 += stats.comment as usize;
     }
 
     cache.save(false);
 
     let mut summaries: Vec<LangSummary> = counts
         .into_iter()
-        .map(|(language, (files, lines, parseable))| LangSummary {
-            language,
-            files,
-            lines,
-            parseable,
-        })
+        .map(
+            |(language, (files, lines, blank, comment, parseable))| LangSummary {
+                language,
+                files,
+                lines,
+                blank,
+                comment,
+                code: lines.saturating_sub(blank).saturating_sub(comment),
+                parseable,
+            },
+        )
         .collect();
     summaries.sort_by(|a, b| {
         b.files
@@ -930,10 +1012,8 @@ pub fn diff_overview(repo: &RepoRoot, opts: DiffOptions) -> AppResult<DiffOvervi
             }
             (Some(new_path), Some(old_path), true) => {
                 // Rename whose endpoints both fall inside the subtree.
-                let staged =
-                    opts.scope == DiffScope::All && staged_set.contains(&entry.path);
-                let unstaged =
-                    opts.scope == DiffScope::All && unstaged_set.contains(&entry.path);
+                let staged = opts.scope == DiffScope::All && staged_set.contains(&entry.path);
+                let unstaged = opts.scope == DiffScope::All && unstaged_set.contains(&entry.path);
                 summaries.push(DiffFileSummary {
                     path: new_path,
                     status: entry.status.to_string(),
@@ -949,10 +1029,8 @@ pub fn diff_overview(repo: &RepoRoot, opts: DiffOptions) -> AppResult<DiffOvervi
             }
             (Some(new_path), None, false) => {
                 // Plain in-subtree change (M / A / D / etc.); not a rename.
-                let staged =
-                    opts.scope == DiffScope::All && staged_set.contains(&entry.path);
-                let unstaged =
-                    opts.scope == DiffScope::All && unstaged_set.contains(&entry.path);
+                let staged = opts.scope == DiffScope::All && staged_set.contains(&entry.path);
+                let unstaged = opts.scope == DiffScope::All && unstaged_set.contains(&entry.path);
                 summaries.push(DiffFileSummary {
                     path: new_path,
                     status: entry.status.to_string(),
@@ -970,10 +1048,8 @@ pub fn diff_overview(repo: &RepoRoot, opts: DiffOptions) -> AppResult<DiffOvervi
                 // Cross-subtree rename ARRIVING. Surface as A; the original
                 // path lives outside our subtree so we can't express it as a
                 // proper rename without leaking toplevel paths.
-                let staged =
-                    opts.scope == DiffScope::All && staged_set.contains(&entry.path);
-                let unstaged =
-                    opts.scope == DiffScope::All && unstaged_set.contains(&entry.path);
+                let staged = opts.scope == DiffScope::All && staged_set.contains(&entry.path);
+                let unstaged = opts.scope == DiffScope::All && unstaged_set.contains(&entry.path);
                 summaries.push(DiffFileSummary {
                     path: new_path,
                     status: "A".to_string(),
@@ -1174,7 +1250,11 @@ pub fn diff_file(
         .map(|h| h.removed)
         .sum::<usize>()
         .into();
-    let added = if parsed_full.binary { None } else { Some(added) };
+    let added = if parsed_full.binary {
+        None
+    } else {
+        Some(added)
+    };
     let removed = if parsed_full.binary {
         None
     } else {
@@ -1232,7 +1312,8 @@ pub fn diff_file(
 
     // Symbol annotation. Working-tree side for normal files, HEAD-side blob
     // for deletions ~ the latter is parsed in-memory and never cached.
-    let (lang_label, language, symbols) = collect_symbols_for_diff(repo, &git_root, &candidate, &opts.against)?;
+    let (lang_label, language, symbols) =
+        collect_symbols_for_diff(repo, &git_root, &candidate, &opts.against)?;
 
     let mut hunks: Vec<DiffHunk> = parsed_unified
         .hunks
@@ -1489,7 +1570,10 @@ fn build_diff_hunk(h: &git::ParsedHunk, symbols: &[SymbolInfo]) -> DiffHunk {
     let span = symbols_for_line_range(symbols, new_lo, new_hi);
     let primary = span.primary;
     let spans: Vec<String> = if span.overlapping.len() > 1 {
-        span.overlapping.iter().map(|s| s.qualname.clone()).collect()
+        span.overlapping
+            .iter()
+            .map(|s| s.qualname.clone())
+            .collect()
     } else {
         Vec::new()
     };
@@ -1509,7 +1593,6 @@ fn build_diff_hunk(h: &git::ParsedHunk, symbols: &[SymbolInfo]) -> DiffHunk {
 fn to_output_symbol(s: SymbolInfo, include_bytes: bool) -> OutputSymbol {
     OutputSymbol {
         kind: s.kind,
-        name: s.name,
         qualname: s.qualname,
         lines: [s.range.start_line, s.range.end_line],
         bytes: include_bytes.then_some([s.range.start_byte, s.range.end_byte]),
@@ -1519,7 +1602,6 @@ fn to_output_symbol(s: SymbolInfo, include_bytes: bool) -> OutputSymbol {
 fn to_output_symbol_detail(s: SymbolDetail, include_bytes: bool) -> OutputSymbolDetail {
     OutputSymbolDetail {
         kind: s.kind,
-        name: s.name,
         qualname: s.qualname,
         content: s.content,
         lines: [s.range.start_line, s.range.end_line],
@@ -1624,15 +1706,299 @@ fn cached_or_parsed(
     };
 
     let parsed = parse_source(language, source)?;
-    let line_count = Some(count_newlines(source.as_bytes()));
+    let line_stats = Some(count_lines(source.as_bytes(), language));
     cache.insert(
         resolved.relative_path.clone(),
         metadata,
         language,
-        line_count,
+        line_stats,
         parsed.symbols.clone(),
     );
     Ok(parsed.symbols)
+}
+
+fn parallel_parse_chunk_size() -> usize {
+    rayon::current_num_threads().saturating_mul(4).max(1)
+}
+
+fn prepare_search_file(cache: &mut ParseCache, resolved: ResolvedPath) -> SearchWorkItem {
+    let stat = match stat_file(&resolved) {
+        Ok(value) => value,
+        Err(AppError::TooLarge(_)) | Err(AppError::InvalidUtf8(_)) => {
+            return SearchWorkItem::Skip {
+                relative_path: resolved.relative_path,
+            };
+        }
+        Err(error) => {
+            return SearchWorkItem::Error {
+                relative_path: resolved.relative_path,
+                error,
+            };
+        }
+    };
+
+    let language = stat.language.filter(|l| l.is_parseable());
+    let cached_symbols =
+        language.and_then(|l| cache.lookup(&resolved.relative_path, &stat.metadata, l));
+
+    SearchWorkItem::Load(PreparedSearchFile {
+        resolved,
+        metadata: stat.metadata,
+        language,
+        cached_symbols,
+    })
+}
+
+fn execute_search_file(
+    item: SearchWorkItem,
+    query: &str,
+    max_results: usize,
+    snippet: bool,
+    include_unscoped: bool,
+) -> SearchWorkResult {
+    let prepared = match item {
+        SearchWorkItem::Skip { relative_path } => {
+            return SearchWorkResult::Skipped { relative_path }
+        }
+        SearchWorkItem::Error {
+            relative_path,
+            error,
+        } => {
+            return SearchWorkResult::Error {
+                relative_path,
+                error,
+            }
+        }
+        SearchWorkItem::Load(prepared) => prepared,
+    };
+
+    let content = match read_after_stat(&prepared.resolved) {
+        Ok(value) => value,
+        Err(AppError::TooLarge(_)) | Err(AppError::InvalidUtf8(_)) => {
+            return SearchWorkResult::Skipped {
+                relative_path: prepared.resolved.relative_path,
+            };
+        }
+        Err(error) => {
+            return SearchWorkResult::Error {
+                relative_path: prepared.resolved.relative_path,
+                error,
+            };
+        }
+    };
+
+    let (matches, cache_update) = match prepared.language {
+        Some(language) => {
+            let (symbols, cache_update) = match prepared.cached_symbols {
+                Some(symbols) => (symbols, None),
+                None => {
+                    let parsed = match parse_source(language, &content) {
+                        Ok(value) => value,
+                        Err(AppError::Parse(_)) | Err(AppError::Unsupported(_)) => {
+                            return SearchWorkResult::Skipped {
+                                relative_path: prepared.resolved.relative_path,
+                            };
+                        }
+                        Err(error) => {
+                            return SearchWorkResult::Error {
+                                relative_path: prepared.resolved.relative_path,
+                                error,
+                            };
+                        }
+                    };
+                    let symbols = parsed.symbols;
+                    let cache_update = ParseCacheUpdate {
+                        relative_path: prepared.resolved.relative_path.clone(),
+                        metadata: prepared.metadata,
+                        language,
+                        line_stats: Some(count_lines(content.as_bytes(), language)),
+                        symbols: symbols.clone(),
+                    };
+                    (symbols, Some(cache_update))
+                }
+            };
+            let parsed = ParsedFile { language, symbols };
+            (
+                search_file(
+                    &parsed,
+                    &content,
+                    &prepared.resolved.relative_path,
+                    query,
+                    max_results,
+                    snippet,
+                    include_unscoped,
+                ),
+                cache_update,
+            )
+        }
+        None => (
+            search_file_plain(&content, query, max_results, snippet),
+            None,
+        ),
+    };
+
+    SearchWorkResult::Ready(SearchFileResult {
+        relative_path: prepared.resolved.relative_path,
+        matches,
+        cache_update,
+    })
+}
+
+fn search_result_path(result: &SearchWorkResult) -> &str {
+    match result {
+        SearchWorkResult::Skipped { relative_path }
+        | SearchWorkResult::Error { relative_path, .. } => relative_path,
+        SearchWorkResult::Ready(result) => &result.relative_path,
+    }
+}
+
+fn prepare_find_file(
+    cache: &mut ParseCache,
+    resolved: ResolvedPath,
+    needs_content: bool,
+) -> FindWorkItem {
+    let stat = match stat_file(&resolved) {
+        Ok(value) => value,
+        Err(AppError::TooLarge(_)) | Err(AppError::InvalidUtf8(_)) => {
+            return FindWorkItem::Skip {
+                relative_path: resolved.relative_path,
+            };
+        }
+        Err(error) => {
+            return FindWorkItem::Error {
+                relative_path: resolved.relative_path,
+                error,
+            };
+        }
+    };
+
+    let language = match stat.language.filter(|l| l.is_parseable()) {
+        Some(language) => language,
+        None => {
+            return FindWorkItem::Skip {
+                relative_path: resolved.relative_path,
+            };
+        }
+    };
+    let cached_symbols = cache.lookup(&resolved.relative_path, &stat.metadata, language);
+
+    FindWorkItem::Load(PreparedFindFile {
+        resolved,
+        metadata: stat.metadata,
+        language,
+        cached_symbols,
+        needs_content,
+    })
+}
+
+fn execute_find_file(item: FindWorkItem) -> FindWorkResult {
+    let prepared = match item {
+        FindWorkItem::Skip { relative_path } => return FindWorkResult::Skipped { relative_path },
+        FindWorkItem::Error {
+            relative_path,
+            error,
+        } => {
+            return FindWorkResult::Error {
+                relative_path,
+                error,
+            }
+        }
+        FindWorkItem::Load(prepared) => prepared,
+    };
+
+    if let Some(symbols) = prepared.cached_symbols {
+        let content = if prepared.needs_content {
+            match read_after_stat(&prepared.resolved) {
+                Ok(value) => Some(value),
+                Err(AppError::TooLarge(_)) | Err(AppError::InvalidUtf8(_)) => {
+                    return FindWorkResult::Skipped {
+                        relative_path: prepared.resolved.relative_path,
+                    };
+                }
+                Err(error) => {
+                    return FindWorkResult::Error {
+                        relative_path: prepared.resolved.relative_path,
+                        error,
+                    };
+                }
+            }
+        } else {
+            None
+        };
+
+        return FindWorkResult::Ready(FindFileResult {
+            relative_path: prepared.resolved.relative_path,
+            symbols,
+            content,
+            cache_update: None,
+        });
+    }
+
+    let content = match read_after_stat(&prepared.resolved) {
+        Ok(value) => value,
+        Err(AppError::TooLarge(_)) | Err(AppError::InvalidUtf8(_)) => {
+            return FindWorkResult::Skipped {
+                relative_path: prepared.resolved.relative_path,
+            };
+        }
+        Err(error) => {
+            return FindWorkResult::Error {
+                relative_path: prepared.resolved.relative_path,
+                error,
+            };
+        }
+    };
+    let parsed = match parse_source(prepared.language, &content) {
+        Ok(value) => value,
+        Err(AppError::Parse(_)) | Err(AppError::Unsupported(_)) => {
+            return FindWorkResult::Skipped {
+                relative_path: prepared.resolved.relative_path,
+            };
+        }
+        Err(error) => {
+            return FindWorkResult::Error {
+                relative_path: prepared.resolved.relative_path,
+                error,
+            };
+        }
+    };
+
+    let symbols = parsed.symbols;
+    let cache_update = ParseCacheUpdate {
+        relative_path: prepared.resolved.relative_path.clone(),
+        metadata: prepared.metadata,
+        language: prepared.language,
+        line_stats: Some(count_lines(content.as_bytes(), prepared.language)),
+        symbols: symbols.clone(),
+    };
+    let content = prepared.needs_content.then_some(content);
+
+    FindWorkResult::Ready(FindFileResult {
+        relative_path: prepared.resolved.relative_path,
+        symbols,
+        content,
+        cache_update: Some(cache_update),
+    })
+}
+
+fn find_result_path(result: &FindWorkResult) -> &str {
+    match result {
+        FindWorkResult::Skipped { relative_path } | FindWorkResult::Error { relative_path, .. } => {
+            relative_path
+        }
+        FindWorkResult::Ready(result) => &result.relative_path,
+    }
+}
+
+fn insert_cache_update(cache: &mut ParseCache, update: ParseCacheUpdate) {
+    let ParseCacheUpdate {
+        relative_path,
+        metadata,
+        language,
+        line_stats,
+        symbols,
+    } = update;
+    cache.insert(relative_path, &metadata, language, line_stats, symbols);
 }
 
 /// Returns the cached line count for `resolved` if (mtime, size, language)
@@ -1642,14 +2008,14 @@ fn cached_or_parsed(
 /// later outline/find/symbol call still re-parses and upgrades the entry).
 /// Binary / oversized / unreadable files yield `None` and are NOT cached
 /// (so a future content-change becomes detectable on the next call).
-fn cache_line_count_for(
+fn cache_line_stats_for(
     cache: &mut ParseCache,
     resolved: &ResolvedPath,
     metadata: &Metadata,
     language: Language,
-) -> Option<u32> {
-    if let Some(line_count) = cache.lookup_line_count(&resolved.relative_path, metadata, language) {
-        return Some(line_count);
+) -> Option<LineStats> {
+    if let Some(stats) = cache.lookup_line_stats(&resolved.relative_path, metadata, language) {
+        return Some(stats);
     }
     if metadata.len() > MAX_FILE_BYTES as u64 {
         return None;
@@ -1658,23 +2024,35 @@ fn cache_line_count_for(
     if bytes.contains(&0) {
         return None;
     }
-    let line_count = count_newlines(&bytes);
-    cache.insert_lang_only(
-        resolved.relative_path.clone(),
-        metadata,
-        language,
-        line_count,
-    );
-    Some(line_count)
-}
-
-fn count_newlines(bytes: &[u8]) -> u32 {
-    let n = bytes.iter().filter(|b| **b == b'\n').count();
-    u32::try_from(n).unwrap_or(u32::MAX)
+    let stats = count_lines(&bytes, language);
+    cache.insert_lang_only(resolved.relative_path.clone(), metadata, language, stats);
+    Some(stats)
 }
 
 fn matches_kinds(filter: &[String], kind: &str) -> bool {
-    filter.is_empty() || filter.iter().any(|k| k.eq_ignore_ascii_case(kind))
+    filter.is_empty() || filter.iter().any(|k| kind_filter_matches(k, kind))
+}
+
+fn kind_filter_matches(filter: &str, kind: &str) -> bool {
+    if filter.eq_ignore_ascii_case(kind) {
+        return true;
+    }
+
+    match filter.to_ascii_lowercase().as_str() {
+        "callable" => kind_matches_any(kind, &["function", "method", "arrow_function"]),
+        "container" => kind_matches_any(
+            kind,
+            &["class", "struct", "interface", "enum", "trait", "object"],
+        ),
+        "value" => kind_matches_any(kind, &["property", "field", "variant"]),
+        _ => false,
+    }
+}
+
+fn kind_matches_any(kind: &str, candidates: &[&str]) -> bool {
+    candidates
+        .iter()
+        .any(|candidate| kind.eq_ignore_ascii_case(candidate))
 }
 
 fn within_depth(qualname: &str, max_depth: Option<usize>) -> bool {
@@ -1890,6 +2268,7 @@ mod tests {
             "needle",
             1,
             false,
+            false,
             &mut ParseCache::disabled(),
         )
         .unwrap();
@@ -1907,6 +2286,7 @@ mod tests {
             vec![repo.resolved("first.txt")],
             "needle",
             1,
+            false,
             false,
             &mut ParseCache::disabled(),
         )

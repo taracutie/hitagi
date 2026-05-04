@@ -1,4 +1,5 @@
 use std::{
+    cell::OnceCell,
     collections::HashSet,
     path::{Component, Path, PathBuf},
 };
@@ -19,6 +20,84 @@ pub struct ResolvedPath {
 
 pub struct RepoRoot {
     root: PathBuf,
+    /// Lazy gitignore-respected file/dir index used by suffix-resolution.
+    /// Built on first miss and reused for the rest of the command. `OnceCell`
+    /// gives us interior mutability without thread sync overhead ~ a single
+    /// command's resolve calls happen on the orchestrator thread.
+    file_index: OnceCell<RepoFileIndex>,
+}
+
+/// Visible (gitignore-respected) repo paths held in memory so suffix-resolution
+/// can scan them instead of walking the FS. `dirs` covers the `FileOrDir`
+/// lookup case (e.g. `find foo src-tauri/src`) and is built lazily ~ FileOnly
+/// resolves (the common case) skip the dir-derivation pass entirely. The
+/// ignored-walk fallback only runs when the visible index is empty (a tmpfs
+/// fixture or a repo where gitignore filtered everything).
+struct RepoFileIndex {
+    files: Vec<String>,
+    dirs: OnceCell<HashSet<String>>,
+}
+
+impl RepoFileIndex {
+    fn from_files(files: Vec<String>) -> Self {
+        Self {
+            files,
+            dirs: OnceCell::new(),
+        }
+    }
+
+    fn dirs(&self) -> &HashSet<String> {
+        self.dirs.get_or_init(|| {
+            let mut dirs: HashSet<String> = HashSet::new();
+            for path in &self.files {
+                let parts: Vec<&str> = path.split('/').collect();
+                for end in 1..parts.len() {
+                    dirs.insert(parts[..end].join("/"));
+                }
+            }
+            dirs
+        })
+    }
+
+    fn scan_for_suffix(
+        &self,
+        kind: PathKind,
+        requested_components: &[String],
+    ) -> (Vec<String>, bool) {
+        let mut matches: Vec<String> = Vec::new();
+        let mut truncated = false;
+        for path in &self.files {
+            if path_ends_with_components(path, requested_components) {
+                if matches.len() == AMBIGUOUS_COLLECT_CAP {
+                    truncated = true;
+                    break;
+                }
+                matches.push(path.clone());
+            }
+        }
+        if !truncated && matches!(kind, PathKind::FileOrDir) {
+            for path in self.dirs() {
+                if path_ends_with_components(path, requested_components) {
+                    if matches.len() == AMBIGUOUS_COLLECT_CAP {
+                        truncated = true;
+                        break;
+                    }
+                    matches.push(path.clone());
+                }
+            }
+        }
+        (matches, truncated)
+    }
+
+    /// Skip the ignored-walk fallback whenever the visible index has any
+    /// content. The fallback only ever surfaced ignored files via partial-
+    /// suffix lookup; the README-documented behavior is "unique repo-internal
+    /// suffix" which is a visible concern. The empty-visible case (test
+    /// fixtures, gitignore-everything repos) still walks because we have no
+    /// other way to find anything.
+    fn skip_ignored_fallback(&self) -> bool {
+        !self.files.is_empty()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -38,7 +117,10 @@ impl PathKind {
 
 impl RepoRoot {
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self {
+            root,
+            file_index: OnceCell::new(),
+        }
     }
 
     pub fn root(&self) -> &Path {
@@ -46,7 +128,65 @@ impl RepoRoot {
     }
 
     pub fn resolve_file(&self, relative_path: &str) -> AppResult<ResolvedPath> {
-        resolve_path(&self.root, relative_path, PathKind::FileOnly)
+        self.resolve_path(relative_path, PathKind::FileOnly)
+    }
+
+    fn file_index(&self) -> &RepoFileIndex {
+        self.file_index
+            .get_or_init(|| RepoFileIndex::from_files(walk_visible_files(&self.root)))
+    }
+
+    fn resolve_path(&self, relative_path: &str, kind: PathKind) -> AppResult<ResolvedPath> {
+        validate_requested_path(relative_path)?;
+        match resolve_exact_path(&self.root, relative_path) {
+            Ok(resolved) => Ok(resolved),
+            Err(AppError::NotFound(_)) => self.resolve_path_by_suffix(relative_path, kind),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn resolve_path_by_suffix(
+        &self,
+        relative_path: &str,
+        kind: PathKind,
+    ) -> AppResult<ResolvedPath> {
+        let requested_components = requested_components(relative_path);
+        let index = self.file_index();
+
+        // Pass 1: in-memory scan over the gitignore-respected file/dir index.
+        // Was a full FS walk via `ignore::WalkBuilder`. Constant-time after
+        // the index build amortizes on the first call.
+        let (mut matches, mut matches_truncated) =
+            index.scan_for_suffix(kind, &requested_components);
+
+        // Pass 2: ignored fallback. Skipped whenever the visible index has
+        // anything in it ~ a non-empty repo with no visible suffix match
+        // means the user typo'd. The empty-visible edge case still walks so
+        // legit ignored content remains addressable there.
+        if matches.is_empty() && !index.skip_ignored_fallback() {
+            let (ignored_matches, ignored_truncated) =
+                walk_for_suffix(&self.root, kind, &requested_components, false);
+            matches = ignored_matches;
+            matches_truncated = ignored_truncated;
+        }
+
+        if matches.is_empty() {
+            return Err(AppError::not_found(format!(
+                "path not found: {relative_path}"
+            )));
+        }
+
+        matches.sort();
+
+        if matches.len() > 1 {
+            return Err(AppError::bad_request(ambiguous_path_message(
+                relative_path,
+                &matches,
+                matches_truncated,
+            )));
+        }
+
+        resolved_path(&self.root, &self.root.join(&matches[0]), relative_path)
     }
 
     /// Validate `relative_path` for traversal/escape and return a normalized
@@ -65,7 +205,7 @@ impl RepoRoot {
     }
 
     fn resolve_search_path(&self, relative_path: &str) -> AppResult<ResolvedPath> {
-        resolve_path(&self.root, relative_path, PathKind::FileOrDir)
+        self.resolve_path(relative_path, PathKind::FileOrDir)
     }
 
     pub fn collect_search_files(&self, paths: &[String]) -> AppResult<Vec<ResolvedPath>> {
@@ -115,16 +255,6 @@ impl RepoRoot {
     }
 }
 
-fn resolve_path(repo_root: &Path, relative_path: &str, kind: PathKind) -> AppResult<ResolvedPath> {
-    validate_requested_path(relative_path)?;
-
-    match resolve_exact_path(repo_root, relative_path) {
-        Ok(resolved) => Ok(resolved),
-        Err(AppError::NotFound(_)) => resolve_path_by_suffix(repo_root, relative_path, kind),
-        Err(error) => Err(error),
-    }
-}
-
 fn validate_requested_path(relative_path: &str) -> AppResult<()> {
     if relative_path.trim().is_empty() {
         return Err(AppError::bad_request("path must not be empty"));
@@ -156,48 +286,40 @@ fn resolve_exact_path(repo_root: &Path, relative_path: &str) -> AppResult<Resolv
     resolved_path(repo_root, &joined, relative_path)
 }
 
-fn resolve_path_by_suffix(
-    repo_root: &Path,
-    relative_path: &str,
-    kind: PathKind,
-) -> AppResult<ResolvedPath> {
-    let requested_components = requested_components(relative_path);
+/// Collect every gitignore-respected file path in the repo (relative to
+/// `repo_root`, `/`-joined). Same WalkBuilder flag set as
+/// `collect_search_files`; lives here to back the `RepoFileIndex` cache.
+fn walk_visible_files(repo_root: &Path) -> Vec<String> {
+    let walker = WalkBuilder::new(repo_root)
+        .hidden(true)
+        .git_ignore(true)
+        .git_global(false)
+        .git_exclude(true)
+        .follow_links(false)
+        .build();
 
-    // Two-pass walk: prefer matches the agent can actually edit (gitignore-
-    // respected). Only fall back to ignored matches when the respected walk
-    // returned nothing ~ this stops `outline schema.prisma` from listing
-    // node_modules/.prisma/client/schema.prisma as a fake ambiguity, while
-    // still letting suffix matching find legitimately-ignored fixtures.
-    let (matches, matches_truncated) =
-        walk_for_suffix(repo_root, kind, &requested_components, true);
-    let (mut matches, matches_truncated) = if matches.is_empty() {
-        walk_for_suffix(repo_root, kind, &requested_components, false)
-    } else {
-        (matches, matches_truncated)
-    };
-
-    if matches.is_empty() {
-        return Err(AppError::not_found(format!(
-            "path not found: {relative_path}"
-        )));
+    let mut files = Vec::new();
+    for entry in walker.flatten() {
+        if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+            continue;
+        }
+        let full_path = entry.into_path();
+        if let Ok(relative) = relative_path_string(repo_root, &full_path) {
+            files.push(relative);
+        }
     }
-
-    matches.sort();
-
-    if matches.len() > 1 {
-        return Err(AppError::bad_request(ambiguous_path_message(
-            relative_path,
-            &matches,
-            matches_truncated,
-        )));
-    }
-
-    resolved_path(repo_root, &repo_root.join(&matches[0]), relative_path)
+    files
 }
 
-/// Walk `repo_root` and collect repo-relative paths whose component suffix
-/// matches `requested_components`. `respect_ignores=true` skips files
-/// hidden by `.gitignore`/`.git/info/exclude` ~ same flags used by the
+/// Walk `repo_root` (un-respected: includes ignored content) and collect
+/// repo-relative paths whose component suffix matches `requested_components`.
+/// Used as the fallback when the in-memory visible index is empty. The bool
+/// result is `true` when the AMBIGUOUS_COLLECT_CAP was hit.
+///
+/// The original two-pass `walk_for_suffix(..., true)` then `(..., false)`
+/// path was retired in favor of the in-memory `RepoFileIndex` for the
+/// `respect_ignores=true` half ~ this function now handles only the
+/// fallback. The flag stays for symmetry/future use.
 /// top-level commands' walker (collect_search_files). `false` walks
 /// everything for fallback resolution. The bool result is true when the
 /// AMBIGUOUS_COLLECT_CAP was hit.

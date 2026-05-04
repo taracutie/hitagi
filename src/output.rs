@@ -111,15 +111,15 @@ fn render_outline(path: &str, value: &OutlineResponse) -> String {
         out.push_str("auto-summarized • depth 1\n");
     }
     if !value.kind_counts.is_empty() {
-        out.push_str("kinds");
+        out.push_str("file kinds");
         for (kind, count) in &value.kind_counts {
             let _ = write!(out, " • {kind} {count}");
         }
         out.push('\n');
     }
-    if let Some(kinds) = &value.available_kinds {
-        let _ = writeln!(out, "available kinds • {}", kinds.join(", "));
-    }
+    // available_kinds JSON field is preserved for programmatic consumers; the
+    // text rendering would just duplicate the `file kinds` line above (same
+    // info, less detail), so we skip it.
     if let Some(note) = &value.note {
         let _ = writeln!(out, "note • {note}");
     }
@@ -171,15 +171,33 @@ fn render_search(query: &str, value: &SearchResponse) -> String {
     if !value.unsampled_dirs.is_empty() {
         let _ = writeln!(out, "unsampled • {}", value.unsampled_dirs.join(", "));
     }
-    for (path, matches) in &value.results {
-        render_search_file(&mut out, &format!("{}{}", value.prefix, path), matches);
-    }
+    render_search_results(&mut out, &value.prefix, &value.results);
     for group in &value.groups {
-        for (path, matches) in &group.results {
-            render_search_file(&mut out, &format!("{}{}", group.prefix, path), matches);
-        }
+        render_search_results(&mut out, &group.prefix, &group.results);
     }
     out
+}
+
+fn render_search_results(
+    out: &mut String,
+    prefix: &str,
+    results: &std::collections::BTreeMap<String, Vec<String>>,
+) {
+    if results.is_empty() {
+        return;
+    }
+    let render_prefix_once = !prefix.is_empty();
+    if render_prefix_once {
+        let _ = writeln!(out, "{prefix}");
+    }
+    for (path, matches) in results {
+        let path = if render_prefix_once {
+            path.to_string()
+        } else {
+            format!("{prefix}{path}")
+        };
+        render_search_file(out, &path, matches);
+    }
 }
 
 fn render_search_file(out: &mut String, path: &str, matches: &[String]) {
@@ -217,14 +235,13 @@ fn render_find(query: &str, value: &FindResponse) -> String {
     if !value.unsampled_dirs.is_empty() {
         let _ = writeln!(out, "unsampled • {}", value.unsampled_dirs.join(", "));
     }
-    if let Some(kinds) = &value.available_kinds {
-        let _ = writeln!(out, "available kinds • {}", kinds.join(", "));
-    }
+    // available_kinds is kept on the JSON shape (programmatic consumers test
+    // it) but suppressed in text ~ the per-match `kind` already conveys what
+    // kinds were searched, and the empty-result case is obvious from "0 matches".
     if let Some(note) = &value.note {
         let _ = writeln!(out, "note • {note}");
     }
-    render_find_matches(&mut out, &value.prefix, &value.matches);
-    render_more_in_file(&mut out, &value.prefix, &value.more_in_file);
+    render_find_bucket(&mut out, &value.prefix, &value.matches, &value.more_in_file);
     for group in &value.groups {
         render_find_group(&mut out, group);
     }
@@ -232,8 +249,27 @@ fn render_find(query: &str, value: &FindResponse) -> String {
 }
 
 fn render_find_group(out: &mut String, group: &FindGroup) {
-    render_find_matches(out, &group.prefix, &group.matches);
-    render_more_in_file(out, &group.prefix, &group.more_in_file);
+    render_find_bucket(out, &group.prefix, &group.matches, &group.more_in_file);
+}
+
+fn render_find_bucket(
+    out: &mut String,
+    prefix: &str,
+    matches: &FindMatches,
+    more_in_file: &std::collections::BTreeMap<String, usize>,
+) {
+    if find_matches_is_empty(matches) && more_in_file.is_empty() {
+        return;
+    }
+    if prefix.is_empty() {
+        render_find_matches(out, prefix, matches);
+        render_more_in_file(out, prefix, more_in_file);
+        return;
+    }
+
+    let _ = writeln!(out, "{prefix}");
+    render_find_matches(out, "", matches);
+    render_more_in_file(out, "", more_in_file);
 }
 
 fn render_find_matches(out: &mut String, prefix: &str, matches: &FindMatches) {
@@ -248,6 +284,13 @@ fn render_find_matches(out: &mut String, prefix: &str, matches: &FindMatches) {
                 let _ = writeln!(out, "• {prefix}{m}");
             }
         }
+    }
+}
+
+fn find_matches_is_empty(matches: &FindMatches) -> bool {
+    match matches {
+        FindMatches::Full(matches) => matches.is_empty(),
+        FindMatches::Terse(matches) => matches.is_empty(),
     }
 }
 
@@ -299,8 +342,8 @@ fn render_langs(value: &LangsResponse) -> String {
         let parseable = if lang.parseable { "parseable" } else { "plain" };
         let _ = writeln!(
             out,
-            "• {:<12} {:>5} files {:>7} lines • {parseable}",
-            lang.language, lang.files, lang.lines
+            "• {:<12} {:>5} files {:>7} lines {:>7} code {:>6} comm {:>6} blank • {parseable}",
+            lang.language, lang.files, lang.lines, lang.code, lang.comment, lang.blank
         );
     }
     out
