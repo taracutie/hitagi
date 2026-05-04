@@ -14,10 +14,10 @@ use crate::{
     models::{
         CacheClearResponse, CacheLangCount, CachePathResponse, CacheStatusResponse,
         DiffFileResponse, DiffFileSummary, DiffHunk, DiffMultiFileResponse, DiffOverviewResponse,
-        DiffSummaryFile, DiffSummaryResponse, FilesResponse, FindGroup, FindMatch, FindMatches,
-        FindResponse, LangSummary, LangsResponse, OutlineResponse, OutputSymbol,
-        OutputSymbolDetail, ReadFileResponse, SearchGroup, SearchResponse, SymbolDetail,
-        SymbolInfo, SymbolResponse,
+        DiffPathsResponse, DiffSummaryFile, DiffSummaryGroup, DiffSummaryResponse, FilesGroup,
+        FilesResponse, FindGroup, FindMatch, FindMatches, FindResponse, LangSummary, LangsResponse,
+        OutlineResponse, OutputSymbol, OutputSymbolDetail, ReadFileResponse, ReadSummaryResponse,
+        SearchGroup, SearchResponse, SymbolDetail, SymbolInfo, SymbolResponse,
     },
     parser::{parse_source, ParsedFile},
     queries::{
@@ -66,6 +66,7 @@ pub struct SearchOptions {
 #[derive(Debug, Default, Clone)]
 pub struct ReadOptions {
     pub lines: Option<(usize, usize)>,
+    pub summary: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -130,6 +131,8 @@ pub struct DiffFileOptions {
 #[derive(Debug, Clone, Default)]
 pub struct DiffSummaryOptions {
     pub symbols: bool,
+    pub commit: bool,
+    pub group_by_state: bool,
 }
 
 struct LoadedSource {
@@ -546,6 +549,68 @@ pub fn read_file(repo: &RepoRoot, path: &str, opts: ReadOptions) -> AppResult<Re
     }
 }
 
+pub fn read_summary(repo: &RepoRoot, path: &str) -> AppResult<ReadSummaryResponse> {
+    let resolved = repo.resolve_file(path)?;
+    let stat = stat_file(&resolved)?;
+    let content = read_after_stat(&resolved)?;
+    let detected = stat.language.unwrap_or(Language::Plaintext);
+    let line_stats = count_lines(content.as_bytes(), detected);
+    let language = stat
+        .language
+        .map(|l| l.as_str().to_string())
+        .unwrap_or_else(|| "plaintext".to_string());
+
+    let mut total_symbols = 0;
+    let mut kind_counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut symbols = Vec::new();
+    let mut note = None;
+
+    if let Some(parseable) = stat.language.filter(|l| l.is_parseable()) {
+        let mut cache = ParseCache::open(repo.root());
+        let parsed = cached_or_parsed(
+            &mut cache,
+            &resolved,
+            &stat.metadata,
+            parseable,
+            Some(&content),
+        )?;
+        cache.save(false);
+
+        total_symbols = parsed.len();
+        for symbol in &parsed {
+            *kind_counts.entry(symbol.kind.clone()).or_insert(0) += 1;
+        }
+        let auto_summarized = total_symbols > OUTLINE_AUTO_SUMMARY_THRESHOLD;
+        let depth = if auto_summarized { Some(1) } else { None };
+        symbols = parsed
+            .into_iter()
+            .filter(|s| within_depth(&s.qualname, depth))
+            .map(|s| to_output_symbol(s, false))
+            .collect();
+        if auto_summarized {
+            note = Some(format!(
+                "file has {total_symbols} symbols; emitted top-level summary to keep response compact"
+            ));
+        }
+    }
+
+    Ok(ReadSummaryResponse {
+        language,
+        lines: line_stats.total as usize,
+        bytes: stat.metadata.len() as usize,
+        blank: line_stats.blank as usize,
+        comment: line_stats.comment as usize,
+        code: line_stats
+            .total
+            .saturating_sub(line_stats.blank + line_stats.comment) as usize,
+        parseable: detected.is_parseable(),
+        total_symbols,
+        kind_counts,
+        symbols,
+        note,
+    })
+}
+
 pub fn find(repo: &RepoRoot, query: &str, opts: FindOptions) -> AppResult<FindResponse> {
     let query = query.trim();
     if query.is_empty() {
@@ -812,12 +877,22 @@ pub fn files(repo: &RepoRoot, opts: FilesOptions) -> AppResult<FilesResponse> {
     files.sort();
 
     let truncated = files.len() > opts.limit;
+    let all_files = files;
+    let mut files = all_files.clone();
     if truncated {
         files.truncate(opts.limit);
     }
+    let groups = if truncated {
+        build_files_groups(&all_files, &files, &opts.globs)?
+    } else {
+        Vec::new()
+    };
 
     let note = if truncated {
-        Some("response truncated; pass globs (e.g. \"**/*.rs\") or --limit N to refine".to_string())
+        Some(
+            "response truncated; grouped samples show first/last matches per glob or root"
+                .to_string(),
+        )
     } else {
         None
     };
@@ -825,8 +900,90 @@ pub fn files(repo: &RepoRoot, opts: FilesOptions) -> AppResult<FilesResponse> {
     Ok(FilesResponse {
         files,
         truncated,
+        groups,
         note,
     })
+}
+
+const FILES_GROUP_SAMPLE: usize = 3;
+
+fn build_files_groups(
+    all_files: &[String],
+    shown_files: &[String],
+    globs: &[String],
+) -> AppResult<Vec<FilesGroup>> {
+    if globs.is_empty() {
+        let mut by_root: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for path in all_files {
+            let root = top_level_dir(path).unwrap_or(".").to_string();
+            by_root.entry(root).or_default().push(path.clone());
+        }
+        return Ok(by_root
+            .into_iter()
+            .map(|(root, paths)| {
+                let shown = shown_files
+                    .iter()
+                    .filter(|path| top_level_dir(path).unwrap_or(".") == root)
+                    .count();
+                let (first, last) = sample_file_group(&paths);
+                FilesGroup {
+                    pattern: None,
+                    root: Some(root),
+                    total: paths.len(),
+                    shown,
+                    first,
+                    last,
+                }
+            })
+            .collect());
+    }
+
+    let mut groups = Vec::new();
+    for pattern in globs {
+        let glob = Glob::new(pattern)
+            .map_err(|e| AppError::bad_request(format!("invalid glob `{pattern}`: {e}")))?;
+        let matcher = glob.compile_matcher();
+        let paths: Vec<String> = all_files
+            .iter()
+            .filter(|path| matcher.is_match(path.as_str()))
+            .cloned()
+            .collect();
+        if paths.is_empty() {
+            continue;
+        }
+        let shown = shown_files
+            .iter()
+            .filter(|path| matcher.is_match(path.as_str()))
+            .count();
+        let (first, last) = sample_file_group(&paths);
+        groups.push(FilesGroup {
+            pattern: Some(pattern.clone()),
+            root: None,
+            total: paths.len(),
+            shown,
+            first,
+            last,
+        });
+    }
+    Ok(groups)
+}
+
+fn sample_file_group(paths: &[String]) -> (Vec<String>, Vec<String>) {
+    let first = paths.iter().take(FILES_GROUP_SAMPLE).cloned().collect();
+    let last = if paths.len() > FILES_GROUP_SAMPLE {
+        paths
+            .iter()
+            .rev()
+            .take(FILES_GROUP_SAMPLE)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    (first, last)
 }
 
 pub fn langs(repo: &RepoRoot) -> AppResult<LangsResponse> {
@@ -1408,87 +1565,285 @@ pub fn diff_summary(
     opts: DiffOptions,
     summary: DiffSummaryOptions,
 ) -> AppResult<DiffSummaryResponse> {
-    let against = if opts.against == DEFAULT_AGAINST_REF {
-        None
-    } else {
-        Some(opts.against.clone())
-    };
-    let scope = match opts.scope {
-        DiffScope::All => String::new(),
-        DiffScope::Staged => "staged".to_string(),
-        DiffScope::Unstaged => "unstaged".to_string(),
-        DiffScope::Untracked => "untracked".to_string(),
-    };
+    let overview = diff_overview(repo, opts.clone())?;
+    let against = overview.against.clone();
+    let scope = overview.scope.clone();
+    let note = overview.note.clone();
+    let all_files = summary_files_from_overview(overview);
+    let selection = select_diff_summary_files(repo, &all_files, paths)?;
+    let mut files = selection.files;
 
-    if paths.is_empty() && !summary.symbols {
-        let overview = diff_overview(repo, opts)?;
-        let prefix = overview.prefix.clone();
-        let files = overview
-            .files
+    if summary.symbols {
+        let drill = DiffFileOptions {
+            symbol: None,
+            raw: false,
+            body: DiffBodyMode::None,
+            snippet: false,
+        };
+        files = files
             .into_iter()
-            .map(|f| {
-                let old_path_needs_prefix = f.old_path_needs_prefix;
-                DiffSummaryFile {
-                    path: format!("{}{}", prefix, f.path),
-                    status: f.status,
-                    old_path: f.old_path.map(|old| {
-                        if old_path_needs_prefix {
-                            format!("{}{}", prefix, old)
-                        } else {
-                            old
-                        }
-                    }),
-                    added: f.added,
-                    removed: f.removed,
-                    language: None,
-                    symbols: Vec::new(),
-                    staged: f.staged,
-                    unstaged: f.unstaged,
-                    binary: f.binary,
-                    more_symbols: 0,
-                    note: f.note,
-                }
+            .map(|base| {
+                let file = diff_file(repo, &base.path, opts.clone(), drill.clone())?;
+                Ok(summary_from_file(file, true, Some(&base)))
             })
-            .collect();
-        return Ok(DiffSummaryResponse {
-            files,
-            against: overview.against,
-            scope: overview.scope,
-            clean: overview.clean,
-            note: overview.note,
-        });
+            .collect::<AppResult<Vec<_>>>()?;
     }
 
-    let target_paths = if paths.is_empty() {
-        let overview = diff_overview(repo, opts.clone())?;
-        let prefix = overview.prefix;
-        overview
-            .files
-            .into_iter()
-            .map(|f| format!("{}{}", prefix, f.path))
-            .collect::<Vec<_>>()
-    } else {
-        paths.to_vec()
-    };
-
-    let drill = DiffFileOptions {
-        symbol: None,
-        raw: false,
-        body: DiffBodyMode::None,
-        snippet: false,
-    };
-    let mut files = Vec::with_capacity(target_paths.len());
-    for path in target_paths {
-        let file = diff_file(repo, &path, opts.clone(), drill.clone())?;
-        files.push(summary_from_file(file, summary.symbols));
-    }
+    let groups = build_diff_summary_groups(&selection.groups, &files);
     Ok(DiffSummaryResponse {
         clean: files.is_empty(),
         files,
+        groups,
         against,
         scope,
-        note: None,
+        commit: summary.commit || summary.group_by_state,
+        note,
     })
+}
+
+pub fn diff_paths(
+    repo: &RepoRoot,
+    paths: &[String],
+    opts: DiffOptions,
+) -> AppResult<DiffPathsResponse> {
+    let overview = diff_overview(repo, opts)?;
+    let against = overview.against.clone();
+    let scope = overview.scope.clone();
+    let note = overview.note.clone();
+    let all_files = summary_files_from_overview(overview);
+    let selection = select_diff_summary_files(repo, &all_files, paths)?;
+    let paths: Vec<String> = selection.files.into_iter().map(|file| file.path).collect();
+    Ok(DiffPathsResponse {
+        clean: paths.is_empty(),
+        paths,
+        against,
+        scope,
+        note,
+    })
+}
+
+pub fn diff_paths_are_all_directories(
+    repo: &RepoRoot,
+    paths: &[String],
+    opts: DiffOptions,
+) -> AppResult<bool> {
+    if paths.is_empty() {
+        return Ok(false);
+    }
+    let overview = diff_overview(repo, opts)?;
+    let all_files = summary_files_from_overview(overview);
+    let filters = resolve_diff_summary_filters(repo, &all_files, paths)?;
+    Ok(filters.iter().all(|filter| filter.is_dir))
+}
+
+#[derive(Debug, Clone)]
+struct DiffSummarySelection {
+    files: Vec<DiffSummaryFile>,
+    groups: Vec<DiffSummaryGroupSpec>,
+}
+
+#[derive(Debug, Clone)]
+struct DiffSummaryGroupSpec {
+    path: String,
+    paths: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct DiffSummaryFilter {
+    path: String,
+    paths: Vec<String>,
+    is_dir: bool,
+}
+
+fn summary_files_from_overview(overview: DiffOverviewResponse) -> Vec<DiffSummaryFile> {
+    let prefix = overview.prefix;
+    overview
+        .files
+        .into_iter()
+        .map(|f| {
+            let old_path_needs_prefix = f.old_path_needs_prefix;
+            DiffSummaryFile {
+                path: format!("{}{}", prefix, f.path),
+                status: f.status,
+                old_path: f.old_path.map(|old| {
+                    if old_path_needs_prefix {
+                        format!("{}{}", prefix, old)
+                    } else {
+                        old
+                    }
+                }),
+                added: f.added,
+                removed: f.removed,
+                language: None,
+                symbols: Vec::new(),
+                staged: f.staged,
+                unstaged: f.unstaged,
+                binary: f.binary,
+                more_symbols: 0,
+                note: f.note,
+            }
+        })
+        .collect()
+}
+
+fn select_diff_summary_files(
+    repo: &RepoRoot,
+    all_files: &[DiffSummaryFile],
+    paths: &[String],
+) -> AppResult<DiffSummarySelection> {
+    if paths.is_empty() {
+        return Ok(DiffSummarySelection {
+            files: all_files.to_vec(),
+            groups: Vec::new(),
+        });
+    }
+
+    let filters = resolve_diff_summary_filters(repo, all_files, paths)?;
+    let by_path: BTreeMap<String, DiffSummaryFile> = all_files
+        .iter()
+        .map(|file| (file.path.clone(), file.clone()))
+        .collect();
+    let mut selected: BTreeMap<String, DiffSummaryFile> = BTreeMap::new();
+    let mut groups = Vec::new();
+
+    for filter in filters {
+        for path in &filter.paths {
+            if let Some(file) = by_path.get(path) {
+                selected.entry(path.clone()).or_insert_with(|| file.clone());
+            }
+        }
+        if filter.is_dir {
+            groups.push(DiffSummaryGroupSpec {
+                path: filter.path,
+                paths: filter.paths,
+            });
+        }
+    }
+
+    Ok(DiffSummarySelection {
+        files: selected.into_values().collect(),
+        groups,
+    })
+}
+
+fn resolve_diff_summary_filters(
+    repo: &RepoRoot,
+    all_files: &[DiffSummaryFile],
+    paths: &[String],
+) -> AppResult<Vec<DiffSummaryFilter>> {
+    paths
+        .iter()
+        .map(|path| resolve_diff_summary_filter(repo, all_files, path))
+        .collect()
+}
+
+fn resolve_diff_summary_filter(
+    repo: &RepoRoot,
+    all_files: &[DiffSummaryFile],
+    path: &str,
+) -> AppResult<DiffSummaryFilter> {
+    let normalized = repo.validate_diff_path(path)?;
+    let resolved = repo.resolve_file_or_dir(path).ok();
+    let base = resolved
+        .as_ref()
+        .map(|r| r.relative_path.clone())
+        .unwrap_or(normalized);
+    let existing_dir = resolved
+        .as_ref()
+        .map(|r| r.full_path.is_dir())
+        .unwrap_or(false);
+    let exact = all_files.iter().find(|file| file.path == base);
+    let prefix = format!("{base}/");
+    let prefix_paths: Vec<String> = all_files
+        .iter()
+        .filter(|file| file.path.starts_with(&prefix))
+        .map(|file| file.path.clone())
+        .collect();
+
+    if existing_dir || (!prefix_paths.is_empty() && exact.is_none()) {
+        return Ok(DiffSummaryFilter {
+            path: base,
+            paths: prefix_paths,
+            is_dir: true,
+        });
+    }
+
+    if let Some(file) = exact {
+        return Ok(DiffSummaryFilter {
+            path: file.path.clone(),
+            paths: vec![file.path.clone()],
+            is_dir: false,
+        });
+    }
+
+    let components = repo::parse_requested_components(&base);
+    let suffix_matches: Vec<&DiffSummaryFile> = all_files
+        .iter()
+        .filter(|file| repo::path_components_match_suffix(&file.path, &components))
+        .collect();
+
+    match suffix_matches.len() {
+        0 => Err(AppError::not_found(format!(
+            "path not found in diff: {path} (run `hitagi diff --paths` to list changed files)"
+        ))),
+        1 => Ok(DiffSummaryFilter {
+            path: suffix_matches[0].path.clone(),
+            paths: vec![suffix_matches[0].path.clone()],
+            is_dir: false,
+        }),
+        _ => {
+            let shown: Vec<&str> = suffix_matches
+                .iter()
+                .take(10)
+                .map(|file| file.path.as_str())
+                .collect();
+            let extra = suffix_matches.len().saturating_sub(shown.len());
+            let remainder = if extra == 0 {
+                String::new()
+            } else {
+                format!(" (+{extra} more)")
+            };
+            Err(AppError::bad_request(format!(
+                "path is ambiguous: {path} matched multiple changed paths: {}{remainder}",
+                shown.join(", ")
+            )))
+        }
+    }
+}
+
+fn build_diff_summary_groups(
+    specs: &[DiffSummaryGroupSpec],
+    files: &[DiffSummaryFile],
+) -> Vec<DiffSummaryGroup> {
+    if specs.is_empty() {
+        return Vec::new();
+    }
+    let by_path: BTreeMap<String, DiffSummaryFile> = files
+        .iter()
+        .map(|file| (file.path.clone(), file.clone()))
+        .collect();
+    specs
+        .iter()
+        .map(|spec| {
+            let group_files: Vec<DiffSummaryFile> = spec
+                .paths
+                .iter()
+                .filter_map(|path| by_path.get(path).cloned())
+                .collect();
+            let added = group_files.iter().map(|file| file.added.unwrap_or(0)).sum();
+            let removed = group_files
+                .iter()
+                .map(|file| file.removed.unwrap_or(0))
+                .sum();
+            DiffSummaryGroup {
+                path: spec.path.clone(),
+                file_count: group_files.len(),
+                added,
+                removed,
+                files: group_files,
+            }
+        })
+        .collect()
 }
 
 fn diff_untracked_file(
@@ -1921,7 +2276,11 @@ fn synthetic_untracked_raw(path: &str, content: &str, added: usize) -> String {
 
 const SUMMARY_SYMBOL_LIMIT: usize = 8;
 
-fn summary_from_file(file: DiffFileResponse, include_symbols: bool) -> DiffSummaryFile {
+fn summary_from_file(
+    file: DiffFileResponse,
+    include_symbols: bool,
+    base: Option<&DiffSummaryFile>,
+) -> DiffSummaryFile {
     let (symbols, more_symbols) = if include_symbols {
         summary_symbols(file.hunks.as_deref())
     } else {
@@ -1932,15 +2291,15 @@ fn summary_from_file(file: DiffFileResponse, include_symbols: bool) -> DiffSumma
         path: file.path,
         status: file.status,
         old_path: file.old_path,
-        added: file.added,
-        removed: file.removed,
+        added: file.added.or_else(|| base.and_then(|b| b.added)),
+        removed: file.removed.or_else(|| base.and_then(|b| b.removed)),
         language: file.language,
         symbols,
-        staged: false,
-        unstaged: false,
+        staged: base.map(|b| b.staged).unwrap_or(false),
+        unstaged: base.map(|b| b.unstaged).unwrap_or(false),
         binary: file.binary,
         more_symbols,
-        note: file.note,
+        note: file.note.or_else(|| base.and_then(|b| b.note.clone())),
     }
 }
 

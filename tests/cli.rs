@@ -633,9 +633,40 @@ fn read_clamps_lines_past_end_of_file() {
 }
 
 #[test]
+fn read_summary_emits_metadata_and_symbols_without_content() {
+    let value = run(&["read", "src/auth.ts", "--summary"]);
+    assert_eq!(value["language"], "typescript");
+    assert_eq!(value["parseable"], true);
+    assert!(value["lines"].as_u64().unwrap() > 0);
+    assert!(value["bytes"].as_u64().unwrap() > 0);
+    assert!(value.get("content").is_none());
+    let symbols = value["symbols"].as_array().unwrap();
+    assert!(symbols.iter().any(|s| s["qualname"] == "AuthService"));
+}
+
+#[test]
+fn read_summary_handles_plaintext_files() {
+    let scratch = ScratchRepo::new("read-summary-plain");
+    scratch.write("notes.txt", "hello\n\nworld\n");
+
+    let value = scratch.run(&["read", "notes.txt", "--summary"]);
+    assert_eq!(value["language"], "plaintext");
+    assert_eq!(value["parseable"], false);
+    assert_eq!(value["lines"], 3);
+    assert!(value.get("content").is_none());
+    assert!(value.get("symbols").is_none());
+}
+
+#[test]
 fn read_rejects_inverted_range() {
     let stderr = run_failure(&["read", "src/auth.ts", "--lines", "10-5"]);
     assert!(stderr.contains("--lines start must be <= end"));
+}
+
+#[test]
+fn read_summary_rejects_line_slices() {
+    let stderr = run_failure(&["read", "src/auth.ts", "--summary", "--lines", "1-2"]);
+    assert!(stderr.contains("--summary and --lines cannot be combined"));
 }
 
 #[test]
@@ -823,6 +854,7 @@ fn files_truncates_with_limit() {
     assert_eq!(files.len(), 2);
     assert_eq!(value["truncated"], true);
     assert!(value["note"].as_str().unwrap().contains("truncated"));
+    assert!(value["groups"].is_array());
 }
 
 #[test]
@@ -839,6 +871,24 @@ fn files_accepts_multiple_globs() {
     assert!(files
         .iter()
         .all(|f| f.ends_with(".ts") || f.ends_with(".prisma")));
+}
+
+#[test]
+fn files_truncation_reports_per_glob_samples() {
+    let value = run(&["files", "apps/**", "src/**", "--limit", "1"]);
+    assert_eq!(value["truncated"], true);
+    assert_eq!(value["files"].as_array().unwrap().len(), 1);
+    let groups = value["groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 2);
+    assert_eq!(groups[0]["pattern"], "apps/**");
+    assert!(groups[0]["total"].as_u64().unwrap() > 0);
+    assert!(groups[0]["first"].as_array().unwrap().len() > 0);
+    assert_eq!(groups[1]["pattern"], "src/**");
+
+    let text = run_text(&["files", "apps/**", "src/**", "--limit", "1"]);
+    assert!(text.contains("1 files shown"), "{text}");
+    assert!(text.contains("pattern apps/**"), "{text}");
+    assert!(text.contains("first •"), "{text}");
 }
 
 #[test]
@@ -1108,6 +1158,11 @@ fn long_help_includes_llm_prompt_sections() {
         "--symbols",
         "--untracked",
         "--body",
+        "--commit",
+        "--paths",
+        "--names-only",
+        "read --summary",
+        "Directory diff summary",
         "multi-drilldown",
     ] {
         assert!(

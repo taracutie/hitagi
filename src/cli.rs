@@ -37,8 +37,8 @@ RECOMMENDED WORKFLOW
   4. outline <FILE>        see the structure of one file (compact, lines only)
   5. symbol <FILE> <Q>     read one symbol's body in isolation
   6. search <STR>          substring search with scope + match-line annotation
-  7. read <FILE>           dump a file (use --lines to slice big files)
-  8. diff [FILES...]       review uncommitted changes (overview, summary, or drill)
+  7. read <FILE>           dump content, line slices, or --summary structure
+  8. diff [FILES...]       review changes (overview, --commit, --paths, or drill)
 
 SUPPORTED LANGUAGES
   PARSEABLE (full outline / symbol / find): Rust (.rs), TypeScript (.ts), TSX \
@@ -81,9 +81,10 @@ TIPS
     Both save a follow-up `read` when you only needed inline context.
 
   Limits and truncation
-    Default --limit is 50 for search/find, 500 for files. When the cap is reached
-    the response carries `\"truncated\": true`. Bump --limit when sweeping; reduce
-    it for noisy queries.
+    Default --limit is 50 for search/find, 2000 for files. When the cap is reached
+    the response carries `\"truncated\": true`. `files` adds per-glob/per-root
+    first/last samples so truncated discovery stays useful without dumping long
+    path lists. Bump --limit when sweeping; reduce it for noisy queries.
 
   Fair sampling on full-repo sweeps
     `find` and `search` walk top-level subdirs round-robin (one file per bucket
@@ -111,6 +112,11 @@ TIPS
     keeps one level of nesting (e.g. methods inside a class, variants inside an
     enum). Depth is counted from dots in the qualname. Use it on big files where
     you only need orientation.
+
+  read --summary
+    Emits language, line stats, parseability, and outline symbols without file
+    content. Use it for new/untracked files when raw `read` would spend too many
+    tokens before you know which symbol or line range matters.
 
   find --terse
     Compact output mode. `matches` becomes a list of strings like
@@ -165,17 +171,18 @@ TIPS
     ±line counts, staged/unstaged flags, and grouped text sections in the default
     combined scope. `diff <PATH...>` prints structured hunks for one or more
     files; one-path JSON remains the single-file response, multi-path JSON is
-    `{ \"files\": [...] }`. Untracked files are drillable as synthetic additions.
-    `--summary` emits compact per-file output for commit review; add `--symbols`
-    to include touched symbols. `--body full|changed-lines|added-only|none`
-    controls structured hunk bodies, and `--snippet` adds the first changed line
-    to each hunk header. Pass --raw for unified diff text instead. `--symbol Q`
-    filters a one-file drilldown to hunks overlapping one symbol. `--staged` /
-    `--unstaged` / `--untracked` narrow the scope. Use `--against REF` to compare
-    against something other than HEAD (e.g. main). Deleted files get their
-    HEAD-side blob parsed in-memory so `symbol` annotations still appear. The
-    structured-hunks response degrades to ranges + symbols (no `body`) when one
-    file's diff exceeds the size cap; a top-level `note` explains.
+    `{ \"files\": [...] }`. Directory PATHS default to grouped summaries. Untracked
+    files are drillable as synthetic additions. `--commit` is the pre-commit
+    preset: summary + touched symbols + no hunk bodies + grouped text sections.
+    `--summary` emits compact per-file output; add `--symbols` to include touched
+    symbols. `--paths` / `--names-only` prints one changed path per line. `--body
+    full|changed-lines|added-only|none` controls structured hunk bodies, and
+    `--snippet` adds the first changed line to each hunk header. Pass --raw for
+    unified diff text instead. `--symbol Q` filters a one-file drilldown to hunks
+    overlapping one symbol. `--staged` / `--unstaged` / `--untracked` narrow the
+    scope. Use `--against REF` to compare against something other than HEAD.
+    Deleted files get their HEAD-side blob parsed in-memory so `symbol`
+    annotations still appear.
 
   Monorepo / repo-subdir scoping
     `diff` only ever surfaces changes inside the hitagi `--repo` subtree. When
@@ -201,6 +208,7 @@ COMMON PATTERNS
   Where's it used (specific dir)? hitagi search \"X\" src/auth
   Sweep without vendor noise      hitagi search \"X\" --exclude vendor --exclude target
   Read a slice of a big file      hitagi read FILE --lines 1400-1510
+  Read structure without content  hitagi read FILE --summary
   List all Rust + TOML files      hitagi files \"**/*.rs\" \"**/*.toml\"
   Find Auth-related classes       hitagi find Auth --kind class,struct --snippet
   Find inside one subtree         hitagi find Network --kind struct src/nnue
@@ -208,10 +216,13 @@ COMMON PATTERNS
   Cheap sweep across the repo     hitagi find X --terse --limit 200
   Diverse sweep (cap hot files)   hitagi find X --terse --per-file 3
   What's uncommitted?             hitagi diff
+  Changed paths only              hitagi diff --paths
   Hunks for one file?             hitagi diff src/foo.rs
   Hunks for several files?        hitagi diff src/foo.rs src/bar.rs
+  Directory diff summary          hitagi diff src tests
   Diff for one symbol?            hitagi diff src/foo.rs --symbol Foo.bar
   Commit-oriented summary?        hitagi diff --summary --symbols
+  Commit-review preset?           hitagi diff --commit
   Ranges without hunk bodies?      hitagi diff src/foo.rs --body none --snippet
   Just staged changes             hitagi diff --staged
   Just untracked changes          hitagi diff --untracked
@@ -220,8 +231,8 @@ COMMON PATTERNS
 ANTI-PATTERNS (token waste)
 
   hitagi read big_file.rs                  # ~5K-line files cost a lot of tokens.
-                                           # Use `outline` then `symbol`, or
-                                           # `read --lines S-E` for slices.
+                                           # Use `read --summary`, `outline` then
+                                           # `symbol`, or `read --lines S-E`.
   hitagi search \"the\"                      # tighten queries; pass [PATHS] to scope.
   hitagi outline huge_file.rs              # add --kind to filter, or just `find`
                                            # the specific symbol you wanted.
@@ -240,8 +251,10 @@ JSON OUTPUT SHAPES (--json; compact form ~ omitted optional fields appear only w
             grouped (when matches span top-levels with no shared prefix):
             {\"results\":{},\"groups\":[{\"prefix\":\"a/\",\"results\":{\"f.rs\":
             [\"...\"]}},{\"prefix\":\"b/\",\"results\":{...}}],\"truncated\":bool}
-  read      {\"language\":\"rust\",\"content\":\"...\",\"lines\":[s,e],
-            \"total_lines\":N}    (lines/total_lines only when --lines is passed)
+  read      content: {\"language\":\"rust\",\"content\":\"...\",\"lines\":[s,e],
+            \"total_lines\":N}
+            summary: {\"language\":\"rust\",\"lines\":N,\"bytes\":N,\"parseable\":bool,
+            \"total_symbols\":N,\"symbols\":[...]}
   find      {\"prefix\":\"src/\"?,\"matches\":[{\"path\":\"...\",\"kind\":\"...\",
             \"name\":\"...\",\"qualname\":\"...\",\"lines\":[s,e]}],
             \"more_in_file\":{\"path\":N,...}?,\"truncated\":bool,
@@ -250,7 +263,9 @@ JSON OUTPUT SHAPES (--json; compact form ~ omitted optional fields appear only w
             {\"matches\":[],\"groups\":[{\"prefix\":\"a/\",\"matches\":[...],
             \"more_in_file\":{...}?},...],\"truncated\":bool,
             \"searched_files\":N,...}
-  files     {\"files\":[\"a\",\"b\",...],\"truncated\":bool,\"note\":\"...\"?}
+  files     {\"files\":[\"a\",\"b\",...],\"truncated\":bool,
+            \"groups\":[{\"pattern\":\"...\"?,\"root\":\"...\"?,\"total\":N,
+            \"shown\":N,\"first\":[...],\"last\":[...]}]?,\"note\":\"...\"?}
   langs     {\"languages\":[{\"language\":\"rust\",\"files\":N,\"lines\":N,
             \"parseable\":bool},...]}
   diff      overview: {\"prefix\":\"...\"?,\"files\":[{\"path\":\"...\",
@@ -265,9 +280,12 @@ JSON OUTPUT SHAPES (--json; compact form ~ omitted optional fields appear only w
             \"snippet\":\"...\"?,\"body\":\"...\"?}],\"raw\":\"...\"?,\"binary\":
             bool?,\"note\":\"...\"?}
             multi-drilldown: {\"files\":[{...drilldown...},...]}
+            paths: {\"paths\":[\"a\",\"b\",...],\"scope\":\"...\"?,\"against\":\"...\"?}
             summary: {\"files\":[{\"path\":\"...\",\"status\":\"...\",\"added\":N?,
             \"removed\":N?,\"language\":\"...\"?,\"symbols\":[\"...\"]?,
-            \"more_symbols\":N?}],\"scope\":\"...\"?,\"against\":\"...\"?}
+            \"more_symbols\":N?}],\"groups\":[{\"path\":\"...\",\"file_count\":N,
+            \"added\":N,\"removed\":N,\"files\":[...]}]?,\"commit\":bool?,
+            \"scope\":\"...\"?,\"against\":\"...\"?}
 
   find --terse override:
     matches (and each group's matches when grouped) becomes a flat list of
@@ -366,6 +384,9 @@ enum Commands {
         /// Slice to a 1-indexed inclusive line range, e.g. `--lines 100-200`.
         #[arg(long, value_name = "S-E")]
         lines: Option<String>,
+        /// Emit metadata and outline symbols without file content.
+        #[arg(long)]
+        summary: bool,
     },
     /// Find symbols across the repo whose qualname contains QUERY (case-insensitive).
     ///
@@ -475,9 +496,18 @@ enum Commands {
         /// --symbols, includes touched symbol names instead of hunk bodies.
         #[arg(long)]
         summary: bool,
+        /// Commit-review preset: compact summary with symbols and grouped text output.
+        #[arg(long)]
+        commit: bool,
         /// Summary only: include touched symbols per file.
-        #[arg(long, requires = "summary")]
+        #[arg(long)]
         symbols: bool,
+        /// Path-only output: one changed repo-relative path per line in text mode.
+        #[arg(long = "paths")]
+        diff_paths: bool,
+        /// Alias for --paths.
+        #[arg(long = "names-only")]
+        names_only: bool,
         /// Structured drilldown body detail.
         #[arg(long, value_enum, default_value_t = CliDiffBodyMode::Full)]
         body: CliDiffBodyMode,
@@ -603,12 +633,27 @@ pub fn run() -> AppResult<()> {
                     let response = commands::search(&repo, &query, opts)?;
                     output::print_search(&query, &response, mode)
                 }
-                Commands::Read { path, lines } => {
+                Commands::Read {
+                    path,
+                    lines,
+                    summary,
+                } => {
+                    if summary && lines.is_some() {
+                        return Err(AppError::bad_request(
+                            "--summary and --lines cannot be combined",
+                        ));
+                    }
                     let opts = ReadOptions {
                         lines: lines.as_deref().map(parse_lines).transpose()?,
+                        summary,
                     };
-                    let response = commands::read_file(&repo, &path, opts)?;
-                    output::print_read(&path, &response, mode)
+                    if opts.summary {
+                        let response = commands::read_summary(&repo, &path)?;
+                        output::print_read_summary(&path, &response, mode)
+                    } else {
+                        let response = commands::read_file(&repo, &path, opts)?;
+                        output::print_read(&path, &response, mode)
+                    }
                 }
                 Commands::Find {
                     query,
@@ -670,7 +715,10 @@ pub fn run() -> AppResult<()> {
                     symbol,
                     raw,
                     summary,
+                    commit,
                     symbols,
+                    diff_paths,
+                    names_only,
                     body,
                     snippet,
                     staged,
@@ -694,6 +742,89 @@ pub fn run() -> AppResult<()> {
                         excludes: exclude,
                     };
                     let body = DiffBodyMode::from(body);
+                    let paths_only = diff_paths || names_only;
+                    if paths_only {
+                        if summary {
+                            return Err(AppError::bad_request(
+                                "--paths and --summary cannot be combined",
+                            ));
+                        }
+                        if commit {
+                            return Err(AppError::bad_request(
+                                "--paths and --commit cannot be combined",
+                            ));
+                        }
+                        if raw {
+                            return Err(AppError::bad_request(
+                                "--paths and --raw cannot be combined",
+                            ));
+                        }
+                        if symbol.is_some() {
+                            return Err(AppError::bad_request(
+                                "--paths and --symbol cannot be combined",
+                            ));
+                        }
+                        if symbols {
+                            return Err(AppError::bad_request(
+                                "--paths and --symbols cannot be combined",
+                            ));
+                        }
+                        if body != DiffBodyMode::Full {
+                            return Err(AppError::bad_request(
+                                "--paths and --body cannot be combined",
+                            ));
+                        }
+                        if snippet {
+                            return Err(AppError::bad_request(
+                                "--paths and --snippet cannot be combined",
+                            ));
+                        }
+                        let response = commands::diff_paths(&repo, &paths, opts)?;
+                        return output::print_diff_paths(&response, mode);
+                    }
+                    if commit {
+                        if summary {
+                            return Err(AppError::bad_request(
+                                "--commit and --summary cannot be combined",
+                            ));
+                        }
+                        if raw {
+                            return Err(AppError::bad_request(
+                                "--commit and --raw cannot be combined",
+                            ));
+                        }
+                        if symbol.is_some() {
+                            return Err(AppError::bad_request(
+                                "--commit and --symbol cannot be combined",
+                            ));
+                        }
+                        if body != DiffBodyMode::Full {
+                            return Err(AppError::bad_request(
+                                "--commit and --body cannot be combined",
+                            ));
+                        }
+                        if snippet {
+                            return Err(AppError::bad_request(
+                                "--commit and --snippet cannot be combined",
+                            ));
+                        }
+                        let response = commands::diff_summary(
+                            &repo,
+                            &paths,
+                            opts,
+                            DiffSummaryOptions {
+                                symbols: true,
+                                commit: true,
+                                group_by_state: true,
+                            },
+                        )?;
+                        return output::print_diff_summary(&response, mode);
+                    }
+                    if symbols && !summary {
+                        return Err(AppError::bad_request(
+                            "--symbols requires --summary or --commit",
+                        ));
+                    }
                     if summary {
                         if raw {
                             return Err(AppError::bad_request(
@@ -719,10 +850,16 @@ pub fn run() -> AppResult<()> {
                             &repo,
                             &paths,
                             opts,
-                            DiffSummaryOptions { symbols },
+                            DiffSummaryOptions {
+                                symbols,
+                                commit: false,
+                                group_by_state: false,
+                            },
                         )?;
                         return output::print_diff_summary(&response, mode);
                     }
+                    let no_drill_flags =
+                        !raw && symbol.is_none() && body == DiffBodyMode::Full && !snippet;
                     if paths.is_empty() {
                         if raw {
                             return Err(AppError::bad_request("--raw requires PATH"));
@@ -738,6 +875,20 @@ pub fn run() -> AppResult<()> {
                         }
                         let response = commands::diff_overview(&repo, opts)?;
                         output::print_diff_overview(&response, mode)
+                    } else if no_drill_flags
+                        && commands::diff_paths_are_all_directories(&repo, &paths, opts.clone())?
+                    {
+                        let response = commands::diff_summary(
+                            &repo,
+                            &paths,
+                            opts,
+                            DiffSummaryOptions {
+                                symbols: false,
+                                commit: false,
+                                group_by_state: false,
+                            },
+                        )?;
+                        output::print_diff_summary(&response, mode)
                     } else if paths.len() == 1 {
                         let drill = DiffFileOptions {
                             symbol,

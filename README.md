@@ -18,11 +18,11 @@ Commands:
 - `outline <PATH>` ~ list every symbol in a file with kind, qualname, and line range.
 - `symbol <PATH> <QUALNAME>` ~ read one symbol's source by qualname (or unique leaf name).
 - `search <QUERY> [PATHS...]` ~ substring search; results group around the enclosing symbol scope and report the actual match line.
-- `read <PATH>` ~ dump a file (or a line slice with `--lines S-E`).
+- `read <PATH>` ~ dump a file, a line slice with `--lines S-E`, or metadata-only structure with `--summary`.
 - `find <QUERY> [PATHS...]` ~ locate symbols across the repo by qualname substring (case-insensitive).
 - `files [GLOBS...]` ~ list files in the repo (gitignore-aware), optionally filtered by globs.
 - `langs` ~ summarise languages present in the repo (file count + line count per language).
-- `diff [PATHS...]` ~ review uncommitted changes; overview by default, compact summary with `--summary`, structured hunks with enclosing-symbol annotation when paths are given.
+- `diff [PATHS...]` ~ review uncommitted changes; overview by default, `--commit`/`--summary` for compact review, `--paths` for staging lists, structured hunks when file paths are given.
 - `cache [status|path|clear]` ~ inspect or manage the on-disk parse cache.
 - `install <claude|codex>` / `uninstall <claude|codex>` ~ add or remove hitagi's user-global agent prompt.
 
@@ -169,6 +169,7 @@ Prints a short metadata header followed by the file content. For files with no r
 Flags:
 
 - `--lines S-E` ~ slice to a 1-indexed inclusive line range, e.g. `--lines 100-200`. The end clamps to the file; if `S` is past EOF you get an error (`--lines start (X) is past end of file (file has N lines)`). With `--json`, slicing adds `"lines": [s, e]` and `"total_lines": N` to the response.
+- `--summary` ~ emit metadata, line stats, parseability, and outline symbols without `content`. Useful for untracked/new files when you need structure before deciding what to read.
 
 ### `find <QUERY> [PATHS...]`
 
@@ -228,7 +229,7 @@ Lists all files in the repo, sorted alphabetically. Respects `.gitignore` (and `
 
 Flags:
 
-- `--limit N` ~ maximum number of files to return (default `2000`). Output includes a truncation note when the cap is hit; `--json` includes `"truncated": true` and a `"note"` field.
+- `--limit N` ~ maximum number of files to return (default `2000`). When truncated, text output switches to per-glob or per-root first/last samples; `--json` includes `"truncated": true`, `"groups"`, and a `"note"` field.
 - `--exclude PATTERN` (repeatable) ~ skip files matching the pattern. Bare names like `--exclude vendor` skip that directory at any depth.
 
 ### `langs`
@@ -249,7 +250,7 @@ One-shot orientation: walks the repo and tallies file count + line count per det
 
 ### `diff [PATHS...]`
 
-Review uncommitted changes (working tree vs `HEAD` by default). Shells out to `git` ~ requires a git repo. With no `PATH`, prints a one-entry-per-file overview; with a `PATH`, prints structured hunks annotated by enclosing symbol.
+Review uncommitted changes (working tree vs `HEAD` by default). Shells out to `git` ~ requires a git repo. With no `PATH`, prints a one-entry-per-file overview; with a file `PATH`, prints structured hunks annotated by enclosing symbol. Directory paths default to grouped compact summaries.
 
 ```bash
 hitagi diff
@@ -294,12 +295,32 @@ hitagi diff --summary --symbols
 
 `--summary` emits compact per-file output for commit review. Add `--symbols` to include touched symbol names without hunk bodies.
 
+```bash
+hitagi diff --commit
+```
+
+`--commit` is the token-efficient pre-commit preset: compact summary, touched symbols included, no hunk bodies, and grouped text sections for `staged+unstaged`, `staged`, `unstaged`, and `untracked`.
+
+```bash
+hitagi diff --paths
+```
+
+`--paths` prints one changed repo-relative path per line in text mode. `--names-only` is an alias.
+
+```bash
+hitagi diff src tests
+```
+
+When every positional path resolves to a directory, plain `diff` returns a grouped summary instead of hunk drilldown. `--summary` and `--commit` also use directory groups when directory paths are passed.
+
 Flags:
 
 - `--symbol QUALNAME` ~ narrow drilldown to hunks overlapping one symbol. Same qualname/leaf semantics as the top-level `symbol` command (suggests near-misses on misspellings).
 - `--raw` ~ emit the unified diff text instead of structured hunks. Mutually exclusive with `--symbol`.
 - `--summary` ~ emit compact per-file summary output. With no paths, summarizes all visible diff entries; with paths, summarizes only those files.
-- `--symbols` ~ summary only: include touched symbols per file, capped to keep output small.
+- `--commit` ~ commit-review preset: summary with touched symbols and grouped state sections.
+- `--symbols` ~ `--summary` only: include touched symbols per file, capped to keep output small. `--commit` includes symbols automatically.
+- `--paths` / `--names-only` ~ path-only output for staging and commit planning.
 - `--body full|changed-lines|added-only|none` ~ structured drilldown body detail. Default is `full`; `none` keeps ranges/symbols without hunk bodies.
 - `--snippet` ~ structured drilldown only: append the first changed line to each hunk header.
 - `--staged` ~ index vs base ref only.

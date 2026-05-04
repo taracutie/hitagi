@@ -130,6 +130,24 @@ pub struct ReadFileResponse {
 }
 
 #[derive(Debug, Serialize)]
+pub struct ReadSummaryResponse {
+    pub language: String,
+    pub lines: usize,
+    pub bytes: usize,
+    pub blank: usize,
+    pub comment: usize,
+    pub code: usize,
+    pub parseable: bool,
+    pub total_symbols: usize,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
+    pub kind_counts: BTreeMap<String, usize>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub symbols: Vec<OutputSymbol>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
 #[serde(untagged)]
 pub enum FindMatches {
     /// Default: structured per-match objects.
@@ -197,9 +215,23 @@ pub struct FilesResponse {
     pub files: Vec<String>,
     #[serde(skip_serializing_if = "is_false")]
     pub truncated: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub groups: Vec<FilesGroup>,
     /// Hint emitted alongside `truncated: true` ~ tells the agent how to refine.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FilesGroup {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root: Option<String>,
+    pub total: usize,
+    pub shown: usize,
+    pub first: Vec<String>,
+    pub last: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -322,20 +354,24 @@ pub struct DiffMultiFileResponse {
     pub files: Vec<DiffFileResponse>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub struct DiffSummaryResponse {
     pub files: Vec<DiffSummaryFile>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub groups: Vec<DiffSummaryGroup>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub against: Option<String>,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub scope: String,
+    #[serde(skip_serializing_if = "is_false")]
+    pub commit: bool,
     #[serde(skip_serializing_if = "is_false")]
     pub clean: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub struct DiffSummaryFile {
     pub path: String,
     pub status: String,
@@ -357,6 +393,28 @@ pub struct DiffSummaryFile {
     pub binary: bool,
     #[serde(skip_serializing_if = "is_zero")]
     pub more_symbols: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct DiffSummaryGroup {
+    pub path: String,
+    pub file_count: usize,
+    pub added: usize,
+    pub removed: usize,
+    pub files: Vec<DiffSummaryFile>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DiffPathsResponse {
+    pub paths: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub against: Option<String>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub scope: String,
+    #[serde(skip_serializing_if = "is_false")]
+    pub clean: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
 }

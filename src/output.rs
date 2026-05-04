@@ -7,9 +7,10 @@ use crate::{
     models::{
         AgentPromptResponse, CacheClearResponse, CachePathResponse, CacheStatusResponse,
         DiffFileResponse, DiffFileSummary, DiffHunk, DiffMultiFileResponse, DiffOverviewResponse,
-        DiffSummaryFile, DiffSummaryResponse, FilesResponse, FindGroup, FindMatch, FindMatches,
-        FindResponse, LangsResponse, OutlineResponse, OutputSymbol, ReadFileResponse,
-        SearchResponse, SymbolResponse,
+        DiffPathsResponse, DiffSummaryFile, DiffSummaryGroup, DiffSummaryResponse, FilesGroup,
+        FilesResponse, FindGroup, FindMatch, FindMatches, FindResponse, LangsResponse,
+        OutlineResponse, OutputSymbol, ReadFileResponse, ReadSummaryResponse, SearchResponse,
+        SymbolResponse,
     },
 };
 
@@ -33,6 +34,14 @@ pub fn print_search(query: &str, value: &SearchResponse, mode: OutputMode) -> Ap
 
 pub fn print_read(path: &str, value: &ReadFileResponse, mode: OutputMode) -> AppResult<()> {
     emit(value, mode, || render_read(path, value))
+}
+
+pub fn print_read_summary(
+    path: &str,
+    value: &ReadSummaryResponse,
+    mode: OutputMode,
+) -> AppResult<()> {
+    emit(value, mode, || render_read_summary(path, value))
 }
 
 pub fn print_find(query: &str, value: &FindResponse, mode: OutputMode) -> AppResult<()> {
@@ -77,6 +86,10 @@ pub fn print_diff_files(value: &DiffMultiFileResponse, mode: OutputMode) -> AppR
 
 pub fn print_diff_summary(value: &DiffSummaryResponse, mode: OutputMode) -> AppResult<()> {
     emit(value, mode, || render_diff_summary(value))
+}
+
+pub fn print_diff_paths(value: &DiffPathsResponse, mode: OutputMode) -> AppResult<()> {
+    emit(value, mode, || render_diff_paths(value))
 }
 
 fn emit<T, F>(value: &T, mode: OutputMode, render_text: F) -> AppResult<()>
@@ -230,6 +243,47 @@ fn render_read(path: &str, value: &ReadFileResponse) -> String {
     out
 }
 
+fn render_read_summary(path: &str, value: &ReadSummaryResponse) -> String {
+    let mut out = String::new();
+    let parseable = if value.parseable {
+        "parseable"
+    } else {
+        "plain"
+    };
+    let _ = writeln!(
+        out,
+        "read summary {path}\n{} • {} lines • {} bytes • {parseable}",
+        value.language, value.lines, value.bytes
+    );
+    let _ = writeln!(
+        out,
+        "line stats • code {} • blank {} • comment {}",
+        value.code, value.blank, value.comment
+    );
+    if value.parseable {
+        let _ = writeln!(
+            out,
+            "symbols • {}/{}",
+            value.symbols.len(),
+            value.total_symbols
+        );
+    }
+    if !value.kind_counts.is_empty() {
+        out.push_str("file kinds");
+        for (kind, count) in &value.kind_counts {
+            let _ = write!(out, " • {kind} {count}");
+        }
+        out.push('\n');
+    }
+    if let Some(note) = &value.note {
+        let _ = writeln!(out, "note • {note}");
+    }
+    for symbol in &value.symbols {
+        render_symbol_line(&mut out, symbol);
+    }
+    out
+}
+
 fn render_find(query: &str, value: &FindResponse) -> String {
     let mut out = String::new();
     let count = find_response_count(value);
@@ -331,17 +385,55 @@ fn render_more_in_file(
 
 fn render_files(value: &FilesResponse) -> String {
     let mut out = String::new();
-    let _ = writeln!(out, "files\n{} files", value.files.len());
+    if value.truncated {
+        let _ = writeln!(out, "files\n{} files shown", value.files.len());
+    } else {
+        let _ = writeln!(out, "files\n{} files", value.files.len());
+    }
     if value.truncated {
         out.push_str("truncated • true\n");
     }
     if let Some(note) = &value.note {
         let _ = writeln!(out, "note • {note}");
     }
+    if value.truncated && !value.groups.is_empty() {
+        for group in &value.groups {
+            render_files_group(&mut out, group);
+        }
+        return out;
+    }
     for file in &value.files {
         let _ = writeln!(out, "• {file}");
     }
     out
+}
+
+fn render_files_group(out: &mut String, group: &FilesGroup) {
+    match (&group.pattern, &group.root) {
+        (Some(pattern), _) => {
+            let _ = writeln!(
+                out,
+                "pattern {pattern} • {} total • {} shown",
+                group.total, group.shown
+            );
+        }
+        (_, Some(root)) => {
+            let _ = writeln!(
+                out,
+                "root {root} • {} total • {} shown",
+                group.total, group.shown
+            );
+        }
+        _ => {
+            let _ = writeln!(out, "group • {} total • {} shown", group.total, group.shown);
+        }
+    }
+    if !group.first.is_empty() {
+        let _ = writeln!(out, "  first • {}", group.first.join(", "));
+    }
+    if !group.last.is_empty() {
+        let _ = writeln!(out, "  last • {}", group.last.join(", "));
+    }
 }
 
 fn render_langs(value: &LangsResponse) -> String {
@@ -567,7 +659,11 @@ fn render_diff_files(value: &DiffMultiFileResponse) -> String {
 
 fn render_diff_summary(value: &DiffSummaryResponse) -> String {
     let mut out = String::new();
-    let mut header = "diff summary".to_string();
+    let mut header = if value.commit {
+        "diff commit".to_string()
+    } else {
+        "diff summary".to_string()
+    };
     if let Some(against) = &value.against {
         let _ = write!(header, " against {against}");
     }
@@ -583,10 +679,57 @@ fn render_diff_summary(value: &DiffSummaryResponse) -> String {
     if let Some(note) = &value.note {
         let _ = writeln!(out, "note • {note}");
     }
-    for file in &value.files {
-        render_diff_summary_file(&mut out, file);
+    if !value.groups.is_empty() {
+        for group in &value.groups {
+            render_diff_summary_group(&mut out, group);
+        }
+    } else if value.commit && value.scope.is_empty() {
+        render_diff_summary_state_groups(&mut out, &value.files);
+    } else {
+        for file in &value.files {
+            render_diff_summary_file(&mut out, file);
+        }
     }
     out
+}
+
+fn render_diff_summary_group(out: &mut String, group: &DiffSummaryGroup) {
+    let _ = writeln!(
+        out,
+        "{} • {} files • +{} -{}",
+        group.path, group.file_count, group.added, group.removed
+    );
+    for file in &group.files {
+        render_diff_summary_file(out, file);
+    }
+}
+
+fn render_diff_summary_state_groups(out: &mut String, files: &[DiffSummaryFile]) {
+    for (label, predicate) in [
+        ("staged+unstaged", 0u8),
+        ("staged", 1),
+        ("unstaged", 2),
+        ("untracked", 3),
+        ("other", 4),
+    ] {
+        let bucket: Vec<_> = files
+            .iter()
+            .filter(|file| match predicate {
+                0 => file.staged && file.unstaged,
+                1 => file.staged && !file.unstaged,
+                2 => file.unstaged && !file.staged,
+                3 => file.status == "?",
+                _ => !file.staged && !file.unstaged && file.status != "?",
+            })
+            .collect();
+        if bucket.is_empty() {
+            continue;
+        }
+        let _ = writeln!(out, "{label}");
+        for file in bucket {
+            render_diff_summary_file(out, file);
+        }
+    }
 }
 
 fn render_diff_summary_file(out: &mut String, file: &DiffSummaryFile) {
@@ -619,6 +762,14 @@ fn render_diff_summary_file(out: &mut String, file: &DiffSummaryFile) {
         let _ = write!(out, " • {note}");
     }
     out.push('\n');
+}
+
+fn render_diff_paths(value: &DiffPathsResponse) -> String {
+    let mut out = String::new();
+    for path in &value.paths {
+        let _ = writeln!(out, "{path}");
+    }
+    out
 }
 
 fn render_diff_hunk(out: &mut String, hunk: &DiffHunk) {

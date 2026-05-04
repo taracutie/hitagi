@@ -131,6 +131,10 @@ impl RepoRoot {
         self.resolve_path(relative_path, PathKind::FileOnly)
     }
 
+    pub fn resolve_file_or_dir(&self, relative_path: &str) -> AppResult<ResolvedPath> {
+        self.resolve_path(relative_path, PathKind::FileOrDir)
+    }
+
     fn file_index(&self) -> &RepoFileIndex {
         self.file_index
             .get_or_init(|| RepoFileIndex::from_files(walk_visible_files(&self.root)))

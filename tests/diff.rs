@@ -608,6 +608,67 @@ fn summary_mode_returns_compact_files_and_symbols_when_requested() {
 }
 
 #[test]
+fn commit_mode_returns_grouped_symbol_summary() {
+    let r = DiffRepo::new("commit-mode");
+    r.write("a.rs", "pub fn alpha() {\n    let x = 1;\n}\n");
+    r.commit("base");
+    r.write("a.rs", "pub fn alpha() {\n    let x = 2;\n}\n");
+    r.write("new.rs", "pub fn fresh() {}\n");
+
+    let json = r.run(&["diff", "--commit"]);
+    assert_eq!(json["commit"], true);
+    assert_eq!(json["files"].as_array().unwrap().len(), 2);
+    let symbols = json["files"][0]["symbols"].as_array().unwrap();
+    assert!(symbols.iter().any(|s| s == "alpha"));
+
+    let text = r.run_text(&["diff", "--commit"]);
+    assert!(text.contains("diff commit"), "{text}");
+    assert!(text.contains("unstaged\n"), "{text}");
+    assert!(text.contains("untracked\n"), "{text}");
+    assert!(!text.contains("@@"), "{text}");
+}
+
+#[test]
+fn diff_paths_lists_changed_paths_and_names_only_alias_matches() {
+    let r = DiffRepo::new("paths-only");
+    r.write("a.rs", "pub fn a() {}\n");
+    r.commit("base");
+    r.write("a.rs", "pub fn aa() {}\n");
+    r.write("new.rs", "pub fn fresh() {}\n");
+
+    let json = r.run(&["diff", "--paths"]);
+    assert_eq!(json["paths"].as_array().unwrap().len(), 2);
+    assert_eq!(json["paths"][0], "a.rs");
+    assert_eq!(json["paths"][1], "new.rs");
+
+    let text = r.run_text(&["diff", "--names-only"]);
+    assert_eq!(text, "a.rs\nnew.rs\n");
+}
+
+#[test]
+fn directory_paths_default_to_grouped_summary() {
+    let r = DiffRepo::new("dir-summary");
+    r.write("src/a.rs", "pub fn a() {}\n");
+    r.write("tests/b.rs", "pub fn b() {}\n");
+    r.commit("base");
+    r.write("src/a.rs", "pub fn aa() {}\n");
+    r.write("tests/b.rs", "pub fn bb() {}\n");
+
+    let json = r.run(&["diff", "src", "tests"]);
+    let groups = json["groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 2);
+    assert_eq!(groups[0]["path"], "src");
+    assert_eq!(groups[0]["file_count"], 1);
+    assert_eq!(groups[1]["path"], "tests");
+    assert_eq!(groups[1]["file_count"], 1);
+
+    let text = r.run_text(&["diff", "src", "tests"]);
+    assert!(text.contains("src • 1 files"), "{text}");
+    assert!(text.contains("tests • 1 files"), "{text}");
+    assert!(!text.contains("@@"), "{text}");
+}
+
+#[test]
 fn drilldown_body_modes_and_snippet_reduce_hunk_context() {
     let r = DiffRepo::new("body-modes");
     r.write("a.rs", "pub fn a() {\n    let x = 1;\n}\n");
@@ -644,6 +705,12 @@ fn invalid_diff_flag_combinations_fail_clearly() {
 
     let stderr = r.run_failure(&["diff", "a.rs", "--raw", "--snippet"]);
     assert!(stderr.contains("--raw and --snippet cannot be combined"));
+
+    let stderr = r.run_failure(&["diff", "--commit", "--summary"]);
+    assert!(stderr.contains("--commit and --summary cannot be combined"));
+
+    let stderr = r.run_failure(&["diff", "--paths", "--symbols"]);
+    assert!(stderr.contains("--paths and --symbols cannot be combined"));
 }
 
 // ~~ Edge cases ~~
