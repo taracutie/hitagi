@@ -47,11 +47,15 @@ fn run_in(repo: &Path, cache_dir: &Path, args: &[&str]) -> Value {
 }
 
 fn run_failure(args: &[&str]) -> String {
+    run_failure_in(&fixture_repo(), shared_cache_dir(), args)
+}
+
+fn run_failure_in(repo: &Path, cache_dir: &Path, args: &[&str]) -> String {
     let assert = Command::cargo_bin("hitagi")
         .unwrap()
-        .env("HITAGI_CACHE_DIR", shared_cache_dir())
+        .env("HITAGI_CACHE_DIR", cache_dir)
         .arg("--repo")
-        .arg(fixture_repo())
+        .arg(repo)
         .args(args)
         .assert()
         .failure();
@@ -312,6 +316,55 @@ fn outline_depth_two_includes_nested_methods() {
         .collect();
     assert!(qualnames.iter().any(|q| q.contains('.')));
     assert!(qualnames.contains(&"AuthService.handleAuth"));
+}
+
+#[test]
+fn outline_qualifies_object_literal_methods_under_object_container() {
+    let scratch = ScratchRepo::new("outline-object-methods");
+    scratch.write(
+        "src/backends.ts",
+        r#"
+const moderationApiBackend: ModerationBackend = {
+  name: 'moderation-api',
+  async run(message) {
+    return null;
+  },
+};
+
+const miniBackend: ModerationBackend = {
+  name: 'gpt-mini',
+  async run(message, context) {
+    return null;
+  },
+};
+"#,
+    );
+
+    let value = scratch.run(&["outline", "src/backends.ts"]);
+    let symbols = value["symbols"].as_array().unwrap();
+    assert!(symbols
+        .iter()
+        .any(|s| s["kind"] == "object" && s["qualname"] == "moderationApiBackend"));
+    assert!(symbols
+        .iter()
+        .any(|s| s["kind"] == "method" && s["qualname"] == "moderationApiBackend.run"));
+    assert!(symbols
+        .iter()
+        .any(|s| s["kind"] == "object" && s["qualname"] == "miniBackend"));
+    assert!(symbols
+        .iter()
+        .any(|s| s["kind"] == "method" && s["qualname"] == "miniBackend.run"));
+    assert!(!symbols
+        .iter()
+        .any(|s| s["kind"] == "method" && s["qualname"] == "run"));
+
+    let mini = scratch.run(&["symbol", "src/backends.ts", "miniBackend.run"]);
+    assert_eq!(mini["symbol"]["qualname"], "miniBackend.run");
+
+    let stderr = scratch.run_failure(&["symbol", "src/backends.ts", "run"]);
+    assert!(stderr.contains("symbol is ambiguous: run"));
+    assert!(stderr.contains("moderationApiBackend.run"));
+    assert!(stderr.contains("miniBackend.run"));
 }
 
 #[test]
@@ -1258,6 +1311,10 @@ impl ScratchRepo {
 
     fn run(&self, args: &[&str]) -> Value {
         run_in(&self.repo, &self.cache_dir, args)
+    }
+
+    fn run_failure(&self, args: &[&str]) -> String {
+        run_failure_in(&self.repo, &self.cache_dir, args)
     }
 }
 

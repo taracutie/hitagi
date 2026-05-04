@@ -275,11 +275,33 @@ fn typescript_symbol(node: Node<'_>, source: &str) -> Option<(&'static str, Stri
                 "arrow_function" | "function" => {
                     symbol_name(node, source).map(|name| ("function", name, false))
                 }
+                "object" if typescript_object_has_direct_method(value) => {
+                    typescript_variable_identifier_name(node, source)
+                        .map(|name| ("object", name, true))
+                }
                 _ => None,
             }
         }
         _ => None,
     }
+}
+
+fn typescript_variable_identifier_name(node: Node<'_>, source: &str) -> Option<String> {
+    let name = node.child_by_field_name("name")?;
+    if name.kind() != "identifier" {
+        return None;
+    }
+    node_text(name, source)
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+}
+
+fn typescript_object_has_direct_method(node: Node<'_>) -> bool {
+    let mut cursor = node.walk();
+    let has_method = node
+        .named_children(&mut cursor)
+        .any(|child| child.kind() == "method_definition");
+    has_method
 }
 
 fn python_symbol(
@@ -435,6 +457,49 @@ export interface UserConfig {
             .collect();
         assert!(kinds.contains(&"property"));
         assert!(kinds.contains(&"method"));
+    }
+
+    #[test]
+    fn typescript_object_literal_methods_are_qualified_by_variable_name() {
+        let source = r#"
+const moderationApiBackend: ModerationBackend = {
+  name: 'moderation-api',
+  async run(message) {
+    return null;
+  },
+};
+
+const miniBackend: ModerationBackend = {
+  name: 'gpt-mini',
+  async run(message, context) {
+    return null;
+  },
+};
+
+const config = {
+  name: 'plain-data',
+  enabled: true,
+};
+"#;
+        let parsed = parse_source(Language::TypeScript, source).unwrap();
+        let qualnames: Vec<&str> = parsed.symbols.iter().map(|s| s.qualname.as_str()).collect();
+
+        assert!(qualnames.contains(&"moderationApiBackend"));
+        assert!(qualnames.contains(&"moderationApiBackend.run"));
+        assert!(qualnames.contains(&"miniBackend"));
+        assert!(qualnames.contains(&"miniBackend.run"));
+        assert!(!qualnames.contains(&"run"));
+        assert!(!qualnames.contains(&"config"));
+
+        let kinds: Vec<(&str, &str)> = parsed
+            .symbols
+            .iter()
+            .map(|s| (s.qualname.as_str(), s.kind.as_str()))
+            .collect();
+        assert!(kinds.contains(&("moderationApiBackend", "object")));
+        assert!(kinds.contains(&("moderationApiBackend.run", "method")));
+        assert!(kinds.contains(&("miniBackend", "object")));
+        assert!(kinds.contains(&("miniBackend.run", "method")));
     }
 
     #[test]
