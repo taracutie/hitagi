@@ -83,6 +83,14 @@ TIPS
     the response carries `\"truncated\": true`. Bump --limit when sweeping; reduce
     it for noisy queries.
 
+  Fair sampling on full-repo sweeps
+    `find` and `search` walk top-level subdirs round-robin (one file per bucket
+    in turn) when no positional [PATHS] are given, so a `--limit` truncation
+    produces a fair sample across the repo instead of exhausting the budget on
+    whichever top-level dir comes first alphabetically. Pass [PATHS] to opt out
+    and walk in user-supplied order. When matches still don't reach a subtree,
+    `unsampled_dirs` lists what was skipped.
+
   Excluding noise (--exclude)
     `search`, `find`, and `files` accept --exclude PATTERN (repeatable). Bare names
     like `--exclude vendor` skip that directory at any depth; full globs like
@@ -104,6 +112,25 @@ TIPS
     Compact output mode. `matches` becomes a list of strings like
     `path:line qualname(kind)` instead of structured objects ~ ~3x smaller for
     sweep queries. With --snippet the line continues with ` :: <signature>`.
+
+  find --per-file N
+    Cap matches per file at N (default 0 = no cap). Useful when one file has
+    a class with many methods that all match the query and would otherwise
+    eat the global --limit budget. Suppressed match counts are reported per-
+    file via `more_in_file: { \"path\": <count>, ... }` (top-level on flat
+    responses, inside the containing group on grouped responses). The cap
+    counts toward --limit ~ it's a diversity control, not a bypass.
+
+  Per-prefix grouping (find / search response shape)
+    When matches all share a common path prefix, the response stays flat:
+    top-level `prefix` plus `matches` (find) or `results` (search) with the
+    prefix stripped. When matches span multiple top-level dirs and there's
+    no shared prefix, the response switches to grouped form: a `groups: [...]`
+    array where each group carries its own `prefix` plus its own `matches`/
+    `results` (and `more_in_file` for find). Cuts repeated long monorepo
+    paths out of the output. Top-level `matches`/`results` is `[]`/`{}` in
+    grouped form. Round-robin sampling and grouping work together: the walk
+    visits diverse subtrees, and grouping hoists each subtree's prefix.
 
   langs and parseable
     `langs` summarises file count + line count per detected language and includes
@@ -172,6 +199,7 @@ COMMON PATTERNS
   Find inside one subtree         hitagi find Network --kind struct src/nnue
   Cheap top-level orientation     hitagi outline FILE --depth 1
   Cheap sweep across the repo     hitagi find X --terse --limit 200
+  Diverse sweep (cap hot files)   hitagi find X --terse --per-file 3
   What's uncommitted?             hitagi diff
   Hunks for one file?             hitagi diff src/foo.rs
   Diff for one symbol?            hitagi diff src/foo.rs --symbol Foo.bar
@@ -198,11 +226,19 @@ OUTPUT SHAPES (compact form ~ omitted optional fields appear only when set)
             \"qualname\":\"...\",\"content\":\"...\",\"lines\":[s,e]}}
   search    {\"prefix\":\"src/\",\"results\":{\"file.rs\":[\"scope(kind) @L<n>\"]},
             \"truncated\":bool}
+            grouped (when matches span top-levels with no shared prefix):
+            {\"results\":{},\"groups\":[{\"prefix\":\"a/\",\"results\":{\"f.rs\":
+            [\"...\"]}},{\"prefix\":\"b/\",\"results\":{...}}],\"truncated\":bool}
   read      {\"language\":\"rust\",\"content\":\"...\",\"lines\":[s,e],
             \"total_lines\":N}    (lines/total_lines only when --lines is passed)
-  find      {\"matches\":[{\"path\":\"...\",\"kind\":\"...\",\"name\":\"...\",
-            \"qualname\":\"...\",\"lines\":[s,e]}],\"truncated\":bool,
+  find      {\"prefix\":\"src/\"?,\"matches\":[{\"path\":\"...\",\"kind\":\"...\",
+            \"name\":\"...\",\"qualname\":\"...\",\"lines\":[s,e]}],
+            \"more_in_file\":{\"path\":N,...}?,\"truncated\":bool,
             \"searched_files\":N,\"available_kinds\":[...]?,\"note\":\"...\"?}
+            grouped (when matches span top-levels with no shared prefix):
+            {\"matches\":[],\"groups\":[{\"prefix\":\"a/\",\"matches\":[...],
+            \"more_in_file\":{...}?},...],\"truncated\":bool,
+            \"searched_files\":N,...}
   files     {\"files\":[\"a\",\"b\",...],\"truncated\":bool,\"note\":\"...\"?}
   langs     {\"languages\":[{\"language\":\"rust\",\"files\":N,\"lines\":N,
             \"parseable\":bool},...]}
@@ -218,8 +254,8 @@ OUTPUT SHAPES (compact form ~ omitted optional fields appear only when set)
             \"...\"?}],\"raw\":\"...\"?,\"binary\":bool?,\"note\":\"...\"?}
 
   find --terse override:
-    matches becomes a flat list of strings like
-    `\"src/foo.rs:42 Foo.bar(method) :: pub fn bar(...) {\"`
+    matches (and each group's matches when grouped) becomes a flat list of
+    strings like `\"src/foo.rs:42 Foo.bar(method) :: pub fn bar(...) {\"`.
 
 ERRORS
   Errors print to stderr as `error: <msg>` and exit 1. Path-not-found, ambiguous
@@ -334,6 +370,11 @@ enum Commands {
         /// strings instead of structured objects. ~3x smaller for sweep queries.
         #[arg(long)]
         terse: bool,
+        /// Cap matches per file at N (0 = no cap, default). When the cap is hit,
+        /// the count of suppressed matches per file is reported in `more_in_file`.
+        /// Counted toward --limit ~ this is a diversity control, not a bypass.
+        #[arg(long, value_name = "N", default_value_t = 0)]
+        per_file: usize,
         /// Glob patterns to exclude (repeatable). Bare names like `vendor` exclude that
         /// directory at any depth; use `vendor/**` for explicit globbing.
         #[arg(long, value_name = "PATTERN")]
@@ -479,6 +520,7 @@ pub fn run() -> AppResult<()> {
             bytes,
             snippet,
             terse,
+            per_file,
             exclude,
         } => {
             let opts = FindOptions {
@@ -489,6 +531,7 @@ pub fn run() -> AppResult<()> {
                 bytes,
                 snippet,
                 terse,
+                per_file,
             };
             print_json(&commands::find(&repo, &query, opts)?, cli.pretty)
         }

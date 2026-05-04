@@ -55,6 +55,98 @@ fn run_failure(args: &[&str]) -> String {
     String::from_utf8(assert.get_output().stderr.clone()).unwrap()
 }
 
+/// Collect all `matches` entries from a find response, flat or grouped. The
+/// returned `Value` references retain their original shape (object with
+/// `path`/`kind`/etc., or terse strings) ~ assertions on `m["path"]` /
+/// `m.as_str()` work the same way as on the un-grouped flat response.
+fn flatten_find_matches(value: &Value) -> Vec<&Value> {
+    let mut out = Vec::new();
+    if let Some(arr) = value["matches"].as_array() {
+        out.extend(arr.iter());
+    }
+    if let Some(groups) = value.get("groups").and_then(|v| v.as_array()) {
+        for g in groups {
+            if let Some(arr) = g["matches"].as_array() {
+                out.extend(arr.iter());
+            }
+        }
+    }
+    out
+}
+
+/// Re-prefix the paths of each find match with whichever prefix wraps it
+/// (top-level for flat, per-group when grouped). Useful for tests that
+/// assert on full repo-relative paths.
+fn flatten_find_paths(value: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    let top_prefix = value["prefix"].as_str().unwrap_or("");
+    if let Some(arr) = value["matches"].as_array() {
+        for m in arr {
+            if let Some(s) = m.as_str() {
+                out.push(format!("{top_prefix}{s}"));
+            } else {
+                out.push(format!("{top_prefix}{}", m["path"].as_str().unwrap()));
+            }
+        }
+    }
+    if let Some(groups) = value.get("groups").and_then(|v| v.as_array()) {
+        for g in groups {
+            let gp = g["prefix"].as_str().unwrap_or("");
+            if let Some(arr) = g["matches"].as_array() {
+                for m in arr {
+                    if let Some(s) = m.as_str() {
+                        out.push(format!("{gp}{s}"));
+                    } else {
+                        out.push(format!("{gp}{}", m["path"].as_str().unwrap()));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Re-prefix each `results` key with its containing prefix. For search
+/// responses, the keys are file paths; this yields the full paths so tests
+/// can compare regardless of flat vs grouped shape.
+fn flatten_search_keys(value: &Value) -> Vec<String> {
+    let mut keys = Vec::new();
+    let top_prefix = value["prefix"].as_str().unwrap_or("");
+    if let Some(o) = value["results"].as_object() {
+        for k in o.keys() {
+            keys.push(format!("{top_prefix}{k}"));
+        }
+    }
+    if let Some(groups) = value.get("groups").and_then(|v| v.as_array()) {
+        for g in groups {
+            let gp = g["prefix"].as_str().unwrap_or("");
+            if let Some(o) = g["results"].as_object() {
+                for k in o.keys() {
+                    keys.push(format!("{gp}{k}"));
+                }
+            }
+        }
+    }
+    keys
+}
+
+/// Sum match-line counts across flat results + every group's results. Used
+/// for tests that just need a total count regardless of response shape.
+fn count_search_matches(value: &Value) -> usize {
+    let mut total = 0usize;
+    if let Some(o) = value["results"].as_object() {
+        total += o.values().filter_map(|v| v.as_array()).map(|a| a.len()).sum::<usize>();
+    }
+    if let Some(groups) = value.get("groups").and_then(|v| v.as_array()) {
+        for g in groups {
+            if let Some(o) = g["results"].as_object() {
+                total += o.values().filter_map(|v| v.as_array()).map(|a| a.len()).sum::<usize>();
+            }
+        }
+    }
+    total
+}
+
 #[test]
 fn outline_emits_compact_symbols() {
     let value = run(&["outline", "src/auth.ts"]);
@@ -555,18 +647,8 @@ fn files_exclude_filters_out_matches() {
 fn search_exclude_filters_files() {
     let with = run(&["search", "Button"]);
     let without = run(&["search", "Button", "--exclude", "apps"]);
-    let with_keys: Vec<&str> = with["results"]
-        .as_object()
-        .unwrap()
-        .keys()
-        .map(|k| k.as_str())
-        .collect();
-    let without_keys: Vec<&str> = without["results"]
-        .as_object()
-        .unwrap()
-        .keys()
-        .map(|k| k.as_str())
-        .collect();
+    let with_keys = flatten_search_keys(&with);
+    let without_keys = flatten_search_keys(&without);
     assert!(
         with_keys.iter().any(|k| k.contains("apps")),
         "baseline should include an apps/ entry, got {with_keys:?}"
@@ -578,18 +660,8 @@ fn search_exclude_filters_files() {
 fn find_exclude_filters_paths() {
     let with = run(&["find", "Button"]);
     let without = run(&["find", "Button", "--exclude", "apps"]);
-    let with_paths: Vec<&str> = with["matches"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|m| m["path"].as_str().unwrap())
-        .collect();
-    let without_paths: Vec<&str> = without["matches"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|m| m["path"].as_str().unwrap())
-        .collect();
+    let with_paths = flatten_find_paths(&with);
+    let without_paths = flatten_find_paths(&without);
     assert!(
         with_paths.iter().any(|p| p.contains("apps/")),
         "baseline should include an apps/ path, got {with_paths:?}"
@@ -810,18 +882,18 @@ fn scoped_walk_does_not_prune_full_repo_entries() {
 
     // Full-repo walk populates entries for both files.
     let full = scratch.run(&["find", "_only"]);
-    assert_eq!(full["matches"].as_array().unwrap().len(), 2);
+    assert_eq!(flatten_find_matches(&full).len(), 2);
 
     // Scoped walk visits only alpha/, but must NOT prune beta/ from the cache.
     let alpha = scratch.run(&["find", "alpha_only", "alpha"]);
-    assert_eq!(alpha["matches"].as_array().unwrap().len(), 1);
+    assert_eq!(flatten_find_matches(&alpha).len(), 1);
 
     // Subsequent full walk should still find beta_only ~ if scoped walk had
     // pruned, beta would just be re-parsed and we couldn't observe pruning,
     // but the cache file size shouldn't shrink. The behavioral invariant we
     // can check from the outside: the search terminates with both matches.
     let again = scratch.run(&["find", "_only"]);
-    assert_eq!(again["matches"].as_array().unwrap().len(), 2);
+    assert_eq!(flatten_find_matches(&again).len(), 2);
 }
 
 #[test]
@@ -831,7 +903,7 @@ fn truncated_find_does_not_prune_full_repo_entries() {
     scratch.write("beta/bar.rs", "pub fn beta_only() {}\n");
 
     let full = scratch.run(&["find", "_only"]);
-    assert_eq!(full["matches"].as_array().unwrap().len(), 2);
+    assert_eq!(flatten_find_matches(&full).len(), 2);
     let warm = scratch.run(&["cache", "status"]);
     assert!(warm["entry_count"].as_u64().unwrap() >= 2);
 
@@ -852,13 +924,7 @@ fn truncated_search_does_not_prune_full_repo_entries() {
     scratch.write("beta/bar.rs", "pub fn beta_only() {}\n");
 
     let full = scratch.run(&["search", "_only"]);
-    let full_total: usize = full["results"]
-        .as_object()
-        .unwrap()
-        .values()
-        .map(|v| v.as_array().unwrap().len())
-        .sum();
-    assert_eq!(full_total, 2);
+    assert_eq!(count_search_matches(&full), 2);
     let warm = scratch.run(&["cache", "status"]);
     assert!(warm["entry_count"].as_u64().unwrap() >= 2);
 
@@ -1310,6 +1376,193 @@ fn search_truncated_lists_unsampled_top_level_dirs() {
         .map(|v| v.as_str().unwrap())
         .collect();
     assert_eq!(unsampled, vec!["bbb", "ccc"]);
+}
+
+#[test]
+fn find_round_robin_samples_across_top_level_dirs() {
+    // Without paths, find should fairly sample across top-level buckets.
+    // aaa/ has THREE files that match; bbb/ and ccc/ have one each. With the
+    // old alphabetical walk and --limit 3, all 3 matches would come from
+    // aaa/. Round-robin file order pulls one from each bucket in turn.
+    let scratch = ScratchRepo::new("find-round-robin");
+    scratch.write("aaa/one.rs", "pub fn target_a1() {}\n");
+    scratch.write("aaa/two.rs", "pub fn target_a2() {}\n");
+    scratch.write("aaa/three.rs", "pub fn target_a3() {}\n");
+    scratch.write("bbb/x.rs", "pub fn target_b1() {}\n");
+    scratch.write("ccc/x.rs", "pub fn target_c1() {}\n");
+
+    let value = scratch.run(&["find", "target", "--limit", "3"]);
+    let names: Vec<String> = flatten_find_matches(&value)
+        .iter()
+        .map(|m| m["qualname"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        names.iter().any(|n| n.starts_with("target_a")),
+        "expected at least one match from aaa/, got {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n.starts_with("target_b")),
+        "expected at least one match from bbb/, got {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n.starts_with("target_c")),
+        "expected at least one match from ccc/, got {names:?}"
+    );
+}
+
+#[test]
+fn search_round_robin_samples_across_top_level_dirs() {
+    let scratch = ScratchRepo::new("search-round-robin");
+    scratch.write("aaa/one.txt", "needle\n");
+    scratch.write("aaa/two.txt", "needle\n");
+    scratch.write("aaa/three.txt", "needle\n");
+    scratch.write("bbb/x.txt", "needle\n");
+    scratch.write("ccc/x.txt", "needle\n");
+
+    let value = scratch.run(&["search", "needle", "--limit", "3"]);
+    let keys = flatten_search_keys(&value);
+    assert!(keys.iter().any(|k| k.starts_with("aaa/")), "got {keys:?}");
+    assert!(keys.iter().any(|k| k.starts_with("bbb/")), "got {keys:?}");
+    assert!(keys.iter().any(|k| k.starts_with("ccc/")), "got {keys:?}");
+}
+
+#[test]
+fn find_path_scoped_walk_preserves_user_order() {
+    // When paths are given, do NOT round-robin ~ honor user-supplied order.
+    // This pins down the existing behavior locked in by find_limit_preserves_
+    // requested_path_order against the new round-robin code path.
+    let scratch = ScratchRepo::new("find-path-order-preserved");
+    scratch.write("aaa/a.rs", "pub fn target_a() {}\n");
+    scratch.write("bbb/b.rs", "pub fn target_b() {}\n");
+
+    // Pass bbb FIRST: with round-robin gated on paths.is_empty(), the walk
+    // should still honor that and return target_b first.
+    let value = scratch.run(&["find", "target", "--limit", "1", "bbb", "aaa"]);
+    let matches = flatten_find_matches(&value);
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0]["qualname"], "target_b");
+}
+
+#[test]
+fn find_per_file_caps_matches_and_reports_overflow() {
+    // src/auth.ts has class AuthService + handleAuth + validateInput. "Auth"
+    // matches all three; --per-file 1 keeps one and tallies 2 in more_in_file.
+    let value = run(&["find", "Auth", "--per-file", "1", "src/auth.ts"]);
+    let matches = flatten_find_matches(&value);
+    assert_eq!(matches.len(), 1);
+    let suppressed: u64 = value["more_in_file"]
+        .as_object()
+        .or_else(|| {
+            value
+                .get("groups")
+                .and_then(|g| g.as_array())?
+                .first()?["more_in_file"]
+                .as_object()
+        })
+        .expect("more_in_file should be set when --per-file capped a file")
+        .values()
+        .next()
+        .and_then(|v| v.as_u64())
+        .unwrap();
+    assert_eq!(suppressed, 2, "{value:?}");
+}
+
+#[test]
+fn find_per_file_zero_means_no_cap() {
+    let value = run(&["find", "Auth", "src/auth.ts"]);
+    assert!(
+        value.get("more_in_file").is_none(),
+        "more_in_file should be omitted when --per-file is 0 (default)"
+    );
+    if let Some(groups) = value.get("groups").and_then(|v| v.as_array()) {
+        for g in groups {
+            assert!(g.get("more_in_file").is_none());
+        }
+    }
+}
+
+#[test]
+fn find_groups_results_when_matches_span_top_levels() {
+    // Two matches in two different top-level dirs ~ no global LCP, so the
+    // response should switch to the grouped shape.
+    let scratch = ScratchRepo::new("find-groups");
+    scratch.write("aaa/a.rs", "pub fn target() {}\n");
+    scratch.write("bbb/b.rs", "pub fn target() {}\n");
+
+    let value = scratch.run(&["find", "target"]);
+    assert!(
+        value.get("prefix").is_none(),
+        "top-level prefix should be omitted when grouped"
+    );
+    let groups = value["groups"]
+        .as_array()
+        .expect("groups should be present when matches span top-levels");
+    assert_eq!(groups.len(), 2);
+    let prefixes: Vec<&str> = groups.iter().map(|g| g["prefix"].as_str().unwrap()).collect();
+    assert!(prefixes.contains(&"aaa/"));
+    assert!(prefixes.contains(&"bbb/"));
+}
+
+#[test]
+fn find_stays_flat_when_single_top_level() {
+    let scratch = ScratchRepo::new("find-flat-single-top");
+    scratch.write(
+        "only/x.rs",
+        "pub fn target_one() {}\npub fn target_two() {}\n",
+    );
+
+    let value = scratch.run(&["find", "target"]);
+    assert!(
+        value.get("groups").is_none(),
+        "groups should be omitted when matches all share a top-level dir"
+    );
+    assert!(value["prefix"].as_str().unwrap().starts_with("only/"));
+}
+
+#[test]
+fn search_groups_results_when_spanning_top_levels() {
+    let scratch = ScratchRepo::new("search-groups");
+    scratch.write("aaa/a.txt", "needle\n");
+    scratch.write("bbb/b.txt", "needle\n");
+
+    let value = scratch.run(&["search", "needle"]);
+    let flat_results = value["results"].as_object().unwrap();
+    assert!(
+        flat_results.is_empty(),
+        "top-level results should be empty when grouped"
+    );
+    let groups = value["groups"]
+        .as_array()
+        .expect("groups should be present when matches span top-levels");
+    assert_eq!(groups.len(), 2);
+}
+
+#[test]
+fn find_grouped_per_file_overflow_lives_inside_group() {
+    // When matches span top-levels (grouped) AND --per-file caps a file,
+    // the overflow tally should live inside the group, not at the top level.
+    let scratch = ScratchRepo::new("find-grouped-overflow");
+    scratch.write(
+        "aaa/a.rs",
+        "pub fn target_one() {}\npub fn target_two() {}\npub fn target_three() {}\n",
+    );
+    scratch.write("bbb/b.rs", "pub fn target() {}\n");
+
+    let value = scratch.run(&["find", "target", "--per-file", "1"]);
+    assert!(
+        value.get("more_in_file").is_none(),
+        "top-level more_in_file should be omitted in grouped responses"
+    );
+    let groups = value["groups"].as_array().unwrap();
+    let aaa_group = groups
+        .iter()
+        .find(|g| g["prefix"].as_str() == Some("aaa/"))
+        .expect("aaa/ group should exist");
+    let overflow = aaa_group["more_in_file"]
+        .as_object()
+        .expect("aaa/ group should report overflow");
+    let suppressed: u64 = overflow.values().next().unwrap().as_u64().unwrap();
+    assert_eq!(suppressed, 2);
 }
 
 #[test]

@@ -12,9 +12,9 @@ use crate::{
     models::{
         CacheClearResponse, CacheLangCount, CachePathResponse, CacheStatusResponse,
         DiffFileResponse, DiffFileSummary, DiffHunk, DiffOverviewResponse, FilesResponse,
-        FindMatch, FindMatches, FindResponse, LangSummary, LangsResponse, OutlineResponse,
-        OutputSymbol, OutputSymbolDetail, ReadFileResponse, SearchResponse, SymbolDetail,
-        SymbolInfo, SymbolResponse,
+        FindGroup, FindMatch, FindMatches, FindResponse, LangSummary, LangsResponse,
+        OutlineResponse, OutputSymbol, OutputSymbolDetail, ReadFileResponse, SearchGroup,
+        SearchResponse, SymbolDetail, SymbolInfo, SymbolResponse,
     },
     parser::{parse_source, ParsedFile},
     queries::{
@@ -68,6 +68,9 @@ pub struct FindOptions {
     pub bytes: bool,
     pub snippet: bool,
     pub terse: bool,
+    /// Cap matches per file at N. 0 = no cap. Suppressed matches are recorded
+    /// in `FindResponse::more_in_file` (or per-group when grouped).
+    pub per_file: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -213,10 +216,13 @@ pub fn search(repo: &RepoRoot, query: &str, opts: SearchOptions) -> AppResult<Se
     let prune = opts.paths.is_empty() && opts.excludes.is_empty();
 
     let exclude_set = build_exclude_set(&opts.excludes)?;
-    let files = apply_excludes(
+    let mut files = apply_excludes(
         repo.collect_search_files(&opts.paths)?,
         exclude_set.as_ref(),
     );
+    if opts.paths.is_empty() {
+        files = interleave_by_top_level(files);
+    }
     let result = search_resolved_files(files, query, opts.limit, opts.snippet, &mut cache);
     let should_prune = prune && matches!(result.as_ref(), Ok(response) if !response.truncated);
     cache.save(should_prune);
@@ -304,20 +310,58 @@ fn search_resolved_files(
         }
     }
 
+    // Decide flat-vs-grouped, mirroring find. Non-empty global LCP → flat
+    // (existing shape). Empty LCP with 2+ top-level buckets → grouped.
     let result_paths: Vec<String> = raw_results.iter().map(|(p, _)| p.clone()).collect();
-    let prefix = common_prefix(&result_paths);
+    let global_prefix = common_prefix(&result_paths);
 
-    let mut results: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for (path, matches) in raw_results {
-        let key = strip_prefix(&path, &prefix);
-        results.entry(key).or_default().extend(matches);
-    }
+    let (prefix_out, results_out, groups_out) = if !global_prefix.is_empty() {
+        let mut results: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (path, matches) in raw_results {
+            let key = strip_prefix(&path, &global_prefix);
+            results.entry(key).or_default().extend(matches);
+        }
+        (global_prefix, results, Vec::new())
+    } else {
+        let mut by_bucket: BTreeMap<String, Vec<(String, Vec<String>)>> = BTreeMap::new();
+        for (path, matches) in raw_results {
+            let key = top_level_dir(&path).unwrap_or("").to_string();
+            by_bucket.entry(key).or_default().push((path, matches));
+        }
+        if by_bucket.len() <= 1 {
+            let mut results: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            for (_, items) in by_bucket {
+                for (path, matches) in items {
+                    results.entry(path).or_default().extend(matches);
+                }
+            }
+            (String::new(), results, Vec::new())
+        } else {
+            let mut groups: Vec<SearchGroup> = Vec::new();
+            for (_bucket, items) in by_bucket {
+                let bucket_paths: Vec<String> =
+                    items.iter().map(|(p, _)| p.clone()).collect();
+                let bp = common_prefix(&bucket_paths);
+                let mut group_results: BTreeMap<String, Vec<String>> = BTreeMap::new();
+                for (path, matches) in items {
+                    let key = strip_prefix(&path, &bp);
+                    group_results.entry(key).or_default().extend(matches);
+                }
+                groups.push(SearchGroup {
+                    prefix: bp,
+                    results: group_results,
+                });
+            }
+            (String::new(), BTreeMap::new(), groups)
+        }
+    };
 
     let unsampled_dirs = unsampled_top_levels(truncated, &all_top_levels, &visited_top_levels);
 
     Ok(SearchResponse {
-        prefix,
-        results,
+        prefix: prefix_out,
+        results: results_out,
+        groups: groups_out,
         truncated,
         unsampled_dirs,
     })
@@ -403,10 +447,13 @@ pub fn find(repo: &RepoRoot, query: &str, opts: FindOptions) -> AppResult<FindRe
     let prune = opts.paths.is_empty() && opts.excludes.is_empty();
 
     let exclude_set = build_exclude_set(&opts.excludes)?;
-    let files = apply_excludes(
+    let mut files = apply_excludes(
         repo.collect_search_files(&opts.paths)?,
         exclude_set.as_ref(),
     );
+    if opts.paths.is_empty() {
+        files = interleave_by_top_level(files);
+    }
     let result = find_resolved_files(files, query, opts, &mut cache);
     let should_prune = prune && matches!(result.as_ref(), Ok(response) if !response.truncated);
     cache.save(should_prune);
@@ -432,6 +479,9 @@ fn find_resolved_files(
     let mut truncated = false;
     let mut searched_files = 0usize;
     let mut all_kinds: BTreeSet<String> = BTreeSet::new();
+    // Suppression counter populated when `--per-file N` (N >= 1) caps a file.
+    // Keys are full repo-relative paths; prefix-strip happens at response build.
+    let mut more_in_file: BTreeMap<String, usize> = BTreeMap::new();
 
     'outer: for resolved in files {
         if matches.len() >= limit {
@@ -493,6 +543,10 @@ fn find_resolved_files(
 
         searched_files += 1;
 
+        // Per-file diversity counter: resets per outer-loop iter (per file).
+        // When --per-file N caps a file, surplus matches are tallied into
+        // `more_in_file[path]` instead of being pushed.
+        let mut current_file_count = 0usize;
         for symbol in symbols {
             if matches.len() >= limit {
                 truncated = true;
@@ -501,6 +555,12 @@ fn find_resolved_files(
             if symbol.qualname.to_lowercase().contains(&needle) {
                 all_kinds.insert(symbol.kind.clone());
                 if !matches_kinds(&opts.kinds, &symbol.kind) {
+                    continue;
+                }
+                if opts.per_file > 0 && current_file_count >= opts.per_file {
+                    *more_in_file
+                        .entry(resolved.relative_path.clone())
+                        .or_insert(0) += 1;
                     continue;
                 }
                 let snippet = opts.snippet.then(|| {
@@ -521,6 +581,7 @@ fn find_resolved_files(
                         .then_some([symbol.range.start_byte, symbol.range.end_byte]),
                     snippet,
                 });
+                current_file_count += 1;
             }
         }
     }
@@ -539,25 +600,82 @@ fn find_resolved_files(
         None
     };
 
+    // Decide flat-vs-grouped output. Rule: non-empty global LCP → flat (single
+    // bucket already implied since common_prefix() truncates back to the last
+    // `/`). Empty LCP → bucket by top-level dir; if 2+ buckets, emit groups.
     let path_list: Vec<String> = matches.iter().map(|m| m.path.clone()).collect();
-    let prefix = common_prefix(&path_list);
-    if !prefix.is_empty() {
-        for m in &mut matches {
-            m.path = strip_prefix(&m.path, &prefix);
-        }
-    }
+    let global_prefix = common_prefix(&path_list);
 
-    let matches = if opts.terse {
-        FindMatches::Terse(matches.into_iter().map(format_terse_match).collect())
+    let (prefix_out, matches_out, groups_out, more_in_file_out) = if !global_prefix.is_empty() {
+        for m in &mut matches {
+            m.path = strip_prefix(&m.path, &global_prefix);
+        }
+        let stripped_overflow: BTreeMap<String, usize> = more_in_file
+            .into_iter()
+            .map(|(p, n)| (strip_prefix(&p, &global_prefix), n))
+            .collect();
+        let matches_enum = if opts.terse {
+            FindMatches::Terse(matches.into_iter().map(format_terse_match).collect())
+        } else {
+            FindMatches::Full(matches)
+        };
+        (global_prefix, matches_enum, Vec::new(), stripped_overflow)
     } else {
-        FindMatches::Full(matches)
+        let mut by_bucket: BTreeMap<String, Vec<FindMatch>> = BTreeMap::new();
+        for m in matches {
+            let key = top_level_dir(&m.path).unwrap_or("").to_string();
+            by_bucket.entry(key).or_default().push(m);
+        }
+        if by_bucket.len() <= 1 {
+            // Edge case: 0 or 1 bucket with no shared dir prefix. Stay flat.
+            let merged: Vec<FindMatch> = by_bucket.into_values().flatten().collect();
+            let matches_enum = if opts.terse {
+                FindMatches::Terse(merged.into_iter().map(format_terse_match).collect())
+            } else {
+                FindMatches::Full(merged)
+            };
+            (String::new(), matches_enum, Vec::new(), more_in_file)
+        } else {
+            let mut groups: Vec<FindGroup> = Vec::new();
+            for (_bucket, mut bmatches) in by_bucket {
+                let bucket_paths: Vec<String> =
+                    bmatches.iter().map(|m| m.path.clone()).collect();
+                let bp = common_prefix(&bucket_paths);
+                let local_overflow: BTreeMap<String, usize> = more_in_file
+                    .iter()
+                    .filter(|(p, _)| p.starts_with(&bp))
+                    .map(|(p, n)| (strip_prefix(p, &bp), *n))
+                    .collect();
+                for m in &mut bmatches {
+                    m.path = strip_prefix(&m.path, &bp);
+                }
+                let matches_enum = if opts.terse {
+                    FindMatches::Terse(bmatches.into_iter().map(format_terse_match).collect())
+                } else {
+                    FindMatches::Full(bmatches)
+                };
+                groups.push(FindGroup {
+                    prefix: bp,
+                    matches: matches_enum,
+                    more_in_file: local_overflow,
+                });
+            }
+            let empty_matches = if opts.terse {
+                FindMatches::Terse(Vec::new())
+            } else {
+                FindMatches::Full(Vec::new())
+            };
+            (String::new(), empty_matches, groups, BTreeMap::new())
+        }
     };
 
     let unsampled_dirs = unsampled_top_levels(truncated, &all_top_levels, &visited_top_levels);
 
     Ok(FindResponse {
-        prefix,
-        matches,
+        prefix: prefix_out,
+        matches: matches_out,
+        groups: groups_out,
+        more_in_file: more_in_file_out,
         truncated,
         searched_files,
         unsampled_dirs,
@@ -1634,6 +1752,42 @@ fn collect_top_level_dirs(files: &[ResolvedPath]) -> BTreeSet<String> {
         .collect()
 }
 
+/// Re-order `files` so iteration round-robins across top-level buckets.
+/// Within each bucket the input (alphabetical/walk) order is preserved.
+/// Files at repo root (no `/` in their relative path) share the `""` bucket.
+/// Bucket order is BTreeMap iteration order = lexicographic. Used by find /
+/// search when no explicit paths were given, so a `--limit` walk produces a
+/// fair sample across top-level subdirs instead of exhausting the budget on
+/// whichever dir comes first alphabetically.
+fn interleave_by_top_level(files: Vec<ResolvedPath>) -> Vec<ResolvedPath> {
+    let mut buckets: BTreeMap<String, Vec<ResolvedPath>> = BTreeMap::new();
+    for f in files {
+        let key = top_level_dir(&f.relative_path).unwrap_or("").to_string();
+        buckets.entry(key).or_default().push(f);
+    }
+    let mut bucket_vecs: Vec<Vec<ResolvedPath>> = buckets
+        .into_values()
+        .map(|mut v| {
+            v.reverse();
+            v
+        })
+        .collect();
+    let mut out = Vec::new();
+    loop {
+        let mut took = false;
+        for b in bucket_vecs.iter_mut() {
+            if let Some(item) = b.pop() {
+                out.push(item);
+                took = true;
+            }
+        }
+        if !took {
+            break;
+        }
+    }
+    out
+}
+
 /// `all - visited` when `truncated`, else empty. Sorted output.
 fn unsampled_top_levels(
     truncated: bool,
@@ -1770,6 +1924,7 @@ mod tests {
                 bytes: false,
                 snippet: false,
                 terse: false,
+                per_file: 0,
             },
             &mut ParseCache::disabled(),
         )
@@ -1804,6 +1959,7 @@ mod tests {
                 bytes: false,
                 snippet: false,
                 terse: false,
+                per_file: 0,
             },
             &mut ParseCache::disabled(),
         )

@@ -93,7 +93,15 @@ pub struct SymbolResponse {
 pub struct SearchResponse {
     #[serde(skip_serializing_if = "String::is_empty")]
     pub prefix: String,
+    /// Always present. Empty (`{}`) when grouping is in effect or when zero
+    /// matches were found ~ keeps the field stable for consumers.
     pub results: BTreeMap<String, Vec<String>>,
+    /// Per-prefix groups, populated when matches span multiple top-level
+    /// dirs. Each group carries its own `prefix` and `results` map. When
+    /// populated, the top-level `prefix` is empty and `results` is omitted.
+    /// Saves bytes by hoisting deep shared paths out of every key.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub groups: Vec<SearchGroup>,
     #[serde(skip_serializing_if = "is_false")]
     pub truncated: bool,
     /// Top-level directories present in the walk root that the cap stopped
@@ -102,6 +110,12 @@ pub struct SearchResponse {
     /// caller know when their --limit is producing a biased sample.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub unsampled_dirs: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SearchGroup {
+    pub prefix: String,
+    pub results: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -127,7 +141,20 @@ pub enum FindMatches {
 pub struct FindResponse {
     #[serde(skip_serializing_if = "String::is_empty")]
     pub prefix: String,
+    /// Always present. Empty (`[]`) when grouping is in effect or when zero
+    /// matches were found ~ keeps the field stable for consumers.
     pub matches: FindMatches,
+    /// Per-prefix groups, populated when matches span multiple top-level dirs
+    /// and no global LCP exists. Each group carries its own `prefix`,
+    /// `matches`, and (if `--per-file` is set) `more_in_file`. When populated,
+    /// the top-level `prefix`/`matches`/`more_in_file` are empty/omitted.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub groups: Vec<FindGroup>,
+    /// Per-file overflow when `--per-file N` capped output. Keys match the
+    /// stripped paths in `matches` (top-level prefix applied). Omitted when
+    /// empty or when grouping moved overflow into per-group containers.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
+    pub more_in_file: BTreeMap<String, usize>,
     #[serde(skip_serializing_if = "is_false")]
     pub truncated: bool,
     pub searched_files: usize,
@@ -155,6 +182,14 @@ pub struct FindMatch {
     pub bytes: Option<[usize; 2]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snippet: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FindGroup {
+    pub prefix: String,
+    pub matches: FindMatches,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
+    pub more_in_file: BTreeMap<String, usize>,
 }
 
 #[derive(Debug, Serialize)]

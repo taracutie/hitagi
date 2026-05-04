@@ -25,6 +25,8 @@ Commands:
 - `diff [PATH]` ~ review uncommitted changes; overview by default, structured hunks with enclosing-symbol annotation when a path is given.
 - `cache [status|path|clear]` ~ inspect or manage the on-disk parse cache.
 
+When a `find`/`search` walk has no positional [PATHS], it visits top-level subdirs round-robin so a `--limit` truncation produces a fair sample across the repo. Pass [PATHS] to opt out and walk in user-supplied order.
+
 Supported languages:
 
 **Parseable** (full `outline` / `symbol` / `find` support):
@@ -133,6 +135,8 @@ Flags:
 - `--snippet` ~ append the matched line as ` :: <line text>` (truncated at 100 chars).
 - `--exclude PATTERN` (repeatable) ~ skip files matching the pattern. Bare names like `--exclude vendor` skip that directory at any depth; full globs like `--exclude "vendor/**"` work too.
 
+When matches span multiple top-level dirs with no shared prefix, the response switches to a grouped shape: `{"groups": [{"prefix": "...", "results": {...}}, ...], "results": {}}`. Each group carries its own `prefix` with file keys stripped relative to it ~ avoids repeating long monorepo paths in every key. See "Response shapes" near the end of `--help`.
+
 ### `read <PATH>`
 
 ```bash
@@ -178,9 +182,12 @@ Flags:
 - `--bytes` ~ include byte ranges.
 - `--snippet` ~ include each symbol's first-line signature as a `snippet` field.
 - `--terse` ~ compact output mode: `matches` becomes a flat list of strings like `"src/foo.rs:42 Foo.bar(method)"` (with snippet appended after ` :: ` if `--snippet` is also passed). ~3x smaller for sweep queries.
+- `--per-file N` ~ cap matches per file at `N` (default `0` = no cap). When set, suppressed match counts are reported in `more_in_file: { "path": <count>, ... }` (top-level on flat responses, inside the containing group on grouped responses). The cap counts toward `--limit` ~ this is a diversity control, not a bypass. Useful when one class with many methods would otherwise eat the whole budget.
 - `--exclude PATTERN` (repeatable) ~ skip matching files (same syntax as `search --exclude`).
 
 `searched_files` reports how many parseable files were inspected. When zero (e.g. `find foo vendor`), the response includes a `note` explaining why ~ usually "no parseable files at this path; for plaintext search across all file types, use `search`".
+
+When matches span multiple top-level dirs with no shared prefix, the response switches to a grouped shape: `{"matches": [], "groups": [{"prefix": "...", "matches": [...], "more_in_file": {...}?}, ...]}`. Each group carries its own `prefix` (the longest common prefix within that bucket) with each match's `path` stripped relative to it. The flat-when-shared and grouped-when-spanning behavior keeps the typical case unchanged while saving a lot of bytes when matches scatter across deep monorepo paths.
 
 ### `files [GLOBS...]`
 
