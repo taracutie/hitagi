@@ -13,7 +13,6 @@ const AMBIGUOUS_COLLECT_CAP: usize = 50;
 
 #[derive(Debug, Clone)]
 pub struct ResolvedPath {
-    pub repo_root: PathBuf,
     pub relative_path: String,
     pub full_path: PathBuf,
 }
@@ -247,7 +246,6 @@ impl RepoRoot {
 
                 if seen.insert(relative_path.clone()) {
                     files.push(ResolvedPath {
-                        repo_root: self.root.clone(),
                         relative_path,
                         full_path: path,
                     });
@@ -396,7 +394,6 @@ fn resolved_path(
     let relative = relative_path_string(repo_root, &canonical)?;
 
     Ok(ResolvedPath {
-        repo_root: repo_root.to_path_buf(),
         relative_path: relative,
         full_path: canonical,
     })
@@ -608,10 +605,8 @@ mod tests {
         // Only an ignored copy exists ~ resolution must still find it so
         // agents can address files that are gitignored on purpose (build
         // outputs, fixtures inside an ignored vendor dir, etc.).
-        let root = std::env::temp_dir().join(format!(
-            "hitagi-suffix-falls-back-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("hitagi-suffix-falls-back-{}", std::process::id()));
         if root.exists() {
             std::fs::remove_dir_all(&root).unwrap();
         }

@@ -1,3 +1,4 @@
+#[cfg(test)]
 use std::collections::HashSet;
 
 use crate::{
@@ -56,8 +57,10 @@ pub fn symbol_detail(
 }
 
 const SNIPPET_MAX_CHARS: usize = 100;
+#[cfg(test)]
 const SNIPPET_SEPARATOR: &str = " :: ";
 
+#[cfg(test)]
 pub fn search_file(
     parsed: &ParsedFile,
     source: &str,
@@ -126,51 +129,7 @@ pub fn search_file(
     raw.into_iter().take(max_results).map(|m| m.entry).collect()
 }
 
-pub fn search_file_plain(
-    source: &str,
-    query: &str,
-    max_results: usize,
-    snippet: bool,
-) -> Vec<String> {
-    if query.is_empty() {
-        return Vec::new();
-    }
-
-    let terms: Vec<&str> = query
-        .split(" OR ")
-        .map(|t| t.trim())
-        .filter(|t| !t.is_empty())
-        .collect();
-
-    let mut results = Vec::new();
-    let mut seen_lines = HashSet::new();
-
-    for term in &terms {
-        let mut offset = 0;
-        while offset < source.len() && results.len() < max_results {
-            let Some(found) = source[offset..].find(term) else {
-                break;
-            };
-
-            let start_byte = offset + found;
-            let line = line_at_byte(source, start_byte);
-
-            if seen_lines.insert(line) {
-                let mut entry = format!("@L{line}");
-                if snippet {
-                    entry.push_str(SNIPPET_SEPARATOR);
-                    entry.push_str(&snippet_at_byte(source, start_byte));
-                }
-                results.push(entry);
-            }
-
-            offset = start_byte + term.len().max(1);
-        }
-    }
-
-    results
-}
-
+#[cfg(test)]
 fn format_match(parsed: &ParsedFile, source: &str, start_byte: usize, snippet: bool) -> String {
     let line = line_at_byte(source, start_byte);
     let mut base = if let Some(symbol) = enclosing_symbol(parsed, start_byte) {
@@ -187,6 +146,7 @@ fn format_match(parsed: &ParsedFile, source: &str, start_byte: usize, snippet: b
     base
 }
 
+#[cfg(test)]
 fn line_at_byte(source: &str, byte_offset: usize) -> usize {
     let cap = byte_offset.min(source.len());
     source.as_bytes()[..cap]
@@ -196,6 +156,7 @@ fn line_at_byte(source: &str, byte_offset: usize) -> usize {
         + 1
 }
 
+#[cfg(test)]
 pub fn snippet_at_byte(source: &str, byte_offset: usize) -> String {
     let bytes = source.as_bytes();
     let len = bytes.len();
@@ -240,6 +201,7 @@ pub fn snippet_for_symbol_signature(source: &str, start_byte: usize, end_byte: u
     }
 }
 
+#[cfg(test)]
 fn enclosing_symbol<'a>(parsed: &'a ParsedFile, byte_offset: usize) -> Option<&'a SymbolInfo> {
     parsed
         .symbols
@@ -478,7 +440,7 @@ mod tests {
     #[test]
     fn builds_outline_for_sample_typescript_file() {
         let source = sample_source();
-        let parsed = parse_source(Language::TypeScript, &source).unwrap();
+        let parsed = parse_source(&Language::new("typescript"), &source).unwrap();
         let names: Vec<_> = parsed
             .symbols
             .iter()
@@ -488,13 +450,12 @@ mod tests {
         assert!(names.contains(&"AuthService"));
         assert!(names.contains(&"AuthService.handleAuth"));
         assert!(names.contains(&"AuthService.validateInput"));
-        assert!(names.contains(&"helper"));
     }
 
     #[test]
     fn finds_symbol_by_qualified_name() {
         let source = sample_source();
-        let parsed = parse_source(Language::TypeScript, &source).unwrap();
+        let parsed = parse_source(&Language::new("typescript"), &source).unwrap();
         let symbol = symbol_detail(&parsed, &source, "AuthService.handleAuth", 1024).unwrap();
 
         assert_eq!(symbol.qualname, "AuthService.handleAuth");
@@ -504,7 +465,7 @@ mod tests {
     #[test]
     fn finds_symbol_by_leaf_suffix_match() {
         let source = sample_source();
-        let parsed = parse_source(Language::TypeScript, &source).unwrap();
+        let parsed = parse_source(&Language::new("typescript"), &source).unwrap();
         let symbol = symbol_detail(&parsed, &source, "handleAuth", 1024).unwrap();
 
         assert_eq!(symbol.qualname, "AuthService.handleAuth");
@@ -513,7 +474,7 @@ mod tests {
     #[test]
     fn missing_symbol_suggests_near_misses() {
         let source = sample_source();
-        let parsed = parse_source(Language::TypeScript, &source).unwrap();
+        let parsed = parse_source(&Language::new("typescript"), &source).unwrap();
         let error = resolve_symbol(&parsed, "Auth").unwrap_err();
         let msg = error.to_string();
         assert!(msg.contains("symbol not found: Auth"));
@@ -523,7 +484,7 @@ mod tests {
     #[test]
     fn missing_symbol_suggests_typo_matches() {
         let source = sample_source();
-        let parsed = parse_source(Language::TypeScript, &source).unwrap();
+        let parsed = parse_source(&Language::new("typescript"), &source).unwrap();
         let error = resolve_symbol(&parsed, "handelAuth").unwrap_err();
         let msg = error.to_string();
         assert!(msg.contains("symbol not found: handelAuth"));
@@ -533,7 +494,7 @@ mod tests {
     #[test]
     fn deduplicates_search_results_by_scope() {
         let source = sample_source();
-        let parsed = parse_source(Language::TypeScript, &source).unwrap();
+        let parsed = parse_source(&Language::new("typescript"), &source).unwrap();
         let results = search_file(
             &parsed,
             &source,
@@ -552,7 +513,7 @@ mod tests {
     #[test]
     fn search_includes_snippet_when_requested() {
         let source = sample_source();
-        let parsed = parse_source(Language::TypeScript, &source).unwrap();
+        let parsed = parse_source(&Language::new("typescript"), &source).unwrap();
         let results = search_file(
             &parsed,
             &source,

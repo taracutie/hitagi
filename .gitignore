@@ -1,5 +1,6 @@
 target
 node_modules/
+.local
 
 # Generated tree-sitter outputs (regenerate with: tree-sitter generate --abi 14 grammar.js)
 vendor/*/src/

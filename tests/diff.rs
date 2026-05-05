@@ -4,9 +4,12 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
+use std::sync::OnceLock;
 
 use assert_cmd::Command;
 use serde_json::Value;
+
+const TEST_PACK_LANGUAGES: &[&str] = &["rust"];
 
 struct DiffRepo {
     cache_dir: PathBuf,
@@ -94,6 +97,7 @@ impl DiffRepo {
     }
 
     fn run_failure(&self, args: &[&str]) -> String {
+        prewarm_language_pack();
         let assert = Command::cargo_bin("hitagi")
             .unwrap()
             .env("HITAGI_CACHE_DIR", &self.cache_dir)
@@ -107,6 +111,7 @@ impl DiffRepo {
     }
 
     fn run_text(&self, args: &[&str]) -> String {
+        prewarm_language_pack();
         let stdout = Command::cargo_bin("hitagi")
             .unwrap()
             .env("HITAGI_CACHE_DIR", &self.cache_dir)
@@ -129,6 +134,7 @@ impl Drop for DiffRepo {
 }
 
 fn run_in(repo: &Path, cache_dir: &Path, args: &[&str]) -> Value {
+    prewarm_language_pack();
     let output = Command::cargo_bin("hitagi")
         .unwrap()
         .env("HITAGI_CACHE_DIR", cache_dir)
@@ -147,6 +153,14 @@ fn run_in(repo: &Path, cache_dir: &Path, args: &[&str]) -> Value {
             String::from_utf8_lossy(&output)
         )
     })
+}
+
+fn prewarm_language_pack() {
+    static PREWARM: OnceLock<()> = OnceLock::new();
+    PREWARM.get_or_init(|| {
+        tree_sitter_language_pack::download(TEST_PACK_LANGUAGES)
+            .expect("test parser languages download");
+    });
 }
 
 // ~~ Overview ~~

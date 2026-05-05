@@ -6,14 +6,16 @@ use crate::{
     agent_prompt::{self, AgentKind},
     commands::{
         self, DiffBodyMode, DiffFileOptions, DiffOptions, DiffScope, DiffSummaryOptions,
-        FilesOptions, FindOptions, OutlineOptions, ReadOptions, SearchOptions, SymbolOptions,
+        FilesOptions, FindOptions, FindRelatedOptions, IndexBuildOptions, OutlineOptions,
+        ReadOptions, SearchModeArg, SearchOptions, SymbolOptions,
     },
     error::{AppError, AppResult},
     output::{self, OutputMode},
     repo::RepoRoot,
 };
 
-const DEFAULT_SEARCH_LIMIT: usize = 50;
+const DEFAULT_SEARCH_LIMIT: usize = 10;
+const DEFAULT_FIND_RELATED_LIMIT: usize = 10;
 const DEFAULT_FIND_LIMIT: usize = 50;
 const DEFAULT_PER_FILE: usize = 5;
 const DEFAULT_FILES_LIMIT: usize = 2000;
@@ -22,7 +24,9 @@ const LONG_ABOUT: &str = "\
 hitagi is a local CLI for tree-sitter-backed structural code queries, built for LLM \
 coding agents (Claude Code, Codex, etc.) to navigate a codebase token-efficiently. \
 Every command parses on demand, prints concise text to stdout, and exits ~ no daemon, \
-no network, no auth. Pass --json for machine-readable output.
+no auth. The default `search` mode also runs a small embedding model locally for \
+hybrid ranking (~30 MB, downloaded on first use; pass `--offline` or `--hashing` to \
+skip). Pass --json for machine-readable output.
 
 PRINCIPLE
   Minimize tokens spent reading code. Use outline / find / search to locate the right \
@@ -36,17 +40,16 @@ RECOMMENDED WORKFLOW
   3. find <NAME>           locate a symbol by qualname substring across the repo
   4. outline <FILE>        see the structure of one file (compact, lines only)
   5. symbol <FILE> <Q>     read one symbol's body in isolation
-  6. search <STR>          substring search with scope + match-line annotation
-  7. read <FILE>           dump content, line slices, or --summary structure
-  8. diff [FILES...]       review changes (overview, --commit, --paths, or drill)
+  6. search <Q>            ranked hybrid search (BM25 + semantic, RRF-fused)
+  7. find-related <FILE> <LINE>   semantically related chunks
+  8. read <FILE>           dump content, line slices, or --summary structure
+  9. diff [FILES...]       review changes (overview, --commit, --paths, or drill)
 
 SUPPORTED LANGUAGES
-  PARSEABLE (full outline / symbol / find): Rust (.rs), TypeScript (.ts), TSX \
-(.tsx), Python (.py), Kotlin (.kt/.kts), Prisma (.prisma).
-  RECOGNISED (named in `langs`, `search`-able as plaintext, but no symbol info): \
-JSON, YAML, TOML, Markdown, SQL, HTML, CSS, shell, Dockerfile.
-  Truly unknown extensions get bucketed as `plaintext` ~ still searchable, just \
-unlabelled.\
+  Language detection and parsing are provided by tree-sitter-language-pack.
+  Pack-supported files work with outline / symbol / find and syntax-aware search chunks.
+  Unknown or unsupported files are still readable and counted by langs, but search does \
+not index them through a plaintext fallback.\
 ";
 
 const AFTER_LONG_HELP: &str = "\
@@ -67,32 +70,49 @@ TIPS
     leaf (handleAuth). Misses include near-miss qualnames in the error so you can
     retry without another roundtrip.
 
-  Search syntax
-    Combine alternatives with \" OR \" (literal, space-padded): \"foo OR bar\" is two
-    terms, \"fooORbar\" is one literal. Each result reads
-      `scope(kind) @L<line>`   for matches inside a parsed symbol
-      `@L<line>`               for matches outside any scope (imports, comments,
-                               plaintext files)
-    Pass extra positional [PATHS] to scope the walk to subtrees.
+  Search ranking
+    QUERY can be natural language, a code identifier, or a literal substring. The
+    default `--mode hybrid` runs both BM25 (lexical) and Model2Vec (semantic)
+    over chunked source, fuses with reciprocal rank, and applies a few generic
+    boosts (symbol-definition match, multi-chunk file rollup, test/compat path
+    penalty). `--mode bm25` skips the model entirely (instant, no downloads);
+    `--mode semantic` uses only the dense index. `--alpha F` overrides the
+    auto-tuned semantic weight (0.0=pure BM25, 1.0=pure semantic). Each result
+    is a chunk: `path:start-end\\tscore\\tsource\\tlanguage`. Pass [PATHS] to
+    scope the search to subtrees; pass `--language LANG` (repeatable) to filter
+    by language label.
 
   Snippets
-    `--snippet` on `search` appends ` :: <matched line>` to each entry.
-    `--snippet` on `find` adds the symbol's first-line signature.
+    `--snippet` on `search` and `find-related` appends ` :: <first non-blank line>`
+    of each chunk. `--snippet` on `find` adds the symbol's first-line signature.
     Both save a follow-up `read` when you only needed inline context.
 
+  Embedding model
+    First run downloads the default Model2Vec model (~30 MB) under
+    $HF_HOME (or $XDG_CACHE_HOME/hitagi/models if HF_HOME is unset). Subsequent
+    runs hit the local copy. Pass `--offline` to forbid network entirely and
+    fall back to a deterministic hashing encoder (lower quality, no download).
+    `--no-download` blocks downloads but allows a cached model. `--model PATH`
+    or `--model HF_REPO_ID` overrides the default. The model is fingerprinted
+    so swapping invalidates the dense cache row independently of the sparse
+    (BM25) row.
+
   Limits and truncation
-    Default --limit is 50 for search/find, 2000 for files. When the cap is reached
-    the response carries `\"truncated\": true`. `files` adds per-glob/per-root
-    first/last samples so truncated discovery stays useful without dumping long
-    path lists. Bump --limit when sweeping; reduce it for noisy queries.
+    Default `--limit` (`-k`) is 10 for `search` / `find-related`, 50 for `find`,
+    2000 for `files`. `find` / `files` carry `\"truncated\": true` when the cap
+    is reached and `files` adds per-glob/per-root first/last samples so truncated
+    discovery stays useful. `search` / `find-related` always return exactly the
+    top-N hits ~ ranking decides what's in vs out; bump `--limit` when you need
+    a wider net.
 
   Fair sampling on full-repo sweeps
-    `find` and `search` walk top-level subdirs round-robin (one file per bucket
-    in turn) when no positional [PATHS] are given, so a `--limit` truncation
-    produces a fair sample across the repo instead of exhausting the budget on
-    whichever top-level dir comes first alphabetically. Pass [PATHS] to opt out
-    and walk in user-supplied order. When matches still don't reach a subtree,
-    `unsampled_dirs` lists what was skipped.
+    `find` walks top-level subdirs round-robin (one file per bucket in turn)
+    when no positional [PATHS] are given, so a `--limit` truncation produces
+    a fair sample across the repo instead of exhausting the budget on whichever
+    top-level dir comes first alphabetically. Pass [PATHS] to opt out and walk
+    in user-supplied order. When matches still don't reach a subtree,
+    `unsampled_dirs` lists what was skipped. (`search` is rank-based and
+    indexes the whole repo unconditionally; `[PATHS]` is a post-rank filter.)
 
   Excluding noise (--exclude)
     `search`, `find`, and `files` accept --exclude PATTERN (repeatable). Bare names
@@ -105,7 +125,7 @@ TIPS
     nothing, the response includes `available_kinds: [...]` so you know what was
     actually present ~ no need for a second probe call. Aliases: callable =
     function/method/arrow_function, container = class/struct/interface/enum/trait/
-    object, value = property/field/variant.
+    object, value = property/field/variant/variable/constant.
 
   outline --depth N
     Limits nesting depth: --depth 1 keeps top-level shapes only; --depth 2 also
@@ -132,39 +152,45 @@ TIPS
     responses, inside the containing group on grouped responses). The cap
     counts toward --limit ~ it's a diversity control, not a bypass.
 
-  Per-prefix grouping (find / search response shape)
-    When matches all share a common path prefix, the response stays flat:
-    top-level `prefix` plus `matches` (find) or `results` (search) with the
-    prefix stripped. When matches span multiple top-level dirs and there's
-    no shared prefix, the response switches to grouped form: a `groups: [...]`
-    array where each group carries its own `prefix` plus its own `matches`/
-    `results` (and `more_in_file` for find). Cuts repeated long monorepo
-    paths out of the output. Top-level `matches`/`results` is `[]`/`{}` in
-    grouped form. Round-robin sampling and grouping work together: the walk
-    visits diverse subtrees, and grouping hoists each subtree's prefix.
+  Per-prefix grouping (find response shape)
+    When `find` matches all share a common path prefix, the response stays
+    flat: top-level `prefix` plus `matches` with the prefix stripped. When
+    matches span multiple top-level dirs and there's no shared prefix, the
+    response switches to grouped form: a `groups: [...]` array where each
+    group carries its own `prefix` plus its own `matches` (and
+    `more_in_file`). Cuts repeated long monorepo paths out of the output.
+    `search` / `find-related` always return a flat `results` list (ranking
+    is the structure).
 
   langs and parseable
     `langs` summarises file count + line count per detected language and includes
-    `parseable: bool`. Languages with `parseable: true` (Rust/TS/TSX/Python/Kotlin/
-    Prisma) work with outline/symbol/find. Recognised non-parseable ones (json,
-    markdown, sql, css, shell, dockerfile, ...) only show up in `langs`/`search`/
-    `read`.
+    `parseable: bool`. Languages with `parseable: true` are supported by
+    tree-sitter-language-pack and work with outline/symbol/find/search. Unknown or
+    unsupported files only show up in `langs`, `files`, and `read`.
 
   When `find` returns nothing
     `find` only matches qualnames in PARSEABLE files (.md/.txt/.toml etc. are
-    skipped). For raw substring search across all file types, use `search`. The
+    skipped). `search` covers syntax chunks for pack-supported files. The
     `searched_files` field tells you how many files actually got parsed; if it's 0
     the response includes a `note` explaining why.
 
   Parse cache
-    find / outline / search / symbol persist parsed symbols at
+    find / outline / symbol persist parsed symbols at
     $HITAGI_CACHE_DIR / $XDG_CACHE_HOME/hitagi / $HOME/.cache/hitagi, keyed by
-    (path, mtime, size, language). Warm runs skip the parse step (and skip the
-    file read entirely for `find` without --snippet and `outline`), turning a
-    multi-second cold sweep into ~100ms. Set HITAGI_NO_CACHE=1 to bypass for one
-    invocation. Use `hitagi cache status` to inspect, `hitagi cache clear` to
-    drop the current repo's cache, `hitagi cache clear --all` to nuke all of
-    them.
+    (path, mtime, size, language). Warm runs skip the parse step entirely.
+    Set HITAGI_NO_CACHE=1 to bypass for one invocation. Use `hitagi cache
+    status` to inspect, `hitagi cache clear` to drop the current repo's cache,
+    `hitagi cache clear --all` to nuke all of them.
+
+  Search index
+    `search` and `find-related` persist their BM25 postings + chunk vector +
+    (when hybrid/semantic) dense embeddings in the same SQLite file as the
+    parse cache. Cold rebuild on first call (~hundreds of ms for 1000 files;
+    longer if the model has to download); warm runs are ~100 ms. The sparse
+    and dense rows have independent fingerprints ~ a model swap rebuilds dense
+    only; a single file change rebuilds both. Use `hitagi index status` to
+    inspect, `hitagi index clean` to drop just the search rows (parse cache
+    untouched), `hitagi index build [--mode hybrid]` to force a rebuild.
 
   Uncommitted changes (`diff`)
     `diff` (no PATH) prints a per-file overview ~ status code (M/A/D/R/C/?),
@@ -204,9 +230,14 @@ COMMON PATTERNS
   What's in this file?            hitagi outline FILE
   Just top-level shapes?          hitagi outline FILE --kind function,struct,enum
   Read this function/struct       hitagi symbol FILE Qualname.Or.Leaf
-  Where's this string used?       hitagi search \"X\" --snippet
-  Where's it used (specific dir)? hitagi search \"X\" src/auth
-  Sweep without vendor noise      hitagi search \"X\" --exclude vendor --exclude target
+  Conceptual / NLQ search?        hitagi search \"how does request validation work\"
+  Exact-symbol lookup (fast)      hitagi search Foo.bar --mode bm25
+  Search a single subtree         hitagi search \"queue worker\" packages/jobs
+  Filter to one language          hitagi search \"router\" --language rust
+  Sweep without vendor noise      hitagi search \"config\" --exclude vendor --exclude target
+  Find related code to a chunk    hitagi find-related src/auth.ts 47
+  Index status / lifecycle        hitagi index status / hitagi index clean / hitagi index build
+  Offline (no model download)     hitagi search foo --offline
   Read a slice of a big file      hitagi read FILE --lines 1400-1510
   Read structure without content  hitagi read FILE --summary
   List all Rust + TOML files      hitagi files \"**/*.rs\" \"**/*.toml\"
@@ -233,7 +264,9 @@ ANTI-PATTERNS (token waste)
   hitagi read big_file.rs                  # ~5K-line files cost a lot of tokens.
                                            # Use `read --summary`, `outline` then
                                            # `symbol`, or `read --lines S-E`.
-  hitagi search \"the\"                      # tighten queries; pass [PATHS] to scope.
+  hitagi search \"the\"                      # rank quality drops for stopword-only
+                                           # queries; pass at least one content
+                                           # token, or scope with [PATHS].
   hitagi outline huge_file.rs              # add --kind to filter, or just `find`
                                            # the specific symbol you wanted.
   hitagi outline FILE --bytes              # don't pass --bytes unless you actually
@@ -246,11 +279,21 @@ JSON OUTPUT SHAPES (--json; compact form ~ omitted optional fields appear only w
             \"qualname\":\"...\",\"lines\":[s,e]}],\"available_kinds\":[...]?}
   symbol    {\"language\":\"rust\",\"symbol\":{\"kind\":\"...\",\"name\":\"...\",
             \"qualname\":\"...\",\"content\":\"...\",\"lines\":[s,e]}}
-  search    {\"prefix\":\"src/\",\"results\":{\"file.rs\":[\"scope(kind) @L<n>\"]},
-            \"truncated\":bool}
-            grouped (when matches span top-levels with no shared prefix):
-            {\"results\":{},\"groups\":[{\"prefix\":\"a/\",\"results\":{\"f.rs\":
-            [\"...\"]}},{\"prefix\":\"b/\",\"results\":{...}}],\"truncated\":bool}
+  search    {\"query\":\"...\",\"mode\":\"hybrid|bm25|semantic\",\"alpha\":F,
+            \"limit\":N,\"languages\":[...]?,\"paths\":[...]?,\"elapsed_ms\":N,
+            \"indexed_files\":N,\"indexed_chunks\":N,\"warnings\":[...]?,
+            \"results\":[{\"path\":\"...\",\"lines\":[s,e],\"language\":\"...\"?,
+            \"score\":F,\"source\":\"bm25|semantic|hybrid\",
+            \"snippet\":\"...\"?}]}
+  find-related  {\"path\":\"...\",\"line\":N,\"limit\":N,\"elapsed_ms\":N,
+            \"indexed_files\":N,\"indexed_chunks\":N,\"source_chunk\":{...hit...},
+            \"warnings\":[...]?,\"results\":[{...hit...},...]}
+  index status  {\"cache_file\":\"...\",\"sparse_present\":bool,\"dense_present\":bool,
+            \"indexed_files\":N,\"indexed_chunks\":N,\"languages\":{lang:N,...},
+            \"model_id\":\"...\"?,\"encoder_kind\":\"...\"?,
+            \"model_fingerprint\":\"...\"?,\"dim\":N?,
+            \"sparse_built_at_unix_secs\":N?,\"dense_built_at_unix_secs\":N?,
+            \"sparse_size_bytes\":N?,\"dense_size_bytes\":N?}
   read      content: {\"language\":\"rust\",\"content\":\"...\",\"lines\":[s,e],
             \"total_lines\":N}
             summary: {\"language\":\"rust\",\"lines\":N,\"bytes\":N,\"parseable\":bool,
@@ -349,33 +392,82 @@ enum Commands {
         #[arg(long)]
         bytes: bool,
     },
-    /// Substring search across the repo, grouped by enclosing scope.
+    /// Hybrid ranked search across the repo (BM25 + semantic, RRF-fused).
     ///
-    /// QUERY is a literal substring. Combine alternatives with ` OR ` (literal,
-    /// surrounded by spaces), e.g. `"foo OR bar"`. Each result is annotated with the
-    /// enclosing symbol scope (when known) and the actual match line, e.g.
-    /// `parse_source(function) @L23` ~ unscoped matches show only `@L23`.
+    /// QUERY can be natural language (`how does request validation work`), a
+    /// code identifier (`AuthService.handleAuth`), or a literal substring.
+    /// Defaults to hybrid mode; pass `--mode bm25` for exact-token / lexical
+    /// search. Each result is a chunk: `path:start-end` with a score and the
+    /// fusion source (`bm25` / `semantic` / `hybrid`).
     Search {
-        /// Substring query. Use ` OR ` (space-padded) to combine alternatives.
+        /// Natural-language, code, or literal query.
         query: String,
-        /// Optional path prefixes to scope the search.
+        /// Optional path prefixes to scope the search to a subtree.
         paths: Vec<String>,
-        /// Maximum total matches to return. Response includes `truncated: true` when hit.
-        #[arg(long, default_value_t = DEFAULT_SEARCH_LIMIT)]
+        /// Maximum ranked chunks to return.
+        #[arg(short = 'k', long = "limit", default_value_t = DEFAULT_SEARCH_LIMIT)]
         limit: usize,
-        /// Append the matched line as a snippet (` :: <line>`) for inline context.
-        #[arg(long)]
-        snippet: bool,
-        /// Glob patterns to exclude (repeatable). Bare names like `vendor` exclude that
-        /// directory at any depth; use `vendor/**` for explicit globbing.
+        /// Ranking mode: hybrid (default), bm25, or semantic.
+        #[arg(short = 'm', long, value_enum, default_value_t = CliSearchMode::Hybrid)]
+        mode: CliSearchMode,
+        /// Restrict to chunks of this language label (`rust`, `go`, ...).
+        /// Repeatable.
+        #[arg(long = "language", value_name = "LANG")]
+        languages: Vec<String>,
+        /// Glob patterns to exclude (repeatable). Bare names like `vendor`
+        /// exclude that directory at any depth; use `vendor/**` for explicit
+        /// globbing.
         #[arg(long, value_name = "PATTERN")]
         exclude: Vec<String>,
-        /// Keep matches that fall outside any parsed symbol scope (top-of-file
-        /// imports, top-level constants, comments). Default suppresses these
-        /// when the same file has inside-symbol matches ~ frees `--limit`
-        /// budget for more useful results. Plaintext files are unaffected.
+        /// Override the auto-tuned hybrid alpha (semantic weight, 0.0-1.0).
+        #[arg(long, value_name = "F")]
+        alpha: Option<f32>,
+        /// Append the chunk's first non-blank line as a snippet (` :: <line>`).
         #[arg(long)]
-        include_unscoped: bool,
+        snippet: bool,
+        /// Use a deterministic hashing encoder instead of model2vec. No
+        /// network, no model file, lower retrieval quality.
+        #[arg(long)]
+        hashing: bool,
+        /// Don't download the model if it's missing; use the cached copy or
+        /// fail.
+        #[arg(long = "no-download")]
+        no_download: bool,
+        /// Refuse all network access (model download AND any future remote
+        /// source). Implies `--no-download`.
+        #[arg(long)]
+        offline: bool,
+        /// Override the embedding model id or local path.
+        #[arg(long, value_name = "MODEL")]
+        model: Option<String>,
+    },
+    /// Find chunks related to a known `path:line` by semantic similarity.
+    ///
+    /// Pass a path:line copied from a `search` result. Reuses the persisted
+    /// search index; first run rebuilds (or downloads the model) like
+    /// `search` does.
+    FindRelated {
+        /// Repo-relative file path (or unique repo-internal suffix).
+        path: String,
+        /// 1-based line inside the source chunk.
+        line: usize,
+        /// Maximum related chunks to return.
+        #[arg(short = 'k', long = "limit", default_value_t = DEFAULT_FIND_RELATED_LIMIT)]
+        limit: usize,
+        #[arg(long)]
+        hashing: bool,
+        #[arg(long = "no-download")]
+        no_download: bool,
+        #[arg(long)]
+        offline: bool,
+        #[arg(long, value_name = "MODEL")]
+        model: Option<String>,
+    },
+    /// Inspect or manage the search index (lives in the same SQLite file as
+    /// the parse cache).
+    Index {
+        #[command(subcommand)]
+        action: Option<IndexAction>,
     },
     /// Read a file's contents.
     Read {
@@ -534,6 +626,48 @@ enum Commands {
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum CliSearchMode {
+    Hybrid,
+    Bm25,
+    Semantic,
+}
+
+impl From<CliSearchMode> for SearchModeArg {
+    fn from(value: CliSearchMode) -> Self {
+        match value {
+            CliSearchMode::Hybrid => SearchModeArg::Hybrid,
+            CliSearchMode::Bm25 => SearchModeArg::Bm25,
+            CliSearchMode::Semantic => SearchModeArg::Semantic,
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum IndexAction {
+    /// Print indexed file/chunk counts, language breakdown, sparse/dense
+    /// presence, and model fingerprint. Default action when no subcommand.
+    Status,
+    /// Force a rebuild of the search index. Useful after a model swap or
+    /// to warm the cache before a session.
+    Build {
+        #[arg(short = 'm', long, value_enum, default_value_t = CliSearchMode::Hybrid)]
+        mode: CliSearchMode,
+        #[arg(long)]
+        hashing: bool,
+        #[arg(long = "no-download")]
+        no_download: bool,
+        #[arg(long)]
+        offline: bool,
+        #[arg(long, value_name = "MODEL")]
+        model: Option<String>,
+    },
+    /// Drop the search-index portion of the SQLite cache. The parse cache
+    /// (used by outline/symbol/find) is left intact. Use `hitagi cache
+    /// clear` to wipe both.
+    Clean,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 enum CliDiffBodyMode {
     Full,
     ChangedLines,
@@ -619,20 +753,78 @@ pub fn run() -> AppResult<()> {
                     query,
                     paths,
                     limit,
-                    snippet,
+                    mode: search_mode,
+                    languages,
                     exclude,
-                    include_unscoped,
+                    alpha,
+                    snippet,
+                    hashing,
+                    no_download,
+                    offline,
+                    model,
                 } => {
                     let opts = SearchOptions {
                         paths,
                         excludes: exclude,
                         limit,
+                        mode: search_mode.into(),
+                        languages,
+                        alpha,
                         snippet,
-                        include_unscoped,
+                        hashing,
+                        no_download,
+                        offline,
+                        model,
                     };
                     let response = commands::search(&repo, &query, opts)?;
-                    output::print_search(&query, &response, mode)
+                    output::print_search(&response, mode)
                 }
+                Commands::FindRelated {
+                    path,
+                    line,
+                    limit,
+                    hashing,
+                    no_download,
+                    offline,
+                    model,
+                } => {
+                    let opts = FindRelatedOptions {
+                        limit,
+                        hashing,
+                        no_download,
+                        offline,
+                        model,
+                    };
+                    let response = commands::find_related(&repo, &path, line, opts)?;
+                    output::print_find_related(&response, mode)
+                }
+                Commands::Index { action } => match action.unwrap_or(IndexAction::Status) {
+                    IndexAction::Status => {
+                        let response = commands::index_status(&repo);
+                        output::print_index_status(&response, mode)
+                    }
+                    IndexAction::Build {
+                        mode: build_mode,
+                        hashing,
+                        no_download,
+                        offline,
+                        model,
+                    } => {
+                        let opts = IndexBuildOptions {
+                            mode: build_mode.into(),
+                            hashing,
+                            no_download,
+                            offline,
+                            model,
+                        };
+                        let response = commands::index_build(&repo, opts)?;
+                        output::print_index_build(&response, mode)
+                    }
+                    IndexAction::Clean => {
+                        let response = commands::index_clean(&repo)?;
+                        output::print_index_clean(&response, mode)
+                    }
+                },
                 Commands::Read {
                     path,
                     lines,

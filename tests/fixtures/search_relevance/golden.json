@@ -1,0 +1,42 @@
+[
+  {
+    "query": "UserCard React component",
+    "expected_path": "src/components/UserCard.tsx",
+    "max_rank": 3
+  },
+  {
+    "query": "useUserPreferences hook",
+    "expected_path": "src/hooks/useUserPreferences.ts",
+    "max_rank": 3
+  },
+  {
+    "query": "UserProfile type definition",
+    "expected_path": "src/types/user.ts",
+    "max_rank": 3
+  },
+  {
+    "query": "public barrel exports",
+    "expected_path": "src/index.ts",
+    "max_rank": 3
+  },
+  {
+    "query": "RuntimeFlags declaration file",
+    "expected_path": "src/env.d.ts",
+    "max_rank": 3
+  },
+  {
+    "query": "user route loader params",
+    "expected_path": "src/routes/users.$userId.tsx",
+    "max_rank": 3
+  },
+  {
+    "query": "getByText Ada Lovelace",
+    "expected_path": "src/components/UserCard.spec.tsx",
+    "max_rank": 10
+  },
+  {
+    "query": "parse hunk header",
+    "expected_path": "src/git.rs",
+    "max_rank": 3
+  }
+]

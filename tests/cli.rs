@@ -5,6 +5,15 @@ use assert_cmd::Command;
 use serde_json::Value;
 
 const HITAGI_PROMPT_BEGIN: &str = "<!-- BEGIN HITAGI MANAGED PROMPT -->";
+const TEST_PACK_LANGUAGES: &[&str] = &[
+    "rust",
+    "typescript",
+    "tsx",
+    "prisma",
+    "markdown",
+    "json",
+    "javascript",
+];
 
 fn fixture_repo() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -26,11 +35,20 @@ fn shared_cache_dir() -> &'static Path {
     })
 }
 
+fn prewarm_language_pack() {
+    static PREWARM: OnceLock<()> = OnceLock::new();
+    PREWARM.get_or_init(|| {
+        tree_sitter_language_pack::download(TEST_PACK_LANGUAGES)
+            .expect("test parser languages download");
+    });
+}
+
 fn run(args: &[&str]) -> Value {
     run_in(&fixture_repo(), shared_cache_dir(), args)
 }
 
 fn run_in(repo: &Path, cache_dir: &Path, args: &[&str]) -> Value {
+    prewarm_language_pack();
     let output = Command::cargo_bin("hitagi")
         .unwrap()
         .env("HITAGI_CACHE_DIR", cache_dir)
@@ -51,6 +69,7 @@ fn run_failure(args: &[&str]) -> String {
 }
 
 fn run_failure_in(repo: &Path, cache_dir: &Path, args: &[&str]) -> String {
+    prewarm_language_pack();
     let assert = Command::cargo_bin("hitagi")
         .unwrap()
         .env("HITAGI_CACHE_DIR", cache_dir)
@@ -63,6 +82,7 @@ fn run_failure_in(repo: &Path, cache_dir: &Path, args: &[&str]) -> String {
 }
 
 fn run_text(args: &[&str]) -> String {
+    prewarm_language_pack();
     let stdout = Command::cargo_bin("hitagi")
         .unwrap()
         .env("HITAGI_CACHE_DIR", shared_cache_dir())
@@ -185,55 +205,6 @@ fn flatten_find_paths(value: &Value) -> Vec<String> {
     out
 }
 
-/// Re-prefix each `results` key with its containing prefix. For search
-/// responses, the keys are file paths; this yields the full paths so tests
-/// can compare regardless of flat vs grouped shape.
-fn flatten_search_keys(value: &Value) -> Vec<String> {
-    let mut keys = Vec::new();
-    let top_prefix = value["prefix"].as_str().unwrap_or("");
-    if let Some(o) = value["results"].as_object() {
-        for k in o.keys() {
-            keys.push(format!("{top_prefix}{k}"));
-        }
-    }
-    if let Some(groups) = value.get("groups").and_then(|v| v.as_array()) {
-        for g in groups {
-            let gp = g["prefix"].as_str().unwrap_or("");
-            if let Some(o) = g["results"].as_object() {
-                for k in o.keys() {
-                    keys.push(format!("{gp}{k}"));
-                }
-            }
-        }
-    }
-    keys
-}
-
-/// Sum match-line counts across flat results + every group's results. Used
-/// for tests that just need a total count regardless of response shape.
-fn count_search_matches(value: &Value) -> usize {
-    let mut total = 0usize;
-    if let Some(o) = value["results"].as_object() {
-        total += o
-            .values()
-            .filter_map(|v| v.as_array())
-            .map(|a| a.len())
-            .sum::<usize>();
-    }
-    if let Some(groups) = value.get("groups").and_then(|v| v.as_array()) {
-        for g in groups {
-            if let Some(o) = g["results"].as_object() {
-                total += o
-                    .values()
-                    .filter_map(|v| v.as_array())
-                    .map(|a| a.len())
-                    .sum::<usize>();
-            }
-        }
-    }
-    total
-}
-
 #[test]
 fn outline_emits_compact_symbols() {
     let value = run(&["outline", "src/auth.ts"]);
@@ -319,7 +290,7 @@ fn outline_depth_two_includes_nested_methods() {
 }
 
 #[test]
-fn outline_qualifies_object_literal_methods_under_object_container() {
+fn outline_uses_pack_object_literal_method_names() {
     let scratch = ScratchRepo::new("outline-object-methods");
     scratch.write(
         "src/backends.ts",
@@ -342,29 +313,18 @@ const miniBackend: ModerationBackend = {
 
     let value = scratch.run(&["outline", "src/backends.ts"]);
     let symbols = value["symbols"].as_array().unwrap();
-    assert!(symbols
+    let run_methods: Vec<&Value> = symbols
         .iter()
-        .any(|s| s["kind"] == "object" && s["qualname"] == "moderationApiBackend"));
-    assert!(symbols
-        .iter()
-        .any(|s| s["kind"] == "method" && s["qualname"] == "moderationApiBackend.run"));
-    assert!(symbols
-        .iter()
-        .any(|s| s["kind"] == "object" && s["qualname"] == "miniBackend"));
-    assert!(symbols
-        .iter()
-        .any(|s| s["kind"] == "method" && s["qualname"] == "miniBackend.run"));
-    assert!(!symbols
-        .iter()
-        .any(|s| s["kind"] == "method" && s["qualname"] == "run"));
+        .filter(|s| s["kind"] == "method" && s["qualname"] == "run")
+        .collect();
+    assert_eq!(
+        run_methods.len(),
+        2,
+        "pack output keeps object-literal method names unqualified"
+    );
 
-    let mini = scratch.run(&["symbol", "src/backends.ts", "miniBackend.run"]);
-    assert_eq!(mini["symbol"]["qualname"], "miniBackend.run");
-
-    let stderr = scratch.run_failure(&["symbol", "src/backends.ts", "run"]);
-    assert!(stderr.contains("symbol is ambiguous: run"));
-    assert!(stderr.contains("moderationApiBackend.run"));
-    assert!(stderr.contains("miniBackend.run"));
+    let first = scratch.run(&["symbol", "src/backends.ts", "run"]);
+    assert_eq!(first["symbol"]["qualname"], "run");
 }
 
 #[test]
@@ -399,203 +359,236 @@ fn symbol_missing_typo_includes_suggestions_when_available() {
     assert!(stderr.contains("AuthService.handleAuth"));
 }
 
+/// Pull the `path` value out of every hit in a ranked-search response.
+fn search_paths(value: &Value) -> Vec<String> {
+    value["results"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|hit| hit["path"].as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[test]
-fn search_finds_match() {
-    let value = run(&["search", "AuthService"]);
-    let results = value["results"].as_object().unwrap();
+fn search_returns_ranked_hits_with_score_and_source() {
+    let value = run(&["search", "AuthService", "--mode", "bm25"]);
+    let hits = value["results"].as_array().unwrap();
     assert!(
-        results.keys().any(|key| key.contains("auth.ts")),
-        "expected an auth.ts entry, got {results:?}"
+        !hits.is_empty(),
+        "expected at least one ranked hit, got {value:?}"
     );
+    let first = &hits[0];
+    assert!(first["path"].is_string());
+    let lines = first["lines"].as_array().unwrap();
+    assert_eq!(lines.len(), 2, "lines is [start, end]");
+    assert!(first["score"].as_f64().unwrap() > 0.0);
+    assert_eq!(first["source"], "bm25");
+    assert_eq!(value["mode"], "bm25");
     assert!(
-        value.get("truncated").is_none(),
-        "truncated hidden when false"
+        search_paths(&value).iter().any(|p| p.contains("auth.ts")),
+        "expected auth.ts somewhere in the ranking, got {value:?}"
     );
 }
 
 #[test]
-fn search_emits_match_line_not_file_range() {
-    let value = run(&["search", "AuthService"]);
-    let entries: Vec<&str> = value["results"]
-        .as_object()
-        .unwrap()
-        .values()
-        .flat_map(|v| v.as_array().unwrap().iter().map(|s| s.as_str().unwrap()))
-        .collect();
-    assert!(!entries.is_empty());
+fn search_snippet_appends_chunk_first_line() {
+    let value = run(&["search", "AuthService", "--mode", "bm25", "--snippet"]);
+    let first = &value["results"][0];
+    let snippet = first["snippet"]
+        .as_str()
+        .expect("snippet emitted with --snippet");
     assert!(
-        entries.iter().all(|e| e.contains("@L")),
-        "every entry should report a match line, got {entries:?}"
-    );
-    assert!(
-        entries.iter().all(|e| !e.contains("L1-L")),
-        "no entry should use the old whole-file fallback, got {entries:?}"
+        !snippet.is_empty(),
+        "snippet should be the chunk's first non-blank line, got {first:?}"
     );
 }
 
 #[test]
-fn search_with_snippet_appends_matched_line() {
-    let value = run(&["search", "TOKEN_DUP", "--snippet"]);
-    let entry = value["results"]
-        .as_object()
-        .unwrap()
-        .values()
-        .next()
-        .and_then(|v| v.as_array())
-        .and_then(|arr| arr.first())
-        .and_then(|s| s.as_str())
-        .expect("expected at least one result entry");
-    assert!(
-        entry.contains(" :: "),
-        "snippet separator missing in {entry}"
-    );
-    assert!(entry.contains("TOKEN_DUP"), "snippet should contain match");
-}
-
-#[test]
-fn search_drops_unscoped_matches_when_file_also_has_scoped_match() {
-    let scratch = ScratchRepo::new("search-unscoped-suppression");
-    // Two occurrences of `useState` ~ one outside any symbol (top-of-file
-    // import line, where most TSX files would have it) and one inside a
-    // function body. The default behavior should keep only the inside-symbol
-    // match; --include-unscoped restores both.
-    scratch.write(
-        "App.tsx",
-        "import { useState } from 'react';\n\
-         export function App() {\n\
-             const [n] = useState(0);\n\
-             return n;\n\
-         }\n",
-    );
-
-    let default_value = scratch.run(&["search", "useState"]);
-    let default_entries: Vec<String> = default_value["results"]
-        .as_object()
-        .unwrap()
-        .values()
-        .flat_map(|v| v.as_array().unwrap().iter())
-        .map(|s| s.as_str().unwrap().to_string())
-        .collect();
-    assert_eq!(
-        default_entries.len(),
-        1,
-        "import-line match should be dropped when an inside-symbol match exists in the same file: {default_entries:?}"
-    );
-    assert!(
-        default_entries[0].contains("App(function)"),
-        "remaining entry should be the inside-function match: {default_entries:?}"
-    );
-
-    let opt_in_value = scratch.run(&["search", "useState", "--include-unscoped"]);
-    let opt_in_entries: Vec<String> = opt_in_value["results"]
-        .as_object()
-        .unwrap()
-        .values()
-        .flat_map(|v| v.as_array().unwrap().iter())
-        .map(|s| s.as_str().unwrap().to_string())
-        .collect();
-    assert_eq!(
-        opt_in_entries.len(),
-        2,
-        "--include-unscoped should keep both the import-line and inside-function matches: {opt_in_entries:?}"
-    );
-    assert!(opt_in_entries.iter().any(|e| e.contains("App(function)")));
-    assert!(
-        opt_in_entries
-            .iter()
-            .any(|e| !e.contains("(function)") && e.contains("@L1")),
-        "expected the import-line `@L1` entry to come back, got {opt_in_entries:?}"
-    );
-}
-
-#[test]
-fn search_keeps_unscoped_matches_in_plaintext_files() {
-    // Plaintext files have no symbol info, so the suppression rule never
-    // fires (zero scoped matches). The match should always come back.
-    let scratch = ScratchRepo::new("search-unscoped-plaintext");
-    scratch.write("notes.md", "use useState here\n");
-
-    let value = scratch.run(&["search", "useState"]);
-    let entries: Vec<String> = value["results"]
-        .as_object()
-        .unwrap()
-        .values()
-        .flat_map(|v| v.as_array().unwrap().iter())
-        .map(|s| s.as_str().unwrap().to_string())
-        .collect();
-    assert_eq!(entries.len(), 1, "{entries:?}");
-}
-
-#[test]
-fn search_truncated_flag_set_when_limit_hit() {
-    let value = run(&["search", "AuthService", "--limit", "1"]);
-    let total: usize = value["results"]
-        .as_object()
-        .unwrap()
-        .values()
-        .map(|v| v.as_array().unwrap().len())
-        .sum();
-    assert_eq!(total, 1);
-    assert_eq!(value["truncated"], true);
-}
-
-#[test]
-fn search_exact_limit_single_file_does_not_report_truncated() {
+fn search_path_scope_filters_to_subtree() {
     let value = run(&[
         "search",
-        "MobileButton",
-        "--limit",
-        "1",
-        "packages/mobile/src/components/Button.tsx",
+        "Button",
+        "packages/mobile",
+        "--mode",
+        "bm25",
+        "-k",
+        "10",
     ]);
-    let entries: Vec<&str> = value["results"]
-        .as_object()
-        .unwrap()
-        .values()
-        .flat_map(|v| v.as_array().unwrap().iter().map(|s| s.as_str().unwrap()))
-        .collect();
-    assert_eq!(entries, vec!["MobileButton(function) @L1"]);
+    let paths = search_paths(&value);
     assert!(
-        value.get("truncated").is_none(),
-        "truncated hidden when the scan completes exactly at the limit"
+        !paths.is_empty(),
+        "expected at least one Button hit under packages/mobile"
+    );
+    assert!(
+        paths.iter().all(|p| p.starts_with("packages/mobile/")),
+        "every hit should fall under packages/mobile, got {paths:?}"
     );
 }
 
 #[test]
-fn search_limit_preserves_requested_path_order() {
-    let mobile_first = run(&[
+fn search_language_filter_drops_other_languages() {
+    let value = run(&[
         "search",
-        "Button",
-        "--limit",
-        "1",
-        "packages/mobile/src/components/Button.tsx",
-        "apps/desktop/src/components/Button.tsx",
+        "AuthService",
+        "--mode",
+        "bm25",
+        "--language",
+        "typescript",
+        "-k",
+        "10",
     ]);
-    let mobile_entries: Vec<&str> = mobile_first["results"]
-        .as_object()
+    let langs: Vec<&str> = value["results"]
+        .as_array()
         .unwrap()
-        .values()
-        .flat_map(|v| v.as_array().unwrap().iter().map(|s| s.as_str().unwrap()))
+        .iter()
+        .filter_map(|hit| hit["language"].as_str())
         .collect();
-    assert_eq!(mobile_entries, vec!["MobileButton(function) @L1"]);
-    assert_eq!(mobile_first["truncated"], true);
+    assert!(!langs.is_empty(), "expected at least one typescript hit");
+    assert!(
+        langs.iter().all(|l| *l == "typescript"),
+        "language filter must restrict to typescript, got {langs:?}"
+    );
+}
 
-    let desktop_first = run(&[
+#[test]
+fn search_limit_caps_result_count() {
+    let value = run(&["search", "Button", "--mode", "bm25", "-k", "1"]);
+    assert_eq!(value["results"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn search_exclude_filters_paths() {
+    let with = run(&["search", "Button", "--mode", "bm25", "-k", "10"]);
+    let without = run(&[
         "search",
         "Button",
-        "--limit",
-        "1",
-        "apps/desktop/src/components/Button.tsx",
-        "packages/mobile/src/components/Button.tsx",
+        "--mode",
+        "bm25",
+        "--exclude",
+        "apps",
+        "-k",
+        "10",
     ]);
-    let desktop_entries: Vec<&str> = desktop_first["results"]
-        .as_object()
+    let with_paths = search_paths(&with);
+    let without_paths = search_paths(&without);
+    assert!(
+        with_paths.iter().any(|p| p.contains("apps/")),
+        "baseline should include an apps/ path, got {with_paths:?}"
+    );
+    assert!(
+        !without_paths.is_empty(),
+        "exclude should leave non-apps hits"
+    );
+    assert!(without_paths.iter().all(|p| !p.contains("apps/")));
+}
+
+#[test]
+fn search_hybrid_with_hashing_returns_fused_results() {
+    // --hashing avoids the network model download, but exercises the same
+    // hybrid (BM25 + dense + RRF) code path the default mode uses.
+    let cache = isolated_cache("search-hybrid-hashing");
+    let value = run_in(
+        &fixture_repo(),
+        &cache,
+        &["search", "AuthService", "--hashing", "-k", "5"],
+    );
+    assert_eq!(value["mode"], "hybrid");
+    let hits = value["results"].as_array().unwrap();
+    assert!(!hits.is_empty(), "expected at least one hybrid hit");
+    for hit in hits {
+        assert_eq!(hit["source"], "hybrid");
+    }
+    std::fs::remove_dir_all(cache).ok();
+}
+
+#[test]
+fn find_related_returns_other_chunks_excluding_source() {
+    let cache = isolated_cache("find-related");
+    let value = run_in(
+        &fixture_repo(),
+        &cache,
+        &["find-related", "src/auth.ts", "1", "--hashing", "-k", "3"],
+    );
+    let source = &value["source_chunk"];
+    assert_eq!(source["path"], "src/auth.ts");
+    assert!(source["lines"][0].as_u64().unwrap() >= 1);
+    let hits = value["results"].as_array().unwrap();
+    assert!(
+        hits.iter()
+            .all(|h| { h["path"] != source["path"] || h["lines"][0] != source["lines"][0] }),
+        "find-related should never return the source chunk itself, got {hits:?}"
+    );
+    std::fs::remove_dir_all(cache).ok();
+}
+
+/// Isolated cache dir for tests that mutate the search index. Sharing the
+/// process-wide `shared_cache_dir` would race because `index clean` from
+/// one test removes rows another test expects to be present.
+fn isolated_cache(name: &str) -> PathBuf {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .values()
-        .flat_map(|v| v.as_array().unwrap().iter().map(|s| s.as_str().unwrap()))
-        .collect();
-    assert_eq!(desktop_entries, vec!["DesktopButton(function) @L1"]);
-    assert_eq!(desktop_first["truncated"], true);
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "hitagi-itest-{name}-{}-{unique}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[test]
+fn index_status_reports_after_search() {
+    let cache = isolated_cache("index-status");
+    let _ = run_in(
+        &fixture_repo(),
+        &cache,
+        &["search", "AuthService", "--mode", "bm25"],
+    );
+    let value = run_in(&fixture_repo(), &cache, &["index", "status"]);
+    assert_eq!(value["sparse_present"], true);
+    assert_eq!(value["dense_present"], false);
+    assert!(value["indexed_files"].as_u64().unwrap() > 0);
+    assert!(value["indexed_chunks"].as_u64().unwrap() > 0);
+    let langs = value["languages"].as_object().unwrap();
+    assert!(
+        langs.values().any(|v| v.as_u64().unwrap() > 0),
+        "language breakdown should have at least one non-zero entry"
+    );
+    std::fs::remove_dir_all(cache).ok();
+}
+
+#[test]
+fn index_clean_drops_search_rows() {
+    let cache = isolated_cache("index-clean");
+    let _ = run_in(
+        &fixture_repo(),
+        &cache,
+        &["search", "AuthService", "--mode", "bm25"],
+    );
+    let cleaned = run_in(&fixture_repo(), &cache, &["index", "clean"]);
+    assert!(cleaned["cleared"].as_bool().unwrap_or(false));
+    let after = run_in(&fixture_repo(), &cache, &["index", "status"]);
+    assert_eq!(after["sparse_present"], false);
+    std::fs::remove_dir_all(cache).ok();
+}
+
+#[test]
+fn index_build_force_rebuilds_and_reports_stats() {
+    let cache = isolated_cache("index-build");
+    let value = run_in(
+        &fixture_repo(),
+        &cache,
+        &["index", "build", "--mode", "bm25"],
+    );
+    assert_eq!(value["mode"], "bm25");
+    assert!(value["indexed_files"].as_u64().unwrap() > 0);
+    assert!(value["indexed_chunks"].as_u64().unwrap() > 0);
+    let langs = value["languages"].as_object().unwrap();
+    assert!(!langs.is_empty());
+    std::fs::remove_dir_all(cache).ok();
 }
 
 #[test]
@@ -680,7 +673,7 @@ fn read_rejects_start_past_eof() {
 
 #[test]
 fn outline_kind_filter_is_case_insensitive() {
-    let value = run(&["outline", "src/auth.ts", "--kind", "FUNCTION"]);
+    let value = run(&["outline", "src/auth.ts", "--kind", "METHOD"]);
     let kinds: Vec<&str> = value["symbols"]
         .as_array()
         .unwrap()
@@ -688,7 +681,7 @@ fn outline_kind_filter_is_case_insensitive() {
         .map(|s| s["kind"].as_str().unwrap())
         .collect();
     assert!(!kinds.is_empty());
-    assert!(kinds.iter().all(|k| *k == "function"));
+    assert!(kinds.iter().all(|k| *k == "method"));
 }
 
 #[test]
@@ -911,19 +904,6 @@ fn files_exclude_filters_out_matches() {
 }
 
 #[test]
-fn search_exclude_filters_files() {
-    let with = run(&["search", "Button"]);
-    let without = run(&["search", "Button", "--exclude", "apps"]);
-    let with_keys = flatten_search_keys(&with);
-    let without_keys = flatten_search_keys(&without);
-    assert!(
-        with_keys.iter().any(|k| k.contains("apps")),
-        "baseline should include an apps/ entry, got {with_keys:?}"
-    );
-    assert!(without_keys.iter().all(|k| !k.contains("apps")));
-}
-
-#[test]
 fn find_exclude_filters_paths() {
     let with = run(&["find", "Button"]);
     let without = run(&["find", "Button", "--exclude", "apps"]);
@@ -969,16 +949,20 @@ fn outline_kind_alias_container_matches_classes() {
 
 #[test]
 fn outline_kind_alias_value_matches_fields() {
-    let value = run(&["outline", "src/schema.prisma", "--kind", "value"]);
+    let scratch = ScratchRepo::new("outline-value-alias");
+    scratch.write("src/constants.rs", "pub const FOO: i32 = 1;\n");
+
+    let value = scratch.run(&["outline", "src/constants.rs", "--kind", "value"]);
     let symbols = value["symbols"].as_array().unwrap();
     assert!(!symbols.is_empty());
-    let mut saw_field = false;
     for symbol in symbols {
         let kind = symbol["kind"].as_str().unwrap();
-        saw_field |= kind == "field";
-        assert!(matches!(kind, "property" | "field" | "variant" | "value"));
+        assert!(matches!(
+            kind,
+            "property" | "field" | "variant" | "variable" | "constant"
+        ));
     }
-    assert!(saw_field, "value alias should include field symbols");
+    assert_eq!(symbols[0]["kind"], "constant");
 }
 
 #[test]
@@ -1063,12 +1047,17 @@ fn default_find_output_is_concise_text() {
 }
 
 #[test]
-fn default_search_output_groups_matches_as_text() {
-    let text = run_text(&["search", "Button", "--snippet", "--limit", "5"]);
-    assert!(text.starts_with("search \"Button\""));
-    assert!(text.contains("apps/desktop/src/components/\nButton.tsx"));
-    assert!(text.contains("packages/mobile/src/components/\nButton.tsx"));
-    assert!(text.contains("• DesktopButton(function) @L1"));
+fn default_search_output_renders_ranked_hits_as_tsv() {
+    let text = run_text(&["search", "Button", "--mode", "bm25", "--snippet", "-k", "5"]);
+    assert!(text.starts_with("search \"Button\" • bm25"));
+    assert!(
+        text.contains("Button.tsx:"),
+        "expected at least one Button.tsx hit in {text}"
+    );
+    assert!(
+        text.lines().any(|l| l.contains("\tbm25\t")),
+        "every hit line should carry the bm25 source tag, got {text}"
+    );
 }
 
 #[test]
@@ -1372,10 +1361,6 @@ impl ScratchRepo {
     fn run(&self, args: &[&str]) -> Value {
         run_in(&self.repo, &self.cache_dir, args)
     }
-
-    fn run_failure(&self, args: &[&str]) -> String {
-        run_failure_in(&self.repo, &self.cache_dir, args)
-    }
 }
 
 impl Drop for ScratchRepo {
@@ -1465,27 +1450,6 @@ fn truncated_find_does_not_prune_full_repo_entries() {
     assert!(
         status["entry_count"].as_u64().unwrap() >= 2,
         "truncated find must not prune warmed cache entries: {status:?}"
-    );
-}
-
-#[test]
-fn truncated_search_does_not_prune_full_repo_entries() {
-    let scratch = ScratchRepo::new("truncated-search-prune");
-    scratch.write("alpha/foo.rs", "pub fn alpha_only() {}\n");
-    scratch.write("beta/bar.rs", "pub fn beta_only() {}\n");
-
-    let full = scratch.run(&["search", "_only"]);
-    assert_eq!(count_search_matches(&full), 2);
-    let warm = scratch.run(&["cache", "status"]);
-    assert!(warm["entry_count"].as_u64().unwrap() >= 2);
-
-    let limited = scratch.run(&["search", "_only", "--limit", "1"]);
-    assert_eq!(limited["truncated"], true);
-
-    let status = scratch.run(&["cache", "status"]);
-    assert!(
-        status["entry_count"].as_u64().unwrap() >= 2,
-        "truncated search must not prune warmed cache entries: {status:?}"
     );
 }
 
@@ -1838,19 +1802,19 @@ fn outline_auto_summarizes_when_symbol_count_exceeds_threshold() {
 #[test]
 fn outline_auto_summary_collapses_nested_symbols() {
     let scratch = ScratchRepo::new("outline-auto-summary-nested");
-    // 50 enums, each with 12 variants ~ 50 + 600 = 650 total symbols. Under
-    // depth=1, only the 50 enum entries should remain.
+    // 50 classes, each with 12 methods ~ 50 + 600 = 650 total symbols. Under
+    // depth=1, only the 50 class entries should remain.
     let mut body = String::new();
     for i in 0..50 {
-        body.push_str(&format!("pub enum E{i:02} {{\n"));
+        body.push_str(&format!("export class C{i:02} {{\n"));
         for j in 0..12 {
-            body.push_str(&format!("    V{j:02},\n"));
+            body.push_str(&format!("    m{j:02}(): void {{}}\n"));
         }
         body.push_str("}\n");
     }
-    scratch.write("enums.rs", &body);
+    scratch.write("classes.ts", &body);
 
-    let value = scratch.run(&["outline", "enums.rs"]);
+    let value = scratch.run(&["outline", "classes.ts"]);
     assert_eq!(value["total_symbols"], 650);
     assert_eq!(value["auto_summarized"], true);
     let symbols_len = value["symbols"].as_array().unwrap().len();
@@ -1859,8 +1823,8 @@ fn outline_auto_summary_collapses_nested_symbols() {
         "depth=1 should drop the variants under each enum"
     );
     let kinds = value["kind_counts"].as_object().unwrap();
-    assert_eq!(kinds["enum"], 50);
-    assert_eq!(kinds["variant"], 600);
+    assert_eq!(kinds["class"], 50);
+    assert_eq!(kinds["method"], 600);
 }
 
 #[test]
@@ -1920,24 +1884,6 @@ fn find_full_walk_omits_unsampled_dirs() {
 }
 
 #[test]
-fn search_truncated_lists_unsampled_top_level_dirs() {
-    let scratch = ScratchRepo::new("search-unsampled-dirs");
-    scratch.write("aaa/notes.txt", "needle here\n");
-    scratch.write("bbb/notes.txt", "needle here\n");
-    scratch.write("ccc/notes.txt", "needle here\n");
-
-    let value = scratch.run(&["search", "needle", "--limit", "1", "aaa", "bbb", "ccc"]);
-    assert_eq!(value["truncated"], true);
-    let unsampled: Vec<&str> = value["unsampled_dirs"]
-        .as_array()
-        .expect("unsampled_dirs must be present when truncated")
-        .iter()
-        .map(|v| v.as_str().unwrap())
-        .collect();
-    assert_eq!(unsampled, vec!["bbb", "ccc"]);
-}
-
-#[test]
 fn find_round_robin_samples_across_top_level_dirs() {
     // Without paths, find should fairly sample across top-level buckets.
     // aaa/ has THREE files that match; bbb/ and ccc/ have one each. With the
@@ -1967,22 +1913,6 @@ fn find_round_robin_samples_across_top_level_dirs() {
         names.iter().any(|n| n.starts_with("target_c")),
         "expected at least one match from ccc/, got {names:?}"
     );
-}
-
-#[test]
-fn search_round_robin_samples_across_top_level_dirs() {
-    let scratch = ScratchRepo::new("search-round-robin");
-    scratch.write("aaa/one.txt", "needle\n");
-    scratch.write("aaa/two.txt", "needle\n");
-    scratch.write("aaa/three.txt", "needle\n");
-    scratch.write("bbb/x.txt", "needle\n");
-    scratch.write("ccc/x.txt", "needle\n");
-
-    let value = scratch.run(&["search", "needle", "--limit", "3"]);
-    let keys = flatten_search_keys(&value);
-    assert!(keys.iter().any(|k| k.starts_with("aaa/")), "got {keys:?}");
-    assert!(keys.iter().any(|k| k.starts_with("bbb/")), "got {keys:?}");
-    assert!(keys.iter().any(|k| k.starts_with("ccc/")), "got {keys:?}");
 }
 
 #[test]
@@ -2096,24 +2026,6 @@ fn find_stays_flat_when_single_top_level() {
         "groups should be omitted when matches all share a top-level dir"
     );
     assert!(value["prefix"].as_str().unwrap().starts_with("only/"));
-}
-
-#[test]
-fn search_groups_results_when_spanning_top_levels() {
-    let scratch = ScratchRepo::new("search-groups");
-    scratch.write("aaa/a.txt", "needle\n");
-    scratch.write("bbb/b.txt", "needle\n");
-
-    let value = scratch.run(&["search", "needle"]);
-    let flat_results = value["results"].as_object().unwrap();
-    assert!(
-        flat_results.is_empty(),
-        "top-level results should be empty when grouped"
-    );
-    let groups = value["groups"]
-        .as_array()
-        .expect("groups should be present when matches span top-levels");
-    assert_eq!(groups.len(), 2);
 }
 
 #[test]

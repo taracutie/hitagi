@@ -1,4 +1,5 @@
 use std::{
+    borrow::Borrow,
     collections::{BTreeMap, HashMap, HashSet},
     ffi::OsString,
     fs::Metadata,
@@ -9,6 +10,7 @@ use std::{
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
 
 use crate::{
+    bin_codec,
     lang::{Language, LineStats},
     models::SymbolInfo,
 };
@@ -22,8 +24,14 @@ use crate::{
 // rewriting every cached file in the repo.
 // v4 split line_count into line_total / line_blank / line_comment so `langs`
 // can break out cloc-style code/comment/blank columns.
-const CACHE_VERSION_KEY: &str = concat!("v4-", env!("CARGO_PKG_VERSION"));
-const CACHE_FILE_NAME: &str = "index.v4.sqlite";
+// v5 added two tables (search_sparse, search_dense) so the ranked-search
+// index lives in the same SQLite file as the parse cache; a v4 file is
+// still readable but the new tables are missing, so we bump to invalidate.
+// v6 switches to bincode 2's standard config and makes parser metadata
+// tree-sitter-language-pack driven, so old symbol blobs are intentionally
+// unreadable.
+const CACHE_VERSION_KEY: &str = concat!("v6-", env!("CARGO_PKG_VERSION"));
+const CACHE_FILE_NAME: &str = "index.v6.sqlite";
 
 #[derive(Clone)]
 struct FileEntry {
@@ -140,8 +148,9 @@ impl ParseCache {
         &mut self,
         rel_path: &str,
         metadata: &Metadata,
-        language: Language,
+        language: impl Borrow<Language>,
     ) -> Option<Vec<SymbolInfo>> {
+        let language = language.borrow();
         let entry = self.lookup_entry(rel_path, metadata, language)?;
         if !entry.parsed_for_symbols {
             return None;
@@ -157,8 +166,9 @@ impl ParseCache {
         &mut self,
         rel_path: &str,
         metadata: &Metadata,
-        language: Language,
+        language: impl Borrow<Language>,
     ) -> Option<LineStats> {
+        let language = language.borrow();
         let entry = self.lookup_entry(rel_path, metadata, language)?;
         entry.line_stats
     }
@@ -167,7 +177,7 @@ impl ParseCache {
         &mut self,
         rel_path: &str,
         metadata: &Metadata,
-        language: Language,
+        language: &Language,
     ) -> Option<FileEntry> {
         if !self.enabled {
             return None;
@@ -353,6 +363,207 @@ impl ParseCache {
     /// Returns None when no cache root could be resolved (e.g. no $HOME).
     pub fn cache_dir_for(repo_root: &Path) -> Option<PathBuf> {
         resolve_cache_dir(&repo_root.to_string_lossy())
+    }
+
+    /// Look up the persisted sparse-index payload for this repo. Returns
+    /// `None` when the cache is disabled, the file is missing, or the row
+    /// hasn't been written yet. Bytes are bincoded by the caller; this
+    /// layer doesn't care about the encoding.
+    pub fn lookup_search_sparse(&mut self) -> Option<SearchSparseRow> {
+        if !self.enabled {
+            return None;
+        }
+        let conn = self.ensure_read_conn()?;
+        conn.query_row(
+            "SELECT bm25_blob, signatures_blob, chunks_blob, file_mapping_blob,
+                    language_mapping_blob, built_at_unix_secs
+             FROM search_sparse WHERE rowid = 1",
+            [],
+            |row| {
+                Ok(SearchSparseRow {
+                    bm25_blob: row.get(0)?,
+                    signatures_blob: row.get(1)?,
+                    chunks_blob: row.get(2)?,
+                    file_mapping_blob: row.get(3)?,
+                    language_mapping_blob: row.get(4)?,
+                    built_at_unix_secs: row.get(5)?,
+                })
+            },
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    /// Look up the persisted dense-index payload for this repo. Returns
+    /// `None` for the same reasons as `lookup_search_sparse`.
+    pub fn lookup_search_dense(&mut self) -> Option<SearchDenseRow> {
+        if !self.enabled {
+            return None;
+        }
+        let conn = self.ensure_read_conn()?;
+        conn.query_row(
+            "SELECT encoder_kind, model_id, model_fingerprint, dim, vectors_blob,
+                    built_at_unix_secs
+             FROM search_dense WHERE rowid = 1",
+            [],
+            |row| {
+                Ok(SearchDenseRow {
+                    encoder_kind: row.get(0)?,
+                    model_id: row.get(1)?,
+                    model_fingerprint: row.get(2)?,
+                    dim: row.get::<_, i64>(3)? as usize,
+                    vectors_blob: row.get(4)?,
+                    built_at_unix_secs: row.get(5)?,
+                })
+            },
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    /// Write the sparse-index payload (overwrites any existing row). Errors
+    /// are silent ~ a failed search-index write should never break the parse
+    /// cache; the next search just rebuilds.
+    pub fn store_search_sparse(&mut self, row: &SearchSparseRow) {
+        if !self.enabled {
+            return;
+        }
+        let Some(conn) = self.ensure_write_conn() else {
+            return;
+        };
+        let _ = conn.execute(
+            "INSERT INTO search_sparse (
+                rowid, bm25_blob, signatures_blob, chunks_blob,
+                file_mapping_blob, language_mapping_blob, built_at_unix_secs
+             ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(rowid) DO UPDATE SET
+                bm25_blob = excluded.bm25_blob,
+                signatures_blob = excluded.signatures_blob,
+                chunks_blob = excluded.chunks_blob,
+                file_mapping_blob = excluded.file_mapping_blob,
+                language_mapping_blob = excluded.language_mapping_blob,
+                built_at_unix_secs = excluded.built_at_unix_secs",
+            params![
+                row.bm25_blob,
+                row.signatures_blob,
+                row.chunks_blob,
+                row.file_mapping_blob,
+                row.language_mapping_blob,
+                row.built_at_unix_secs,
+            ],
+        );
+    }
+
+    /// Write the dense-index payload (overwrites any existing row). Same
+    /// silent-on-error policy as `store_search_sparse`.
+    pub fn store_search_dense(&mut self, row: &SearchDenseRow) {
+        if !self.enabled {
+            return;
+        }
+        let Some(conn) = self.ensure_write_conn() else {
+            return;
+        };
+        let _ = conn.execute(
+            "INSERT INTO search_dense (
+                rowid, encoder_kind, model_id, model_fingerprint, dim,
+                vectors_blob, built_at_unix_secs
+             ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(rowid) DO UPDATE SET
+                encoder_kind = excluded.encoder_kind,
+                model_id = excluded.model_id,
+                model_fingerprint = excluded.model_fingerprint,
+                dim = excluded.dim,
+                vectors_blob = excluded.vectors_blob,
+                built_at_unix_secs = excluded.built_at_unix_secs",
+            params![
+                row.encoder_kind,
+                row.model_id,
+                row.model_fingerprint,
+                row.dim as i64,
+                row.vectors_blob,
+                row.built_at_unix_secs,
+            ],
+        );
+    }
+
+    /// Drop just the search-index rows (sparse + dense). Parse cache rows in
+    /// `files` are left intact. Used by `hitagi index clean`.
+    pub fn clear_search_index(&mut self) -> std::io::Result<bool> {
+        if !self.enabled {
+            return Ok(false);
+        }
+        let Some(conn) = self.ensure_write_conn() else {
+            return Ok(false);
+        };
+        let cleared_sparse = conn.execute("DELETE FROM search_sparse", []).unwrap_or(0);
+        let cleared_dense = conn.execute("DELETE FROM search_dense", []).unwrap_or(0);
+        Ok(cleared_sparse + cleared_dense > 0)
+    }
+
+    /// Inspect the on-disk presence of the search-index rows without
+    /// touching the parse cache. Returns `None` when the cache file doesn't
+    /// exist or can't be opened.
+    pub fn inspect_search_index(repo_root: &Path) -> SearchIndexInspection {
+        let repo_root_str = repo_root.to_string_lossy().into_owned();
+        let cache_dir = resolve_cache_dir(&repo_root_str);
+        let cache_file = cache_dir.as_ref().map(|d| d.join(CACHE_FILE_NAME));
+        let mut inspection = SearchIndexInspection::default();
+        let Some(file) = cache_file else {
+            return inspection;
+        };
+        if !file.exists() {
+            return inspection;
+        }
+        let Ok(conn) = Connection::open_with_flags(&file, OpenFlags::SQLITE_OPEN_READ_ONLY) else {
+            return inspection;
+        };
+        if let Ok(meta) = conn.query_row(
+            "SELECT chunks_blob, file_mapping_blob, language_mapping_blob,
+                    built_at_unix_secs
+             FROM search_sparse WHERE rowid = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        ) {
+            inspection.sparse_present = true;
+            inspection.sparse_chunks_bytes = meta.0.len();
+            inspection.sparse_file_mapping_bytes = meta.1.len();
+            inspection.sparse_language_mapping_bytes = meta.2.len();
+            inspection.sparse_built_at_unix_secs = Some(meta.3);
+        }
+        if let Ok(meta) = conn.query_row(
+            "SELECT encoder_kind, model_id, model_fingerprint, dim,
+                    LENGTH(vectors_blob), built_at_unix_secs
+             FROM search_dense WHERE rowid = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)? as usize,
+                    row.get::<_, i64>(4)? as usize,
+                    row.get::<_, i64>(5)?,
+                ))
+            },
+        ) {
+            inspection.dense_present = true;
+            inspection.dense_encoder_kind = Some(meta.0);
+            inspection.dense_model_id = Some(meta.1);
+            inspection.dense_model_fingerprint = Some(meta.2);
+            inspection.dense_dim = Some(meta.3);
+            inspection.dense_vectors_bytes = meta.4;
+            inspection.dense_built_at_unix_secs = Some(meta.5);
+        }
+        inspection
     }
 
     /// Read everything we know about `repo_root`'s on-disk cache without
@@ -565,6 +776,62 @@ pub struct CacheClearAllOutcome {
     pub repos_removed: usize,
 }
 
+/// One persisted sparse-search payload. The blobs are opaque ~ this layer
+/// just round-trips bytes between SQLite and the search module. Encoding is
+/// the search module's concern (currently bincode).
+#[derive(Debug, Clone)]
+pub struct SearchSparseRow {
+    pub bm25_blob: Vec<u8>,
+    /// Snapshot of every walked file's (rel_path, len, mtime) at index time.
+    /// Compared against a fresh walk to decide "rebuild vs reuse."
+    pub signatures_blob: Vec<u8>,
+    /// Bincoded `Vec<IndexedChunk>` in chunk-id order. Both BM25 and dense
+    /// rows reference into the same chunk vector by index, so it lives on
+    /// the sparse row (always built; dense is optional).
+    pub chunks_blob: Vec<u8>,
+    /// Bincoded `BTreeMap<String, Vec<usize>>` (file path -> chunk ids). Used
+    /// by selectors and `find-related`.
+    pub file_mapping_blob: Vec<u8>,
+    /// Bincoded `BTreeMap<String, Vec<usize>>` (language label -> chunk ids).
+    /// Used by language filters.
+    pub language_mapping_blob: Vec<u8>,
+    pub built_at_unix_secs: i64,
+}
+
+/// One persisted dense-search payload. Independent of `SearchSparseRow` so
+/// a model swap rebuilds dense without touching sparse.
+#[derive(Debug, Clone)]
+pub struct SearchDenseRow {
+    /// "model2vec" or "hashing".
+    pub encoder_kind: String,
+    /// HF model id or local path (stable identifier).
+    pub model_id: String,
+    /// Hash of model files; mismatch invalidates the row.
+    pub model_fingerprint: String,
+    pub dim: usize,
+    /// Bincoded normalized `Array2<f32>` in chunk-id-aligned row order.
+    pub vectors_blob: Vec<u8>,
+    pub built_at_unix_secs: i64,
+}
+
+/// Read-only inspection of the search-index portion of the cache. Used by
+/// `hitagi index status` to report what's persisted without forcing a load.
+#[derive(Debug, Clone, Default)]
+pub struct SearchIndexInspection {
+    pub sparse_present: bool,
+    pub sparse_chunks_bytes: usize,
+    pub sparse_file_mapping_bytes: usize,
+    pub sparse_language_mapping_bytes: usize,
+    pub sparse_built_at_unix_secs: Option<i64>,
+    pub dense_present: bool,
+    pub dense_encoder_kind: Option<String>,
+    pub dense_model_id: Option<String>,
+    pub dense_model_fingerprint: Option<String>,
+    pub dense_dim: Option<usize>,
+    pub dense_vectors_bytes: usize,
+    pub dense_built_at_unix_secs: Option<i64>,
+}
+
 fn env_disabled() -> bool {
     matches!(std::env::var_os("HITAGI_NO_CACHE"), Some(value) if !value.is_empty() && value != "0")
 }
@@ -578,7 +845,7 @@ fn valid_cache_root(value: OsString) -> Option<PathBuf> {
     }
 }
 
-fn cache_root() -> Option<PathBuf> {
+pub(crate) fn cache_root() -> Option<PathBuf> {
     if let Some(custom) = std::env::var_os("HITAGI_CACHE_DIR") {
         return valid_cache_root(custom);
     }
@@ -612,6 +879,24 @@ fn init_db(conn: &Connection, repo_root: &str) -> rusqlite::Result<()> {
             parsed_for_symbols INTEGER NOT NULL,
             symbols_blob BLOB NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS search_sparse (
+            rowid INTEGER PRIMARY KEY CHECK (rowid = 1),
+            bm25_blob BLOB NOT NULL,
+            signatures_blob BLOB NOT NULL,
+            chunks_blob BLOB NOT NULL,
+            file_mapping_blob BLOB NOT NULL,
+            language_mapping_blob BLOB NOT NULL,
+            built_at_unix_secs INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS search_dense (
+            rowid INTEGER PRIMARY KEY CHECK (rowid = 1),
+            encoder_kind TEXT NOT NULL,
+            model_id TEXT NOT NULL,
+            model_fingerprint TEXT NOT NULL,
+            dim INTEGER NOT NULL,
+            vectors_blob BLOB NOT NULL,
+            built_at_unix_secs INTEGER NOT NULL
+        );
         ",
     )?;
     conn.execute(
@@ -630,7 +915,7 @@ fn validate_db(conn: &Connection, repo_root: &str) -> bool {
     let stored_repo_root = meta_value(conn, "repo_root").ok().flatten();
     version.as_deref() == Some(CACHE_VERSION_KEY)
         && stored_repo_root.as_deref() == Some(repo_root)
-        && files_table_is_readable(conn)
+        && tables_are_readable(conn)
 }
 
 fn meta_value(conn: &Connection, key: &str) -> rusqlite::Result<Option<String>> {
@@ -642,13 +927,27 @@ fn meta_value(conn: &Connection, key: &str) -> rusqlite::Result<Option<String>> 
     .optional()
 }
 
-fn files_table_is_readable(conn: &Connection) -> bool {
+fn tables_are_readable(conn: &Connection) -> bool {
     conn.prepare(
         "SELECT rel_path, mtime_secs, mtime_nanos, size, language,
                 line_total, line_blank, line_comment, parsed_for_symbols, symbols_blob
          FROM files LIMIT 0",
     )
     .is_ok()
+        && conn
+            .prepare(
+                "SELECT bm25_blob, signatures_blob, chunks_blob, file_mapping_blob,
+                        language_mapping_blob, built_at_unix_secs
+                 FROM search_sparse LIMIT 0",
+            )
+            .is_ok()
+        && conn
+            .prepare(
+                "SELECT encoder_kind, model_id, model_fingerprint, dim,
+                        vectors_blob, built_at_unix_secs
+                 FROM search_dense LIMIT 0",
+            )
+            .is_ok()
 }
 
 struct RawEntry {
@@ -686,7 +985,7 @@ fn read_raw_entry(row: &rusqlite::Row) -> rusqlite::Result<RawEntry> {
 fn decode_entry(raw: RawEntry) -> Option<(String, FileEntry)> {
     let parsed_for_symbols = raw.parsed_for_symbols != 0;
     let symbols = if parsed_for_symbols {
-        bincode::deserialize(&raw.symbols_blob).ok()?
+        bin_codec::decode(&raw.symbols_blob).ok()?
     } else {
         Vec::new()
     };
@@ -736,8 +1035,9 @@ fn write_entries(
 
 fn upsert_entry(tx: &Transaction<'_>, rel_path: &str, entry: &FileEntry) -> rusqlite::Result<()> {
     let symbols_blob = if entry.parsed_for_symbols {
-        bincode::serialize(&entry.symbols)
-            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+        bin_codec::encode(&entry.symbols).map_err(|e| {
+            rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(e)))
+        })?
     } else {
         Vec::new()
     };
@@ -798,36 +1098,18 @@ fn prune_entries(tx: &Transaction<'_>, seen: &HashSet<String>) -> rusqlite::Resu
     Ok(())
 }
 
-fn entry_matches(entry: &FileEntry, metadata: &Metadata, language: Language) -> bool {
+fn entry_matches(entry: &FileEntry, metadata: &Metadata, language: &Language) -> bool {
     let Some((secs, nanos)) = mtime_parts(metadata) else {
         return false;
     };
     entry.mtime_secs == secs
         && entry.mtime_nanos == nanos
         && entry.size == metadata.len()
-        && entry.language == language
+        && &entry.language == language
 }
 
 fn language_from_str(value: &str) -> Option<Language> {
-    match value {
-        "rust" => Some(Language::Rust),
-        "typescript" => Some(Language::TypeScript),
-        "tsx" => Some(Language::Tsx),
-        "python" => Some(Language::Python),
-        "kotlin" => Some(Language::Kotlin),
-        "prisma" => Some(Language::Prisma),
-        "json" => Some(Language::Json),
-        "yaml" => Some(Language::Yaml),
-        "toml" => Some(Language::Toml),
-        "markdown" => Some(Language::Markdown),
-        "sql" => Some(Language::Sql),
-        "html" => Some(Language::Html),
-        "css" => Some(Language::Css),
-        "shell" => Some(Language::Shell),
-        "dockerfile" => Some(Language::Dockerfile),
-        "plaintext" => Some(Language::Plaintext),
-        _ => None,
-    }
+    (!value.is_empty()).then(|| Language::new(value))
 }
 
 fn mtime_parts(metadata: &Metadata) -> Option<(i64, u32)> {
@@ -961,6 +1243,18 @@ mod tests {
         }]
     }
 
+    fn rust() -> Language {
+        Language::new("rust")
+    }
+
+    fn typescript() -> Language {
+        Language::new("typescript")
+    }
+
+    fn tsx() -> Language {
+        Language::new("tsx")
+    }
+
     fn write_file(repo_root: &Path, rel: &str, body: &str) -> Metadata {
         let path = repo_root.join(rel);
         if let Some(parent) = path.parent() {
@@ -997,7 +1291,7 @@ mod tests {
             cache.insert(
                 "a.rs".to_string(),
                 &metadata,
-                Language::Rust,
+                rust(),
                 None,
                 sample_symbols(),
             );
@@ -1006,7 +1300,7 @@ mod tests {
 
         let mut cache = tmp.open();
         let symbols = cache
-            .lookup("a.rs", &metadata, Language::Rust)
+            .lookup("a.rs", &metadata, rust())
             .expect("should hit after roundtrip");
         assert_eq!(symbols, sample_symbols());
     }
@@ -1020,13 +1314,13 @@ mod tests {
         cache.insert(
             "a.rs".to_string(),
             &metadata,
-            Language::Rust,
+            rust(),
             None,
             sample_symbols(),
         );
 
         let bigger = write_file(&tmp.repo_root, "a.rs", "fn foo() { 1 + 1; }");
-        assert!(cache.lookup("a.rs", &bigger, Language::Rust).is_none());
+        assert!(cache.lookup("a.rs", &bigger, rust()).is_none());
     }
 
     #[test]
@@ -1038,12 +1332,12 @@ mod tests {
         cache.insert(
             "a.ts".to_string(),
             &metadata,
-            Language::TypeScript,
+            typescript(),
             None,
             sample_symbols(),
         );
         // Same path, same metadata, different language => miss (covers .ts -> .tsx).
-        assert!(cache.lookup("a.ts", &metadata, Language::Tsx).is_none());
+        assert!(cache.lookup("a.ts", &metadata, tsx()).is_none());
     }
 
     #[test]
@@ -1056,7 +1350,7 @@ mod tests {
             cache.insert(
                 "a.rs".to_string(),
                 &metadata,
-                Language::Rust,
+                rust(),
                 None,
                 sample_symbols(),
             );
@@ -1066,7 +1360,7 @@ mod tests {
         update_meta(&tmp.cache_file(), "version", "v3-9999.9.9");
 
         let mut cache = tmp.open();
-        assert!(cache.lookup("a.rs", &metadata, Language::Rust).is_none());
+        assert!(cache.lookup("a.rs", &metadata, rust()).is_none());
     }
 
     #[test]
@@ -1079,7 +1373,7 @@ mod tests {
             cache.insert(
                 "a.rs".to_string(),
                 &metadata,
-                Language::Rust,
+                rust(),
                 None,
                 sample_symbols(),
             );
@@ -1089,7 +1383,7 @@ mod tests {
         update_meta(&tmp.cache_file(), "repo_root", "/some/other/path");
 
         let mut cache = tmp.open();
-        assert!(cache.lookup("a.rs", &metadata, Language::Rust).is_none());
+        assert!(cache.lookup("a.rs", &metadata, rust()).is_none());
     }
 
     #[test]
@@ -1102,7 +1396,7 @@ mod tests {
             cache.insert(
                 "a.rs".to_string(),
                 &metadata,
-                Language::Rust,
+                rust(),
                 None,
                 sample_symbols(),
             );
@@ -1112,11 +1406,11 @@ mod tests {
         break_files_table(&tmp.cache_file(), None);
 
         let mut cache = tmp.open();
-        assert!(cache.lookup("a.rs", &metadata, Language::Rust).is_none());
+        assert!(cache.lookup("a.rs", &metadata, rust()).is_none());
         cache.insert(
             "a.rs".to_string(),
             &metadata,
-            Language::Rust,
+            rust(),
             None,
             sample_symbols(),
         );
@@ -1124,7 +1418,7 @@ mod tests {
 
         let mut cache = tmp.open();
         assert_eq!(
-            cache.lookup("a.rs", &metadata, Language::Rust),
+            cache.lookup("a.rs", &metadata, rust()),
             Some(sample_symbols())
         );
     }
@@ -1139,7 +1433,7 @@ mod tests {
             cache.insert(
                 "a.rs".to_string(),
                 &metadata,
-                Language::Rust,
+                rust(),
                 None,
                 sample_symbols(),
             );
@@ -1152,11 +1446,11 @@ mod tests {
         );
 
         let mut cache = tmp.open();
-        assert!(cache.lookup("a.rs", &metadata, Language::Rust).is_none());
+        assert!(cache.lookup("a.rs", &metadata, rust()).is_none());
         cache.insert(
             "a.rs".to_string(),
             &metadata,
-            Language::Rust,
+            rust(),
             None,
             sample_symbols(),
         );
@@ -1164,7 +1458,7 @@ mod tests {
 
         let mut cache = tmp.open();
         assert_eq!(
-            cache.lookup("a.rs", &metadata, Language::Rust),
+            cache.lookup("a.rs", &metadata, rust()),
             Some(sample_symbols())
         );
     }
@@ -1177,31 +1471,19 @@ mod tests {
 
         {
             let mut cache = tmp.open();
-            cache.insert(
-                "a.rs".to_string(),
-                &m_a,
-                Language::Rust,
-                None,
-                sample_symbols(),
-            );
-            cache.insert(
-                "b.rs".to_string(),
-                &m_b,
-                Language::Rust,
-                None,
-                sample_symbols(),
-            );
+            cache.insert("a.rs".to_string(), &m_a, rust(), None, sample_symbols());
+            cache.insert("b.rs".to_string(), &m_b, rust(), None, sample_symbols());
             cache.save(false);
         }
 
         let mut cache = tmp.open();
         // Only touch a.rs this run.
-        let _ = cache.lookup("a.rs", &m_a, Language::Rust);
+        let _ = cache.lookup("a.rs", &m_a, rust());
         cache.save(true);
 
         let mut cache = tmp.open();
-        assert!(cache.lookup("a.rs", &m_a, Language::Rust).is_some());
-        assert!(cache.lookup("b.rs", &m_b, Language::Rust).is_none());
+        assert!(cache.lookup("a.rs", &m_a, rust()).is_some());
+        assert!(cache.lookup("b.rs", &m_b, rust()).is_none());
     }
 
     #[test]
@@ -1212,29 +1494,17 @@ mod tests {
 
         {
             let mut cache = tmp.open();
-            cache.insert(
-                "a.rs".to_string(),
-                &m_a,
-                Language::Rust,
-                None,
-                sample_symbols(),
-            );
-            cache.insert(
-                "b.rs".to_string(),
-                &m_b,
-                Language::Rust,
-                None,
-                sample_symbols(),
-            );
+            cache.insert("a.rs".to_string(), &m_a, rust(), None, sample_symbols());
+            cache.insert("b.rs".to_string(), &m_b, rust(), None, sample_symbols());
             cache.save(false);
         }
 
         let mut cache = tmp.open();
-        let _ = cache.lookup("a.rs", &m_a, Language::Rust);
+        let _ = cache.lookup("a.rs", &m_a, rust());
         cache.save(false);
 
         let mut cache = tmp.open();
-        assert!(cache.lookup("b.rs", &m_b, Language::Rust).is_some());
+        assert!(cache.lookup("b.rs", &m_b, rust()).is_some());
     }
 
     #[test]
@@ -1247,7 +1517,7 @@ mod tests {
             cache.insert(
                 "a.rs".to_string(),
                 &metadata,
-                Language::Rust,
+                rust(),
                 None,
                 sample_symbols(),
             );
@@ -1257,7 +1527,7 @@ mod tests {
         let before = fs::metadata(tmp.cache_file()).unwrap().modified().unwrap();
         std::thread::sleep(Duration::from_millis(1100));
         let mut cache = tmp.open();
-        assert!(cache.lookup("a.rs", &metadata, Language::Rust).is_some());
+        assert!(cache.lookup("a.rs", &metadata, rust()).is_some());
         cache.save(false);
         let after = fs::metadata(tmp.cache_file()).unwrap().modified().unwrap();
         assert_eq!(before, after, "warm hit + save(false) must not rewrite DB");
@@ -1272,11 +1542,11 @@ mod tests {
         cache.insert(
             "a.rs".to_string(),
             &metadata,
-            Language::Rust,
+            rust(),
             None,
             sample_symbols(),
         );
-        assert!(cache.lookup("a.rs", &metadata, Language::Rust).is_none());
+        assert!(cache.lookup("a.rs", &metadata, rust()).is_none());
         cache.save(false);
 
         assert!(
@@ -1287,7 +1557,11 @@ mod tests {
     }
 
     fn ls(total: u32, blank: u32, comment: u32) -> LineStats {
-        LineStats { total, blank, comment }
+        LineStats {
+            total,
+            blank,
+            comment,
+        }
     }
 
     #[test]
@@ -1300,7 +1574,7 @@ mod tests {
             cache.insert(
                 "a.rs".to_string(),
                 &metadata,
-                Language::Rust,
+                rust(),
                 Some(ls(2, 0, 0)),
                 sample_symbols(),
             );
@@ -1309,7 +1583,7 @@ mod tests {
 
         let mut cache = tmp.open();
         assert_eq!(
-            cache.lookup_line_stats("a.rs", &metadata, Language::Rust),
+            cache.lookup_line_stats("a.rs", &metadata, rust()),
             Some(ls(2, 0, 0))
         );
     }
@@ -1323,16 +1597,13 @@ mod tests {
         cache.insert(
             "a.rs".to_string(),
             &metadata,
-            Language::Rust,
+            rust(),
             Some(ls(1, 0, 0)),
             sample_symbols(),
         );
 
         let bigger = write_file(&tmp.repo_root, "a.rs", "fn foo() {}\nfn bar() {}\n");
-        assert_eq!(
-            cache.lookup_line_stats("a.rs", &bigger, Language::Rust),
-            None
-        );
+        assert_eq!(cache.lookup_line_stats("a.rs", &bigger, rust()), None);
     }
 
     #[test]
@@ -1344,15 +1615,15 @@ mod tests {
         let metadata = write_file(&tmp.repo_root, "a.rs", "fn foo() {}\n");
 
         let mut cache = tmp.open();
-        cache.insert_lang_only("a.rs".to_string(), &metadata, Language::Rust, ls(1, 0, 0));
+        cache.insert_lang_only("a.rs".to_string(), &metadata, rust(), ls(1, 0, 0));
 
         assert_eq!(
-            cache.lookup_line_stats("a.rs", &metadata, Language::Rust),
+            cache.lookup_line_stats("a.rs", &metadata, rust()),
             Some(ls(1, 0, 0)),
             "lang-only stamp serves line counts"
         );
         assert!(
-            cache.lookup("a.rs", &metadata, Language::Rust).is_none(),
+            cache.lookup("a.rs", &metadata, rust()).is_none(),
             "lang-only stamp must NOT satisfy symbol lookup"
         );
 
@@ -1360,16 +1631,16 @@ mod tests {
         cache.insert(
             "a.rs".to_string(),
             &metadata,
-            Language::Rust,
+            rust(),
             Some(ls(1, 0, 0)),
             sample_symbols(),
         );
         assert_eq!(
-            cache.lookup_line_stats("a.rs", &metadata, Language::Rust),
+            cache.lookup_line_stats("a.rs", &metadata, rust()),
             Some(ls(1, 0, 0))
         );
         assert_eq!(
-            cache.lookup("a.rs", &metadata, Language::Rust),
+            cache.lookup("a.rs", &metadata, rust()),
             Some(sample_symbols())
         );
     }
@@ -1385,15 +1656,12 @@ mod tests {
         cache.insert(
             "a.rs".to_string(),
             &metadata,
-            Language::Rust,
+            rust(),
             None,
             sample_symbols(),
         );
 
-        assert_eq!(
-            cache.lookup_line_stats("a.rs", &metadata, Language::Rust),
-            None
-        );
+        assert_eq!(cache.lookup_line_stats("a.rs", &metadata, rust()), None);
     }
 
     #[test]

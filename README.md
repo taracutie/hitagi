@@ -11,47 +11,30 @@
 ---
 
 `hitagi` is a cli tool that allows coding agents (or humans) to efficiently query information about your codebase.
-it's meant for my own personal use so for now it only supports the languages I actively use :p
+Tree-sitter language support comes from `tree-sitter-language-pack`; no grammars are vendored in this repo.
 
 Commands:
 
 - `outline <PATH>` ~ list every symbol in a file with kind, qualname, and line range.
 - `symbol <PATH> <QUALNAME>` ~ read one symbol's source by qualname (or unique leaf name).
-- `search <QUERY> [PATHS...]` ~ substring search; results group around the enclosing symbol scope and report the actual match line.
+- `search <QUERY> [PATHS...]` ~ ranked hybrid search (BM25 + Model2Vec semantic, RRF-fused chunks).
+- `find-related <FILE> <LINE>` ~ semantically related chunks to one you're already looking at.
 - `read <PATH>` ~ dump a file, a line slice with `--lines S-E`, or metadata-only structure with `--summary`.
 - `find <QUERY> [PATHS...]` ~ locate symbols across the repo by qualname substring (case-insensitive).
 - `files [GLOBS...]` ~ list files in the repo (gitignore-aware), optionally filtered by globs.
 - `langs` ~ summarise languages present in the repo (file count + line count per language).
 - `diff [PATHS...]` ~ review uncommitted changes; overview by default, `--commit`/`--summary` for compact review, `--paths` for staging lists, structured hunks when file paths are given.
 - `cache [status|path|clear]` ~ inspect or manage the on-disk parse cache.
+- `index [status|build|clean]` ~ inspect or manage the search index (lives in the same SQLite file as the parse cache; `clean` drops just the search rows).
 - `install <claude|codex>` / `uninstall <claude|codex>` ~ add or remove hitagi's user-global agent prompt.
 
-When a `find`/`search` walk has no positional [PATHS], it visits top-level subdirs round-robin so a `--limit` truncation produces a fair sample across the repo. Pass [PATHS] to opt out and walk in user-supplied order.
+When a `find` walk has no positional [PATHS], it visits top-level subdirs round-robin so a `--limit` truncation produces a fair sample across the repo. `search` always indexes the whole repo (positional [PATHS] is a post-rank filter).
 
-Supported languages:
+Supported languages are pack-driven:
 
-**Parseable** (full `outline` / `symbol` / `find` support):
-
-- Rust ~ `.rs` (functions, structs, enums + variants, traits, mod blocks, impl methods)
-- TypeScript ~ `.ts` (classes, interfaces + properties + methods, type aliases, functions, fields)
-- TSX ~ `.tsx` (same as TypeScript)
-- Python ~ `.py`
-- Kotlin ~ `.kt`, `.kts`
-- Prisma ~ `.prisma`
-
-**Recognised** (named in `langs`, plaintext-search-able, but no symbol info):
-
-- JSON ~ `.json`, `.jsonc`, `.json5`
-- YAML ~ `.yaml`, `.yml`
-- TOML ~ `.toml`
-- Markdown ~ `.md`, `.markdown`, `.mdx`
-- SQL ~ `.sql`
-- HTML ~ `.html`, `.htm`
-- CSS ~ `.css`, `.scss`, `.sass`, `.less`
-- Shell ~ `.sh`, `.bash`, `.zsh`, `.fish`
-- Dockerfile ~ filename match (`Dockerfile` / `Containerfile`)
-
-Truly unknown extensions get bucketed as `plaintext` ~ still searchable, just unlabelled.
+- Files detected by `tree-sitter-language-pack` are parseable and can support `outline`, `symbol`, `find`, syntax-aware `search` chunks, and `diff` symbol annotations.
+- `Dockerfile` / `Containerfile` and `Makefile` get explicit filename labels in addition to the pack's path detector.
+- Unknown or unsupported files are still available to `read`, `files`, and `langs`, but they are treated as `plaintext` and are not syntax-indexed by `search`.
 
 ## Install
 
@@ -111,7 +94,7 @@ Bodyless `mod foo;` declarations are intentionally omitted (they're imports, not
 Flags:
 
 - `--bytes` ~ also include `bytes: [start, end]` byte offsets per symbol (off by default; agents almost never need them).
-- `--kind K1,K2,...` ~ keep only symbols of these kinds. Comma-separated, case-insensitive. Common kinds: `function`, `method`, `struct`, `enum`, `variant`, `class`, `interface`, `property`, `trait`, `module`, `model`, `field`. Aliases: `callable` (`function`, `method`, `arrow_function`), `container` (`class`, `struct`, `interface`, `enum`, `trait`, `object`), `value` (`property`, `field`, `variant`). When no symbol matches, the response includes `available_kinds: [...]` listing what the file actually contains.
+- `--kind K1,K2,...` ~ keep only symbols of these kinds. Comma-separated, case-insensitive. Common kinds: `function`, `method`, `struct`, `enum`, `variant`, `class`, `interface`, `property`, `trait`, `module`, `model`, `field`, `constant`, `variable`. Aliases: `callable` (`function`, `method`, `arrow_function`), `container` (`class`, `struct`, `interface`, `enum`, `trait`, `object`), `value` (`property`, `field`, `variant`, `variable`, `constant`). When no symbol matches, the response includes `available_kinds: [...]` listing what the file actually contains.
 - `--depth N` ~ limit nesting depth: `--depth 1` keeps top-level symbols only, `--depth 2` adds one nested level (e.g. methods inside a class, variants inside an enum). Counted by dots in the qualname. Useful for orientation on big files.
 
 ### `symbol <PATH> <QUALNAME>`
@@ -127,36 +110,64 @@ Flags: `--bytes` (same as outline).
 ### `search <QUERY> [PATHS...]`
 
 ```bash
-hitagi search "tree_sitter::Parser" --snippet
+hitagi search "where does cache invalidation happen"
 ```
 
 ```text
-search "tree_sitter::Parser"
-1 matches
-src/parser.rs
-  • parse_source(function) @L16 :: let mut parser = tree_sitter::Parser::new();
+search "where does cache invalidation happen" • hybrid α=0.65 • 5 hits / 517 chunks in 57 files • 11ms
+src/commands.rs:2825-2876   0.0163  hybrid  rust
+src/cache.rs:1203-1714      0.0159  hybrid  rust
+src/cli.rs:636-663          0.0154  hybrid  rust
+README.md:361-410           0.0151  hybrid  markdown
+src/repo.rs:1-39            0.0125  hybrid  rust
 ```
 
-Each entry follows the format `<scope>(<kind>) @L<match_line>` for matches inside a parsed symbol, or just `@L<match_line>` for matches outside any scope (top-of-file imports, comments, plaintext files). Pass `--snippet` to append the matched line.
+Default mode is **hybrid**: BM25 (lexical) and Model2Vec (semantic) over chunked source, fused with reciprocal rank, with a few generic boosts (symbol-definition match, multi-chunk file rollup, test/compat path penalty).
 
-When a parseable file produces both a scoped match (inside a symbol) and an unscoped match (e.g. an import line) for the same query, the unscoped one is dropped by default to keep `--limit` budget focused on usage sites. Pass `--include-unscoped` to keep both. Plaintext files (no symbol info) are unaffected ~ the suppression rule only fires when at least one scoped match exists.
+- `--mode bm25` ~ exact-token / lexical only. No model needed; instant.
+- `--mode semantic` ~ embedding-only ranking. Conceptual queries; needs the model.
+- `--mode hybrid` ~ default. The auto-tuner picks an alpha based on the query shape (symbol → 0.25, NLQ → 0.65, mixed → 0.45, else 0.55); `--alpha F` overrides.
 
-Combine alternatives with ` OR ` ~ literal text, surrounded by spaces. `"foo OR bar"` searches for both terms; `"fooORbar"` is a literal substring.
-
-Pass extra positional paths to scope the search:
-
-```bash
-hitagi search validateInput src tests
-```
+First call on a repo builds the index ~ a few hundred ms for ~1k files for BM25, plus the embedding pass for hybrid/semantic. Warm calls are ~100 ms. The index lives alongside the parse cache in the same SQLite file (see `index status` / `index clean`).
 
 Flags:
 
-- `--limit N` ~ maximum total matches to return (default `50`). Response includes `"truncated": true` when the cap is hit.
-- `--snippet` ~ append the matched line as ` :: <line text>` (truncated at 100 chars).
-- `--exclude PATTERN` (repeatable) ~ skip files matching the pattern. Bare names like `--exclude vendor` skip that directory at any depth; full globs like `--exclude "vendor/**"` work too.
-- `--include-unscoped` ~ keep matches that fall outside any parsed symbol scope when the same file also has scoped matches. Off by default.
+- `-k N` / `--limit N` ~ maximum ranked chunks (default `10`).
+- `-m MODE` / `--mode MODE` ~ `hybrid` (default), `bm25`, or `semantic`.
+- `--language LANG` (repeatable) ~ restrict to chunks of this language label (`rust`, `go`, ...).
+- `--exclude PATTERN` (repeatable) ~ skip files matching the pattern. Bare names like `--exclude vendor` skip that directory at any depth.
+- `--alpha F` ~ override the auto-tuned semantic weight (0.0=pure BM25, 1.0=pure semantic).
+- `--snippet` ~ append the chunk's first non-blank line as ` :: <line>`.
+- `--hashing` ~ use a deterministic hashing encoder instead of Model2Vec. No network, no model file, lower retrieval quality. Useful in CI or when the model isn't available.
+- `--no-download` ~ don't download the model if it's missing; use the cached copy or auto-fall back to `--hashing` with a warning.
+- `--offline` ~ refuse all network access. Same hashing fallback as `--no-download`.
+- `--model PATH_OR_HF_ID` ~ override the default `minishlab/potion-code-16M` model.
 
-When matches span multiple top-level dirs with no shared prefix, the response switches to a grouped shape: `{"groups": [{"prefix": "...", "results": {...}}, ...], "results": {}}`. Each group carries its own `prefix` with file keys stripped relative to it ~ avoids repeating long monorepo paths in every key. See "Response shapes" near the end of `--help`.
+Pass positional `[PATHS]` to filter results to chunks under those subtrees:
+
+```bash
+hitagi search "queue worker" packages/jobs
+```
+
+### `find-related <FILE> <LINE>`
+
+```bash
+hitagi find-related src/cli.rs 600
+```
+
+Pass a `path:line` from a `search` result to get semantically similar chunks elsewhere in the repo. Reuses the persisted search index; first call rebuilds and may download the model just like `search` does.
+
+Flags: same encoder / model flags as `search` (`--hashing`, `--no-download`, `--offline`, `--model`), plus `-k N`.
+
+### `index [status|build|clean]`
+
+```bash
+hitagi index status
+hitagi index build --mode hybrid
+hitagi index clean
+```
+
+Inspect or manage the search index directly. `build` forces a rebuild (handy after a `--model X` swap or to warm a cache before a session). `clean` drops just the search rows (sparse + dense) ~ the parse cache for `outline`/`symbol`/`find` is left intact. Use `cache clear` to wipe both.
 
 ### `read <PATH>`
 
@@ -183,7 +194,7 @@ find "load_source"
 • src/commands.rs:L380-422 function load_source :: fn load_source(resolved: &ResolvedPath) -> AppResult<LoadedSource> {
 ```
 
-Walks the repo, parses every supported file, returns symbols whose qualname contains `QUERY` (case-insensitive). Use this when you know the symbol name but not the file. Only matches qualnames within parseable files; `.md`/`.txt`/etc. are skipped ~ for raw substring search across all files, use `search`.
+Walks the repo, parses every supported file, returns symbols whose qualname contains `QUERY` (case-insensitive). Use this when you know the symbol name but not the file. Only matches qualnames within parseable files; unsupported plaintext files are skipped.
 
 Pass extra positional paths to scope the walk.
 
@@ -197,7 +208,7 @@ Flags:
 - `--per-file N` ~ cap matches per file at `N` (default `5`; pass `0` for no cap). Suppressed match counts are reported in `more_in_file: { "path": <count>, ... }` (top-level on flat responses, inside the containing group on grouped responses). The cap counts toward `--limit` ~ this is a diversity control, not a bypass. Useful when one class with many methods would otherwise eat the whole budget.
 - `--exclude PATTERN` (repeatable) ~ skip matching files (same syntax as `search --exclude`).
 
-`searched_files` reports how many parseable files were inspected. When zero (e.g. `find foo vendor`), the response includes a `note` explaining why ~ usually "no parseable files at this path; for plaintext search across all file types, use `search`".
+`searched_files` reports how many parseable files were inspected. When zero (e.g. `find foo vendor`), the response includes a `note` explaining why.
 
 When matches span multiple top-level dirs with no shared prefix, the response switches to a grouped shape: `{"matches": [], "groups": [{"prefix": "...", "matches": [...], "more_in_file": {...}?}, ...]}`. Each group carries its own `prefix` (the longest common prefix within that bucket) with each match's `path` stripped relative to it. The flat-when-shared and grouped-when-spanning behavior keeps the typical case unchanged while saving a lot of bytes when matches scatter across deep monorepo paths.
 
@@ -246,7 +257,7 @@ languages
 • tsx              2 files     312 lines • parseable
 ```
 
-One-shot orientation: walks the repo and tallies file count + line count per detected language. Sorted by file count descending. The `parseable` flag tells you which entries support `outline`/`symbol`/`find` (Rust, TypeScript, TSX, Python, Kotlin, Prisma) ~ the rest are recognised by extension but only respond to `search` and `read`.
+One-shot orientation: walks the repo and tallies file count + line count per detected language. Sorted by file count descending. The `parseable` flag tells you which entries are supported by `tree-sitter-language-pack` and can produce syntax-aware results for `outline`/`symbol`/`find`/`search`.
 
 ### `diff [PATHS...]`
 
@@ -360,13 +371,13 @@ With `--json`, `status` returns:
 {
   "enabled": true,
   "disabled_via_env": false,
-  "current_version": "v3-0.1.0",
+  "current_version": "v6-0.1.0",
   "cache_dir": "/home/user/.cache/hitagi/abc123def4567890",
-  "cache_file": "/home/user/.cache/hitagi/abc123def4567890/index.v3.sqlite",
+  "cache_file": "/home/user/.cache/hitagi/abc123def4567890/index.v6.sqlite",
   "exists": true,
   "size_bytes": 7324880,
   "modified_unix_secs": 1714728000,
-  "stored_version": "v3-0.1.0",
+  "stored_version": "v6-0.1.0",
   "stored_repo_root": "/home/user/code/myrepo",
   "version_match": true,
   "repo_root_match": true,
@@ -399,12 +410,4 @@ Files exceeding these caps return an error rather than truncating.
 
 ## Maintenance
 
-The compiled tree-sitter parsers in `vendor/*/src/` are gitignored. To regenerate them after pulling fresh grammar sources:
-
-```bash
-for grammar in vendor/tree-sitter-rust vendor/tree-sitter-python vendor/tree-sitter-kotlin vendor/tree-sitter-prisma vendor/tree-sitter-typescript vendor/tree-sitter-tsx; do
-  (cd "$grammar" && tree-sitter generate --abi 14)
-done
-```
-
-Requires the [tree-sitter CLI](https://tree-sitter.github.io/tree-sitter/cli/) on `$PATH`.
+Language parsers are provided by `tree-sitter-language-pack`; update that crate when parser coverage or grammar versions need to change.

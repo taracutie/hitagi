@@ -190,7 +190,12 @@ pub fn ref_exists(toplevel: &Path, ref_name: &str) -> bool {
     matches!(
         raw_git(
             toplevel,
-            &["rev-parse", "--verify", "--quiet", &format!("{ref_name}^{{commit}}")],
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{ref_name}^{{commit}}")
+            ],
         ),
         Ok(_)
     )
@@ -232,12 +237,7 @@ pub fn numstat(
     base_ref: Option<&str>,
     cached: bool,
 ) -> AppResult<Vec<NumstatEntry>> {
-    let mut args: Vec<String> = vec![
-        "diff".into(),
-        "--numstat".into(),
-        "-z".into(),
-        "-M".into(),
-    ];
+    let mut args: Vec<String> = vec!["diff".into(), "--numstat".into(), "-z".into(), "-M".into()];
     if cached {
         args.push("--cached".into());
     }
@@ -307,12 +307,12 @@ pub fn parse_name_status_z(bytes: &[u8]) -> AppResult<Vec<NameStatusEntry>> {
     let mut entries = Vec::new();
     let mut chunks = bytes.split(|b| *b == 0).filter(|s| !s.is_empty());
     while let Some(chunk) = chunks.next() {
-        let status_str = std::str::from_utf8(chunk).map_err(|_| {
-            AppError::internal("non-UTF-8 in git --name-status status field")
-        })?;
-        let first_char = status_str.chars().next().ok_or_else(|| {
-            AppError::internal("empty status field in git --name-status output")
-        })?;
+        let status_str = std::str::from_utf8(chunk)
+            .map_err(|_| AppError::internal("non-UTF-8 in git --name-status status field"))?;
+        let first_char = status_str
+            .chars()
+            .next()
+            .ok_or_else(|| AppError::internal("empty status field in git --name-status output"))?;
         let path_chunk = chunks.next().ok_or_else(|| {
             AppError::internal(format!(
                 "name-status record missing path after status `{status_str}`"
@@ -329,9 +329,7 @@ pub fn parse_name_status_z(bytes: &[u8]) -> AppResult<Vec<NameStatusEntry>> {
                 ))
             })?;
             let new_path = std::str::from_utf8(new_chunk)
-                .map_err(|_| {
-                    AppError::internal("non-UTF-8 in git --name-status rename path")
-                })?
+                .map_err(|_| AppError::internal("non-UTF-8 in git --name-status rename path"))?
                 .to_string();
             entries.push(NameStatusEntry {
                 status: first_char,
@@ -370,7 +368,9 @@ pub fn parse_numstat_z(bytes: &[u8]) -> AppResult<Vec<NumstatEntry>> {
             i += 1;
         }
         if i >= bytes.len() {
-            return Err(AppError::internal("truncated numstat entry (no tab after added)"));
+            return Err(AppError::internal(
+                "truncated numstat entry (no tab after added)",
+            ));
         }
         let added_str = std::str::from_utf8(&bytes[added_start..i])
             .map_err(|_| AppError::internal("non-UTF-8 in numstat added"))?;
@@ -382,7 +382,9 @@ pub fn parse_numstat_z(bytes: &[u8]) -> AppResult<Vec<NumstatEntry>> {
             i += 1;
         }
         if i >= bytes.len() {
-            return Err(AppError::internal("truncated numstat entry (no tab after removed)"));
+            return Err(AppError::internal(
+                "truncated numstat entry (no tab after removed)",
+            ));
         }
         let removed_str = std::str::from_utf8(&bytes[removed_start..i])
             .map_err(|_| AppError::internal("non-UTF-8 in numstat removed"))?;
@@ -577,9 +579,9 @@ fn parse_diff_git_paths(rest: &str) -> Option<(String, String)> {
 }
 
 pub fn parse_hunk_header(line: &str) -> AppResult<RawHunk> {
-    let s = line.strip_prefix("@@ -").ok_or_else(|| {
-        AppError::internal(format!("malformed hunk header: `{line}`"))
-    })?;
+    let s = line
+        .strip_prefix("@@ -")
+        .ok_or_else(|| AppError::internal(format!("malformed hunk header: `{line}`")))?;
 
     let (old_start, mut rest) = read_uint(s).ok_or_else(|| {
         AppError::internal(format!("malformed hunk header (old_start): `{line}`"))
@@ -596,9 +598,7 @@ pub fn parse_hunk_header(line: &str) -> AppResult<RawHunk> {
     };
 
     rest = rest.strip_prefix(" +").ok_or_else(|| {
-        AppError::internal(format!(
-            "malformed hunk header (missing ` +`): `{line}`"
-        ))
+        AppError::internal(format!("malformed hunk header (missing ` +`): `{line}`"))
     })?;
 
     let (new_start, r2) = read_uint(rest).ok_or_else(|| {

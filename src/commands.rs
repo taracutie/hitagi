@@ -15,16 +15,17 @@ use crate::{
         CacheClearResponse, CacheLangCount, CachePathResponse, CacheStatusResponse,
         DiffFileResponse, DiffFileSummary, DiffHunk, DiffMultiFileResponse, DiffOverviewResponse,
         DiffPathsResponse, DiffSummaryFile, DiffSummaryGroup, DiffSummaryResponse, FilesGroup,
-        FilesResponse, FindGroup, FindMatch, FindMatches, FindResponse, LangSummary, LangsResponse,
+        FilesResponse, FindGroup, FindMatch, FindMatches, FindRelatedResponse, FindResponse,
+        IndexBuildResponse, IndexCleanResponse, IndexStatusResponse, LangSummary, LangsResponse,
         OutlineResponse, OutputSymbol, OutputSymbolDetail, ReadFileResponse, ReadSummaryResponse,
-        SearchGroup, SearchResponse, SymbolDetail, SymbolInfo, SymbolResponse,
+        SearchHit, SearchResponse, SymbolDetail, SymbolInfo, SymbolResponse,
     },
     parser::{parse_source, ParsedFile},
     queries::{
-        resolve_symbol, search_file, search_file_plain, snippet_for_symbol_signature,
-        symbol_detail, symbols_for_line_range,
+        resolve_symbol, snippet_for_symbol_signature, symbol_detail, symbols_for_line_range,
     },
     repo::{self, RepoRoot, ResolvedPath},
+    search,
 };
 
 pub const MAX_FILE_BYTES: usize = 1024 * 1024;
@@ -49,18 +50,54 @@ pub struct SymbolOptions {
     pub bytes: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchModeArg {
+    Hybrid,
+    Bm25,
+    Semantic,
+}
+
+impl SearchModeArg {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Hybrid => "hybrid",
+            Self::Bm25 => "bm25",
+            Self::Semantic => "semantic",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SearchOptions {
     pub paths: Vec<String>,
     pub excludes: Vec<String>,
     pub limit: usize,
+    pub mode: SearchModeArg,
+    pub languages: Vec<String>,
+    pub alpha: Option<f32>,
     pub snippet: bool,
-    /// Keep matches that fall outside any parsed symbol scope (top-of-file
-    /// imports, top-level constants, comments). Default false ~ when a file
-    /// also has inside-symbol matches, the unscoped ones are dropped to free
-    /// budget for more useful results. Plaintext files (no symbol info) are
-    /// unaffected: the rule fires only when at least one scoped match exists.
-    pub include_unscoped: bool,
+    pub hashing: bool,
+    pub no_download: bool,
+    pub offline: bool,
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FindRelatedOptions {
+    pub limit: usize,
+    pub hashing: bool,
+    pub no_download: bool,
+    pub offline: bool,
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexBuildOptions {
+    pub mode: SearchModeArg,
+    pub hashing: bool,
+    pub no_download: bool,
+    pub offline: bool,
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -148,41 +185,6 @@ struct ParseCacheUpdate {
     symbols: Vec<SymbolInfo>,
 }
 
-struct PreparedSearchFile {
-    resolved: ResolvedPath,
-    metadata: Metadata,
-    language: Option<Language>,
-    cached_symbols: Option<Vec<SymbolInfo>>,
-}
-
-enum SearchWorkItem {
-    Skip {
-        relative_path: String,
-    },
-    Error {
-        relative_path: String,
-        error: AppError,
-    },
-    Load(PreparedSearchFile),
-}
-
-struct SearchFileResult {
-    relative_path: String,
-    matches: Vec<String>,
-    cache_update: Option<ParseCacheUpdate>,
-}
-
-enum SearchWorkResult {
-    Skipped {
-        relative_path: String,
-    },
-    Error {
-        relative_path: String,
-        error: AppError,
-    },
-    Ready(SearchFileResult),
-}
-
 struct PreparedFindFile {
     resolved: ResolvedPath,
     metadata: Metadata,
@@ -229,7 +231,7 @@ pub fn outline(repo: &RepoRoot, path: &str, opts: OutlineOptions) -> AppResult<O
         AppError::unsupported(format!("no parser for {}", resolved.relative_path))
     })?;
 
-    let symbols = cached_or_parsed(&mut cache, &resolved, &stat.metadata, language, None)?;
+    let symbols = cached_or_parsed(&mut cache, &resolved, &stat.metadata, &language, None)?;
     cache.save(false);
 
     let total_symbols = symbols.len();
@@ -302,12 +304,14 @@ pub fn symbol(
         &mut cache,
         &resolved,
         &stat.metadata,
-        language,
+        &language,
         Some(&content),
     )?;
     cache.save(false);
 
-    let parsed = ParsedFile { language, symbols };
+    let parsed = ParsedFile {
+        symbols,
+    };
     let detail = symbol_detail(&parsed, &content, qualname, MAX_RESPONSE_BYTES)?;
 
     Ok(SymbolResponse {
@@ -326,159 +330,409 @@ pub fn search(repo: &RepoRoot, query: &str, opts: SearchOptions) -> AppResult<Se
     }
 
     let mut cache = ParseCache::open(repo.root());
-    let prune = opts.paths.is_empty() && opts.excludes.is_empty();
-
+    let sparse = search::engine::ensure_sparse(repo, &mut cache)?;
+    let mut warnings: Vec<String> = Vec::new();
+    if sparse.chunks.is_empty() {
+        warnings.push("repo has no indexable files".to_string());
+    }
     let exclude_set = build_exclude_set(&opts.excludes)?;
-    let mut files = apply_excludes(
-        repo.collect_search_files(&opts.paths)?,
-        exclude_set.as_ref(),
-    );
-    if opts.paths.is_empty() {
-        files = interleave_by_top_level(files);
-    }
-    let result = search_resolved_files(
-        files,
-        query,
-        opts.limit,
-        opts.snippet,
-        opts.include_unscoped,
-        &mut cache,
-    );
-    let should_prune = prune && matches!(result.as_ref(), Ok(response) if !response.truncated);
-    cache.save(should_prune);
-    result
-}
 
-fn search_resolved_files(
-    files: Vec<ResolvedPath>,
-    query: &str,
-    limit: usize,
-    snippet: bool,
-    include_unscoped: bool,
-    cache: &mut ParseCache,
-) -> AppResult<SearchResponse> {
-    let all_top_levels = collect_top_level_dirs(&files);
-    let mut visited_top_levels: BTreeSet<String> = BTreeSet::new();
-
-    let mut raw_results: Vec<(String, Vec<String>)> = Vec::new();
-    let mut total = 0usize;
-    let mut truncated = false;
-
-    let chunk_size = parallel_parse_chunk_size();
-    let worker_limit = limit.saturating_add(1);
-    let mut index = 0usize;
-
-    'files: while index < files.len() {
-        if total >= limit {
-            truncated = true;
-            break;
-        }
-
-        let end = (index + chunk_size).min(files.len());
-        let prepared: Vec<SearchWorkItem> = files[index..end]
-            .iter()
-            .cloned()
-            .map(|resolved| prepare_search_file(cache, resolved))
-            .collect();
-        let outcomes: Vec<SearchWorkResult> = prepared
-            .into_par_iter()
-            .map(|item| execute_search_file(item, query, worker_limit, snippet, include_unscoped))
-            .collect();
-
-        index = end;
-
-        for outcome in outcomes {
-            if total >= limit {
-                truncated = true;
-                break 'files;
+    let mode_label = opts.mode.as_str().to_string();
+    let output = match opts.mode {
+        SearchModeArg::Bm25 => search::engine::run_bm25(
+            &sparse,
+            query,
+            opts.limit,
+            &opts.languages,
+            &opts.paths,
+            exclude_set.as_ref(),
+        ),
+        SearchModeArg::Hybrid | SearchModeArg::Semantic => {
+            let (encoder, encoder_kind, model_id, fingerprint, encoder_warning) =
+                load_encoder_with_policy(
+                    opts.hashing,
+                    opts.no_download,
+                    opts.offline,
+                    opts.model.as_deref(),
+                )?;
+            if let Some(w) = encoder_warning {
+                warnings.push(w);
             }
-
-            let relative_path = search_result_path(&outcome).to_string();
-            if let Some(top) = top_level_dir(&relative_path) {
-                visited_top_levels.insert(top.to_string());
+            let dense = search::engine::ensure_dense(
+                &mut cache,
+                &sparse,
+                encoder.as_ref(),
+                &encoder_kind,
+                &model_id,
+                &fingerprint,
+            )?;
+            match opts.mode {
+                SearchModeArg::Semantic => search::engine::run_semantic(
+                    &sparse,
+                    encoder.as_ref(),
+                    &dense.vectors,
+                    query,
+                    opts.limit,
+                    &opts.languages,
+                    &opts.paths,
+                    exclude_set.as_ref(),
+                )?,
+                SearchModeArg::Hybrid => search::engine::run_hybrid(
+                    &sparse,
+                    encoder.as_ref(),
+                    &dense.vectors,
+                    query,
+                    opts.limit,
+                    opts.alpha,
+                    &opts.languages,
+                    &opts.paths,
+                    exclude_set.as_ref(),
+                )?,
+                SearchModeArg::Bm25 => unreachable!("bm25 handled above"),
             }
-
-            let result = match outcome {
-                SearchWorkResult::Skipped { .. } => continue,
-                SearchWorkResult::Error { error, .. } => return Err(error),
-                SearchWorkResult::Ready(result) => result,
-            };
-
-            if let Some(update) = result.cache_update {
-                insert_cache_update(cache, update);
-            }
-
-            let remaining = limit - total;
-            let mut matches = result.matches;
-            if matches.len() > remaining {
-                matches.truncate(remaining);
-                truncated = true;
-            }
-
-            if !matches.is_empty() {
-                total += matches.len();
-                raw_results.push((result.relative_path, matches));
-            }
-
-            if truncated {
-                break 'files;
-            }
-        }
-    }
-
-    // Decide flat-vs-grouped, mirroring find. Non-empty global LCP → flat
-    // (existing shape). Empty LCP with 2+ top-level buckets → grouped.
-    let result_paths: Vec<String> = raw_results.iter().map(|(p, _)| p.clone()).collect();
-    let global_prefix = common_prefix(&result_paths);
-
-    let (prefix_out, results_out, groups_out) = if !global_prefix.is_empty() {
-        let mut results: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for (path, matches) in raw_results {
-            let key = strip_prefix(&path, &global_prefix);
-            results.entry(key).or_default().extend(matches);
-        }
-        (global_prefix, results, Vec::new())
-    } else {
-        let mut by_bucket: BTreeMap<String, Vec<(String, Vec<String>)>> = BTreeMap::new();
-        for (path, matches) in raw_results {
-            let key = top_level_dir(&path).unwrap_or("").to_string();
-            by_bucket.entry(key).or_default().push((path, matches));
-        }
-        if by_bucket.len() <= 1 {
-            let mut results: BTreeMap<String, Vec<String>> = BTreeMap::new();
-            for (_, items) in by_bucket {
-                for (path, matches) in items {
-                    results.entry(path).or_default().extend(matches);
-                }
-            }
-            (String::new(), results, Vec::new())
-        } else {
-            let mut groups: Vec<SearchGroup> = Vec::new();
-            for (_bucket, items) in by_bucket {
-                let bucket_paths: Vec<String> = items.iter().map(|(p, _)| p.clone()).collect();
-                let bp = common_prefix(&bucket_paths);
-                let mut group_results: BTreeMap<String, Vec<String>> = BTreeMap::new();
-                for (path, matches) in items {
-                    let key = strip_prefix(&path, &bp);
-                    group_results.entry(key).or_default().extend(matches);
-                }
-                groups.push(SearchGroup {
-                    prefix: bp,
-                    results: group_results,
-                });
-            }
-            (String::new(), BTreeMap::new(), groups)
         }
     };
 
-    let unsampled_dirs = unsampled_top_levels(truncated, &all_top_levels, &visited_top_levels);
+    let mut results: Vec<SearchHit> = output
+        .hits
+        .into_iter()
+        .map(|hit| build_hit(hit, opts.snippet))
+        .collect();
+
+    if !opts.paths.is_empty() {
+        results.retain(|hit| hit_under_any_prefix(&hit.path, &opts.paths));
+    }
 
     Ok(SearchResponse {
-        prefix: prefix_out,
-        results: results_out,
-        groups: groups_out,
-        truncated,
-        unsampled_dirs,
+        query: query.to_string(),
+        mode: mode_label,
+        alpha: output.alpha,
+        limit: opts.limit,
+        languages: opts.languages,
+        paths: opts.paths,
+        elapsed_ms: output.stats.elapsed_ms,
+        indexed_files: output.indexed_files,
+        indexed_chunks: output.indexed_chunks,
+        warnings,
+        results,
+    })
+}
+
+pub fn find_related(
+    repo: &RepoRoot,
+    path: &str,
+    line: usize,
+    opts: FindRelatedOptions,
+) -> AppResult<FindRelatedResponse> {
+    if line == 0 {
+        return Err(AppError::bad_request("line must be 1-indexed"));
+    }
+    if opts.limit == 0 {
+        return Err(AppError::bad_request("--limit must be at least 1"));
+    }
+
+    // Resolve the path against the repo's file list so suffix-matching works
+    // (`--repo /repo find-related src/foo.rs` works even when invoked from
+    // a subdir).
+    let resolved = repo.resolve_file(path)?;
+
+    let mut cache = ParseCache::open(repo.root());
+    let sparse = search::engine::ensure_sparse(repo, &mut cache)?;
+    let mut warnings: Vec<String> = Vec::new();
+
+    let chunk_id = search::engine::find_chunk_at_line(&sparse, &resolved.relative_path, line)
+        .ok_or_else(|| {
+            AppError::not_found(format!(
+                "no indexed chunk for {}:{line}; index may need a rebuild",
+                resolved.relative_path
+            ))
+        })?;
+    let source_chunk = sparse.chunks[chunk_id].clone();
+
+    let (encoder, encoder_kind, model_id, fingerprint, encoder_warning) = load_encoder_with_policy(
+        opts.hashing,
+        opts.no_download,
+        opts.offline,
+        opts.model.as_deref(),
+    )?;
+    if let Some(w) = encoder_warning {
+        warnings.push(w);
+    }
+    let dense = search::engine::ensure_dense(
+        &mut cache,
+        &sparse,
+        encoder.as_ref(),
+        &encoder_kind,
+        &model_id,
+        &fingerprint,
+    )?;
+
+    let started = std::time::Instant::now();
+    // Encode the source chunk's content as the query. Selector excludes the
+    // source chunk itself so we never return it.
+    let mut allowed: Vec<usize> = (0..sparse.chunks.len()).collect();
+    allowed.retain(|&id| id != chunk_id);
+    let mut hits = search::fuse::search_semantic(
+        &source_chunk.content,
+        encoder.as_ref(),
+        &dense.vectors,
+        &sparse.chunks,
+        opts.limit,
+        Some(&allowed),
+    );
+    let elapsed_ms = started.elapsed().as_millis();
+
+    // Drop any remaining matches for the source path itself unless it has
+    // multiple chunks (then keep neighboring chunks).
+    hits.retain(|h| {
+        h.chunk.file_path != source_chunk.file_path || h.chunk.start_line != source_chunk.start_line
+    });
+
+    let results: Vec<SearchHit> = hits.into_iter().map(|h| build_hit(h, false)).collect();
+    let source_hit = SearchHit {
+        path: source_chunk.file_path,
+        lines: [source_chunk.start_line, source_chunk.end_line],
+        language: source_chunk.language,
+        score: 1.0,
+        source: "source".to_string(),
+        snippet: None,
+    };
+
+    Ok(FindRelatedResponse {
+        path: resolved.relative_path,
+        line,
+        limit: opts.limit,
+        elapsed_ms,
+        indexed_files: sparse.file_mapping.len(),
+        indexed_chunks: sparse.chunks.len(),
+        source_chunk: source_hit,
+        warnings,
+        results,
+    })
+}
+
+/// Resolve the encoder requested by the CLI flags, applying the
+/// `--offline` / `--no-download` / `--hashing` policy. Returns the encoder
+/// + tagging metadata needed to fingerprint the persisted dense row.
+///
+/// Falls back to the hashing encoder when `--offline` / `--no-download` is
+/// set and the Model2Vec model isn't locally cached, emitting a warning so
+/// the user knows quality is degraded.
+fn load_encoder_with_policy(
+    hashing: bool,
+    no_download: bool,
+    offline: bool,
+    model: Option<&str>,
+) -> AppResult<(
+    Box<dyn search::model2vec::Encoder>,
+    String,
+    String,
+    String,
+    Option<String>,
+)> {
+    if hashing {
+        let encoder = search::model2vec::HashingEncoder::new(search::model2vec::DEFAULT_DIM);
+        return Ok((
+            Box::new(encoder),
+            "hashing".to_string(),
+            format!("hashing-{}", search::model2vec::DEFAULT_DIM),
+            format!("hashing-{}", search::model2vec::DEFAULT_DIM),
+            None,
+        ));
+    }
+
+    let policy = if offline {
+        search::model2vec::ModelLoadPolicy::Offline
+    } else if no_download {
+        search::model2vec::ModelLoadPolicy::NoDownload
+    } else {
+        search::model2vec::ModelLoadPolicy::AllowDownload
+    };
+    let options = search::model2vec::ModelOptions::new(model, policy);
+    search::model_cache::ensure_hf_home();
+    let model_status = search::model2vec::model_status(model);
+    if matches!(policy, search::model2vec::ModelLoadPolicy::AllowDownload)
+        && !model_status.available()
+    {
+        eprintln!(
+            "hitagi: index: downloading embedding model {} (first run may take a while)",
+            options.model
+        );
+    } else {
+        eprintln!("hitagi: index: loading embedding model {}", options.model);
+    }
+
+    match search::model2vec::load_model(&options) {
+        Ok(encoder) => {
+            let fingerprint = search::model2vec::model_fingerprint(&options)
+                .unwrap_or_else(|_| options.model.clone());
+            Ok((
+                encoder,
+                "model2vec".to_string(),
+                options.model.clone(),
+                fingerprint,
+                None,
+            ))
+        }
+        Err(err) if offline || no_download => {
+            // Fall back to the hashing encoder so the agent can still get
+            // some semantic-ish ranking instead of a hard error.
+            let encoder = search::model2vec::HashingEncoder::new(search::model2vec::DEFAULT_DIM);
+            Ok((
+                Box::new(encoder),
+                "hashing".to_string(),
+                format!("hashing-{}", search::model2vec::DEFAULT_DIM),
+                format!("hashing-{}", search::model2vec::DEFAULT_DIM),
+                Some(format!(
+                    "model unavailable ({err}); falling back to hashing encoder"
+                )),
+            ))
+        }
+        Err(err) => Err(err),
+    }
+}
+
+pub fn index_status(repo: &RepoRoot) -> IndexStatusResponse {
+    let inspection = ParseCache::inspect_search_index(repo.root());
+    let parse_inspection = ParseCache::inspect(repo.root());
+    let cache_file = parse_inspection
+        .cache_file
+        .as_ref()
+        .map(|p| p.display().to_string());
+
+    let (indexed_files, indexed_chunks, languages) = if inspection.sparse_present {
+        // Decode the chunks/file_mapping/language_mapping from a fresh load
+        // so the status report has true counts. Cheap because the file is
+        // already in the page cache after the inspect.
+        let mut cache = ParseCache::open(repo.root());
+        match search::persist::load_sparse(&mut cache) {
+            Ok(Some(payload)) => {
+                let langs: BTreeMap<String, usize> = payload
+                    .language_mapping
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.len()))
+                    .collect();
+                (payload.file_mapping.len(), payload.chunks.len(), langs)
+            }
+            _ => (0, 0, BTreeMap::new()),
+        }
+    } else {
+        (0, 0, BTreeMap::new())
+    };
+
+    IndexStatusResponse {
+        cache_file,
+        sparse_present: inspection.sparse_present,
+        dense_present: inspection.dense_present,
+        indexed_files,
+        indexed_chunks,
+        languages,
+        model_id: inspection.dense_model_id,
+        encoder_kind: inspection.dense_encoder_kind,
+        model_fingerprint: inspection.dense_model_fingerprint,
+        dim: inspection.dense_dim,
+        sparse_built_at_unix_secs: inspection.sparse_built_at_unix_secs,
+        dense_built_at_unix_secs: inspection.dense_built_at_unix_secs,
+        sparse_size_bytes: inspection
+            .sparse_present
+            .then_some(inspection.sparse_chunks_bytes),
+        dense_size_bytes: inspection
+            .dense_present
+            .then_some(inspection.dense_vectors_bytes),
+    }
+}
+
+pub fn index_build(repo: &RepoRoot, opts: IndexBuildOptions) -> AppResult<IndexBuildResponse> {
+    let mut cache = ParseCache::open(repo.root());
+    let started = std::time::Instant::now();
+    let sparse = search::engine::rebuild_sparse(repo, &mut cache)?;
+    let mut warnings: Vec<String> = Vec::new();
+
+    if matches!(opts.mode, SearchModeArg::Hybrid | SearchModeArg::Semantic) {
+        let (encoder, encoder_kind, model_id, fingerprint, encoder_warning) =
+            load_encoder_with_policy(
+                opts.hashing,
+                opts.no_download,
+                opts.offline,
+                opts.model.as_deref(),
+            )?;
+        if let Some(w) = encoder_warning {
+            warnings.push(w);
+        }
+        let _ = search::engine::rebuild_dense(
+            &mut cache,
+            &sparse,
+            encoder.as_ref(),
+            &encoder_kind,
+            &model_id,
+            &fingerprint,
+        )?;
+    }
+
+    let elapsed_ms = started.elapsed().as_millis();
+    let languages: BTreeMap<String, usize> = sparse
+        .language_mapping
+        .iter()
+        .map(|(k, v)| (k.clone(), v.len()))
+        .collect();
+
+    Ok(IndexBuildResponse {
+        mode: opts.mode.as_str().to_string(),
+        indexed_files: sparse.file_mapping.len(),
+        indexed_chunks: sparse.chunks.len(),
+        languages,
+        elapsed_ms,
+        warnings,
+    })
+}
+
+pub fn index_clean(repo: &RepoRoot) -> AppResult<IndexCleanResponse> {
+    let mut cache = ParseCache::open(repo.root());
+    let cleared = cache
+        .clear_search_index()
+        .map_err(|e| AppError::internal(format!("clear search index: {e}")))?;
+    let parse_inspection = ParseCache::inspect(repo.root());
+    let cache_file = parse_inspection
+        .cache_file
+        .as_ref()
+        .map(|p| p.display().to_string());
+    Ok(IndexCleanResponse {
+        cleared,
+        cache_file,
+    })
+}
+
+fn build_hit(hit: search::types::RankedHit, want_snippet: bool) -> SearchHit {
+    let snippet = want_snippet.then(|| first_nonblank_line(&hit.chunk.content));
+    SearchHit {
+        path: hit.chunk.file_path,
+        lines: [hit.chunk.start_line, hit.chunk.end_line],
+        language: hit.chunk.language,
+        score: hit.score,
+        source: hit.source.as_str().to_string(),
+        snippet,
+    }
+}
+
+fn first_nonblank_line(content: &str) -> String {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            // Cap to 100 chars so a one-line giant import statement doesn't
+            // blow up the response.
+            if trimmed.chars().count() > 100 {
+                return trimmed.chars().take(100).collect::<String>() + "…";
+            }
+            return trimmed.to_string();
+        }
+    }
+    String::new()
+}
+
+fn hit_under_any_prefix(path: &str, prefixes: &[String]) -> bool {
+    prefixes.iter().any(|p| {
+        let needle = p.trim_end_matches('/');
+        path == needle || path.starts_with(&format!("{needle}/"))
     })
 }
 
@@ -553,19 +807,16 @@ pub fn read_summary(repo: &RepoRoot, path: &str) -> AppResult<ReadSummaryRespons
     let resolved = repo.resolve_file(path)?;
     let stat = stat_file(&resolved)?;
     let content = read_after_stat(&resolved)?;
-    let detected = stat.language.unwrap_or(Language::Plaintext);
-    let line_stats = count_lines(content.as_bytes(), detected);
-    let language = stat
-        .language
-        .map(|l| l.as_str().to_string())
-        .unwrap_or_else(|| "plaintext".to_string());
+    let detected = stat.language.clone().unwrap_or(Language::Plaintext);
+    let line_stats = count_lines(content.as_bytes(), &detected);
+    let language = detected.as_str().to_string();
 
     let mut total_symbols = 0;
     let mut kind_counts: BTreeMap<String, usize> = BTreeMap::new();
     let mut symbols = Vec::new();
     let mut note = None;
 
-    if let Some(parseable) = stat.language.filter(|l| l.is_parseable()) {
+    if let Some(parseable) = stat.language.as_ref().filter(|l| l.is_parseable()) {
         let mut cache = ParseCache::open(repo.root());
         let parsed = cached_or_parsed(
             &mut cache,
@@ -1005,7 +1256,7 @@ pub fn langs(repo: &RepoRoot) -> AppResult<LangsResponse> {
             Language::detect(Path::new(&resolved.full_path)).unwrap_or(Language::Plaintext);
         // Binary detection runs lazily inside the miss path of
         // cache_line_stats_for ~ on warm runs we never open the file.
-        let Some(stats) = cache_line_stats_for(&mut cache, &resolved, &metadata, language) else {
+        let Some(stats) = cache_line_stats_for(&mut cache, &resolved, &metadata, &language) else {
             continue;
         };
 
@@ -1501,14 +1752,13 @@ pub fn diff_file(
         .collect();
 
     if let Some(query) = drill.symbol.as_deref() {
-        let language = language.ok_or_else(|| {
+        language.ok_or_else(|| {
             AppError::unsupported(format!(
                 "no parser for {} (cannot filter by --symbol on non-parseable files)",
                 candidate.repo_relative
             ))
         })?;
         let parsed_file = ParsedFile {
-            language,
             symbols: symbols.clone(),
         };
         let target = resolve_symbol(&parsed_file, query)?;
@@ -1949,14 +2199,13 @@ fn diff_untracked_file(
     };
 
     if let Some(query) = drill.symbol.as_deref() {
-        let language = language.ok_or_else(|| {
+        language.ok_or_else(|| {
             AppError::unsupported(format!(
                 "no parser for {} (cannot filter by --symbol on non-parseable files)",
                 candidate.repo_relative
             ))
         })?;
         let parsed_file = ParsedFile {
-            language,
             symbols: symbols.clone(),
         };
         let target = resolve_symbol(&parsed_file, query)?;
@@ -2112,7 +2361,7 @@ fn collect_symbols_for_diff(
     against: &str,
 ) -> AppResult<(Option<String>, Option<Language>, Vec<SymbolInfo>)> {
     let detected = Language::detect(Path::new(&candidate.repo_relative)).ok();
-    let lang_label = detected.map(|l| l.as_str().to_string());
+    let lang_label = detected.as_ref().map(|l| l.as_str().to_string());
     let parseable = detected.filter(|l| l.is_parseable());
 
     if candidate.status == 'D' {
@@ -2131,7 +2380,7 @@ fn collect_symbols_for_diff(
         let Ok(content) = std::str::from_utf8(&bytes) else {
             return Ok((lang_label, None, Vec::new()));
         };
-        match parse_source(language, content) {
+        match parse_source(&language, content) {
             Ok(parsed) => Ok((lang_label, Some(language), parsed.symbols)),
             Err(_) => Ok((lang_label, None, Vec::new())),
         }
@@ -2145,7 +2394,6 @@ fn collect_symbols_for_diff(
             return Ok((lang_label, None, Vec::new()));
         }
         let resolved = ResolvedPath {
-            repo_root: repo.root().to_path_buf(),
             relative_path: candidate.repo_relative.clone(),
             full_path,
         };
@@ -2153,11 +2401,11 @@ fn collect_symbols_for_diff(
             Ok(s) => s,
             Err(_) => return Ok((lang_label, None, Vec::new())),
         };
-        if stat.language.filter(|l| *l == language).is_none() {
+        if stat.language.as_ref() != Some(&language) {
             return Ok((lang_label, None, Vec::new()));
         }
         let mut cache = ParseCache::open(repo.root());
-        let symbols = match cached_or_parsed(&mut cache, &resolved, &stat.metadata, language, None)
+        let symbols = match cached_or_parsed(&mut cache, &resolved, &stat.metadata, &language, None)
         {
             Ok(s) => s,
             Err(_) => Vec::new(),
@@ -2340,19 +2588,6 @@ fn to_output_symbol_detail(s: SymbolDetail, include_bytes: bool) -> OutputSymbol
     }
 }
 
-fn first_chunk_has_nul(path: &Path) -> bool {
-    use std::io::Read;
-    let file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return false,
-    };
-    let mut buf = Vec::with_capacity(8192);
-    if file.take(8192).read_to_end(&mut buf).is_err() {
-        return false;
-    }
-    buf.contains(&0)
-}
-
 struct FileStat {
     metadata: Metadata,
     language: Option<Language>,
@@ -2420,7 +2655,7 @@ fn cached_or_parsed(
     cache: &mut ParseCache,
     resolved: &ResolvedPath,
     metadata: &Metadata,
-    language: Language,
+    language: &Language,
     content: Option<&str>,
 ) -> AppResult<Vec<SymbolInfo>> {
     if let Some(symbols) = cache.lookup(&resolved.relative_path, metadata, language) {
@@ -2441,7 +2676,7 @@ fn cached_or_parsed(
     cache.insert(
         resolved.relative_path.clone(),
         metadata,
-        language,
+        language.clone(),
         line_stats,
         parsed.symbols.clone(),
     );
@@ -2450,137 +2685,6 @@ fn cached_or_parsed(
 
 fn parallel_parse_chunk_size() -> usize {
     rayon::current_num_threads().saturating_mul(4).max(1)
-}
-
-fn prepare_search_file(cache: &mut ParseCache, resolved: ResolvedPath) -> SearchWorkItem {
-    let stat = match stat_file(&resolved) {
-        Ok(value) => value,
-        Err(AppError::TooLarge(_)) | Err(AppError::InvalidUtf8(_)) => {
-            return SearchWorkItem::Skip {
-                relative_path: resolved.relative_path,
-            };
-        }
-        Err(error) => {
-            return SearchWorkItem::Error {
-                relative_path: resolved.relative_path,
-                error,
-            };
-        }
-    };
-
-    let language = stat.language.filter(|l| l.is_parseable());
-    let cached_symbols =
-        language.and_then(|l| cache.lookup(&resolved.relative_path, &stat.metadata, l));
-
-    SearchWorkItem::Load(PreparedSearchFile {
-        resolved,
-        metadata: stat.metadata,
-        language,
-        cached_symbols,
-    })
-}
-
-fn execute_search_file(
-    item: SearchWorkItem,
-    query: &str,
-    max_results: usize,
-    snippet: bool,
-    include_unscoped: bool,
-) -> SearchWorkResult {
-    let prepared = match item {
-        SearchWorkItem::Skip { relative_path } => {
-            return SearchWorkResult::Skipped { relative_path }
-        }
-        SearchWorkItem::Error {
-            relative_path,
-            error,
-        } => {
-            return SearchWorkResult::Error {
-                relative_path,
-                error,
-            }
-        }
-        SearchWorkItem::Load(prepared) => prepared,
-    };
-
-    let content = match read_after_stat(&prepared.resolved) {
-        Ok(value) => value,
-        Err(AppError::TooLarge(_)) | Err(AppError::InvalidUtf8(_)) => {
-            return SearchWorkResult::Skipped {
-                relative_path: prepared.resolved.relative_path,
-            };
-        }
-        Err(error) => {
-            return SearchWorkResult::Error {
-                relative_path: prepared.resolved.relative_path,
-                error,
-            };
-        }
-    };
-
-    let (matches, cache_update) = match prepared.language {
-        Some(language) => {
-            let (symbols, cache_update) = match prepared.cached_symbols {
-                Some(symbols) => (symbols, None),
-                None => {
-                    let parsed = match parse_source(language, &content) {
-                        Ok(value) => value,
-                        Err(AppError::Parse(_)) | Err(AppError::Unsupported(_)) => {
-                            return SearchWorkResult::Skipped {
-                                relative_path: prepared.resolved.relative_path,
-                            };
-                        }
-                        Err(error) => {
-                            return SearchWorkResult::Error {
-                                relative_path: prepared.resolved.relative_path,
-                                error,
-                            };
-                        }
-                    };
-                    let symbols = parsed.symbols;
-                    let cache_update = ParseCacheUpdate {
-                        relative_path: prepared.resolved.relative_path.clone(),
-                        metadata: prepared.metadata,
-                        language,
-                        line_stats: Some(count_lines(content.as_bytes(), language)),
-                        symbols: symbols.clone(),
-                    };
-                    (symbols, Some(cache_update))
-                }
-            };
-            let parsed = ParsedFile { language, symbols };
-            (
-                search_file(
-                    &parsed,
-                    &content,
-                    &prepared.resolved.relative_path,
-                    query,
-                    max_results,
-                    snippet,
-                    include_unscoped,
-                ),
-                cache_update,
-            )
-        }
-        None => (
-            search_file_plain(&content, query, max_results, snippet),
-            None,
-        ),
-    };
-
-    SearchWorkResult::Ready(SearchFileResult {
-        relative_path: prepared.resolved.relative_path,
-        matches,
-        cache_update,
-    })
-}
-
-fn search_result_path(result: &SearchWorkResult) -> &str {
-    match result {
-        SearchWorkResult::Skipped { relative_path }
-        | SearchWorkResult::Error { relative_path, .. } => relative_path,
-        SearchWorkResult::Ready(result) => &result.relative_path,
-    }
 }
 
 fn prepare_find_file(
@@ -2611,7 +2715,7 @@ fn prepare_find_file(
             };
         }
     };
-    let cached_symbols = cache.lookup(&resolved.relative_path, &stat.metadata, language);
+    let cached_symbols = cache.lookup(&resolved.relative_path, &stat.metadata, &language);
 
     FindWorkItem::Load(PreparedFindFile {
         resolved,
@@ -2679,7 +2783,7 @@ fn execute_find_file(item: FindWorkItem) -> FindWorkResult {
             };
         }
     };
-    let parsed = match parse_source(prepared.language, &content) {
+    let parsed = match parse_source(&prepared.language, &content) {
         Ok(value) => value,
         Err(AppError::Parse(_)) | Err(AppError::Unsupported(_)) => {
             return FindWorkResult::Skipped {
@@ -2695,11 +2799,12 @@ fn execute_find_file(item: FindWorkItem) -> FindWorkResult {
     };
 
     let symbols = parsed.symbols;
+    let line_stats = Some(count_lines(content.as_bytes(), &prepared.language));
     let cache_update = ParseCacheUpdate {
         relative_path: prepared.resolved.relative_path.clone(),
         metadata: prepared.metadata,
         language: prepared.language,
-        line_stats: Some(count_lines(content.as_bytes(), prepared.language)),
+        line_stats,
         symbols: symbols.clone(),
     };
     let content = prepared.needs_content.then_some(content);
@@ -2743,7 +2848,7 @@ fn cache_line_stats_for(
     cache: &mut ParseCache,
     resolved: &ResolvedPath,
     metadata: &Metadata,
-    language: Language,
+    language: &Language,
 ) -> Option<LineStats> {
     if let Some(stats) = cache.lookup_line_stats(&resolved.relative_path, metadata, language) {
         return Some(stats);
@@ -2756,7 +2861,12 @@ fn cache_line_stats_for(
         return None;
     }
     let stats = count_lines(&bytes, language);
-    cache.insert_lang_only(resolved.relative_path.clone(), metadata, language, stats);
+    cache.insert_lang_only(
+        resolved.relative_path.clone(),
+        metadata,
+        language.clone(),
+        stats,
+    );
     Some(stats)
 }
 
@@ -2775,7 +2885,10 @@ fn kind_filter_matches(filter: &str, kind: &str) -> bool {
             kind,
             &["class", "struct", "interface", "enum", "trait", "object"],
         ),
-        "value" => kind_matches_any(kind, &["property", "field", "variant"]),
+        "value" => kind_matches_any(
+            kind,
+            &["property", "field", "variant", "variable", "constant"],
+        ),
         _ => false,
     }
 }
@@ -2809,7 +2922,7 @@ fn build_include_set(globs: &[String]) -> AppResult<Option<GlobSet>> {
     Ok(Some(set))
 }
 
-fn build_exclude_set(excludes: &[String]) -> AppResult<Option<GlobSet>> {
+pub(crate) fn build_exclude_set(excludes: &[String]) -> AppResult<Option<GlobSet>> {
     if excludes.is_empty() {
         return Ok(None);
     }
@@ -2844,7 +2957,10 @@ fn expand_exclude_pattern(pattern: &str) -> Vec<String> {
     }
 }
 
-fn apply_excludes(files: Vec<ResolvedPath>, excludes: Option<&GlobSet>) -> Vec<ResolvedPath> {
+pub(crate) fn apply_excludes(
+    files: Vec<ResolvedPath>,
+    excludes: Option<&GlobSet>,
+) -> Vec<ResolvedPath> {
     match excludes {
         None => files,
         Some(set) => files
@@ -2976,7 +3092,6 @@ mod tests {
 
         fn resolved(&self, relative_path: &str) -> ResolvedPath {
             ResolvedPath {
-                repo_root: self.root.clone(),
                 relative_path: relative_path.to_string(),
                 full_path: self.root.join(relative_path),
             }
@@ -2987,44 +3102,6 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
-    }
-
-    #[test]
-    fn search_stops_loading_files_when_global_limit_is_filled() {
-        let repo = TempRepo::new("search-limit");
-        fs::write(repo.root.join("first.txt"), "needle\n").unwrap();
-
-        let response = search_resolved_files(
-            vec![repo.resolved("first.txt"), repo.resolved("missing.txt")],
-            "needle",
-            1,
-            false,
-            false,
-            &mut ParseCache::disabled(),
-        )
-        .unwrap();
-
-        assert_eq!(response.results.get("first.txt").unwrap(), &vec!["@L1"]);
-        assert_eq!(response.truncated, true);
-    }
-
-    #[test]
-    fn search_reports_truncated_when_single_file_exceeds_limit() {
-        let repo = TempRepo::new("search-file-limit");
-        fs::write(repo.root.join("first.txt"), "needle\nneedle\n").unwrap();
-
-        let response = search_resolved_files(
-            vec![repo.resolved("first.txt")],
-            "needle",
-            1,
-            false,
-            false,
-            &mut ParseCache::disabled(),
-        )
-        .unwrap();
-
-        assert_eq!(response.results.get("first.txt").unwrap(), &vec!["@L1"]);
-        assert_eq!(response.truncated, true);
     }
 
     #[test]

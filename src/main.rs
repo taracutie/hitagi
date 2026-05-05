@@ -1,4 +1,5 @@
 mod agent_prompt;
+mod bin_codec;
 mod cache;
 mod cli;
 mod commands;
@@ -10,6 +11,7 @@ mod output;
 mod parser;
 mod queries;
 mod repo;
+mod search;
 
 use std::process::ExitCode;
 

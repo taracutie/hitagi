@@ -90,33 +90,109 @@ pub struct SymbolResponse {
     pub symbol: OutputSymbolDetail,
 }
 
+/// Ranked-search response. Replaces the old literal-substring shape ~ each
+/// `result` is a chunk (path + start/end + score + source mode), not a list
+/// of `scope(kind) @L<n>` strings. Hits are pre-sorted by score desc.
 #[derive(Debug, Serialize)]
 pub struct SearchResponse {
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub prefix: String,
-    /// Always present. Empty (`{}`) when grouping is in effect or when zero
-    /// matches were found ~ keeps the field stable for consumers.
-    pub results: BTreeMap<String, Vec<String>>,
-    /// Per-prefix groups, populated when matches span multiple top-level
-    /// dirs. Each group carries its own `prefix` and `results` map. When
-    /// populated, the top-level `prefix` is empty and `results` is omitted.
-    /// Saves bytes by hoisting deep shared paths out of every key.
+    pub query: String,
+    pub mode: String,
+    /// Resolved alpha (0.0=BM25, 1.0=semantic). Always emitted so the agent
+    /// can see whether the auto-tuner kicked in or `--alpha` overrode.
+    pub alpha: f32,
+    pub limit: usize,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    pub groups: Vec<SearchGroup>,
-    #[serde(skip_serializing_if = "is_false")]
-    pub truncated: bool,
-    /// Top-level directories present in the walk root that the cap stopped
-    /// us from reaching. Only present when `truncated == true` AND the walk
-    /// missed at least one subtree ~ otherwise empty/omitted. Lets the
-    /// caller know when their --limit is producing a biased sample.
+    pub languages: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    pub unsampled_dirs: Vec<String>,
+    pub paths: Vec<String>,
+    pub elapsed_ms: u128,
+    pub indexed_files: usize,
+    pub indexed_chunks: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub warnings: Vec<String>,
+    pub results: Vec<SearchHit>,
 }
 
 #[derive(Debug, Serialize)]
-pub struct SearchGroup {
-    pub prefix: String,
-    pub results: BTreeMap<String, Vec<String>>,
+pub struct SearchHit {
+    pub path: String,
+    pub lines: [usize; 2],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    pub score: f32,
+    /// Which side of the hybrid actually surfaced this hit: `bm25`,
+    /// `semantic`, or `hybrid` (when the fusion contributed).
+    pub source: String,
+    /// First non-blank line of the chunk. Only emitted with `--snippet`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
+}
+
+/// `find-related` response. Contains the resolved source chunk so the
+/// caller can verify they pointed at what they meant, plus the related
+/// hits (excluding the source).
+#[derive(Debug, Serialize)]
+pub struct FindRelatedResponse {
+    pub path: String,
+    pub line: usize,
+    pub limit: usize,
+    pub elapsed_ms: u128,
+    pub indexed_files: usize,
+    pub indexed_chunks: usize,
+    pub source_chunk: SearchHit,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub warnings: Vec<String>,
+    pub results: Vec<SearchHit>,
+}
+
+/// `hitagi index status` response. Reports what's persisted in the search
+/// portion of the SQLite cache without forcing a load.
+#[derive(Debug, Serialize)]
+pub struct IndexStatusResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_file: Option<String>,
+    pub sparse_present: bool,
+    pub dense_present: bool,
+    pub indexed_files: usize,
+    pub indexed_chunks: usize,
+    pub languages: BTreeMap<String, usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encoder_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dim: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sparse_built_at_unix_secs: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dense_built_at_unix_secs: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sparse_size_bytes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dense_size_bytes: Option<usize>,
+}
+
+/// `hitagi index build` response.
+#[derive(Debug, Serialize)]
+pub struct IndexBuildResponse {
+    pub mode: String,
+    pub indexed_files: usize,
+    pub indexed_chunks: usize,
+    pub languages: BTreeMap<String, usize>,
+    pub elapsed_ms: u128,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub warnings: Vec<String>,
+}
+
+/// `hitagi index clean` response.
+#[derive(Debug, Serialize)]
+pub struct IndexCleanResponse {
+    /// True when at least one search row was deleted.
+    pub cleared: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_file: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

@@ -8,9 +8,10 @@ use crate::{
         AgentPromptResponse, CacheClearResponse, CachePathResponse, CacheStatusResponse,
         DiffFileResponse, DiffFileSummary, DiffHunk, DiffMultiFileResponse, DiffOverviewResponse,
         DiffPathsResponse, DiffSummaryFile, DiffSummaryGroup, DiffSummaryResponse, FilesGroup,
-        FilesResponse, FindGroup, FindMatch, FindMatches, FindResponse, LangsResponse,
-        OutlineResponse, OutputSymbol, ReadFileResponse, ReadSummaryResponse, SearchResponse,
-        SymbolResponse,
+        FilesResponse, FindGroup, FindMatch, FindMatches, FindRelatedResponse, FindResponse,
+        IndexBuildResponse, IndexCleanResponse, IndexStatusResponse, LangsResponse,
+        OutlineResponse, OutputSymbol, ReadFileResponse, ReadSummaryResponse, SearchHit,
+        SearchResponse, SymbolResponse,
     },
 };
 
@@ -28,8 +29,24 @@ pub fn print_symbol(path: &str, value: &SymbolResponse, mode: OutputMode) -> App
     emit(value, mode, || render_symbol(path, value))
 }
 
-pub fn print_search(query: &str, value: &SearchResponse, mode: OutputMode) -> AppResult<()> {
-    emit(value, mode, || render_search(query, value))
+pub fn print_search(value: &SearchResponse, mode: OutputMode) -> AppResult<()> {
+    emit(value, mode, || render_search(value))
+}
+
+pub fn print_find_related(value: &FindRelatedResponse, mode: OutputMode) -> AppResult<()> {
+    emit(value, mode, || render_find_related(value))
+}
+
+pub fn print_index_status(value: &IndexStatusResponse, mode: OutputMode) -> AppResult<()> {
+    emit(value, mode, || render_index_status(value))
+}
+
+pub fn print_index_build(value: &IndexBuildResponse, mode: OutputMode) -> AppResult<()> {
+    emit(value, mode, || render_index_build(value))
+}
+
+pub fn print_index_clean(value: &IndexCleanResponse, mode: OutputMode) -> AppResult<()> {
+    emit(value, mode, || render_index_clean(value))
 }
 
 pub fn print_read(path: &str, value: &ReadFileResponse, mode: OutputMode) -> AppResult<()> {
@@ -183,50 +200,157 @@ fn render_symbol(path: &str, value: &SymbolResponse) -> String {
     out
 }
 
-fn render_search(query: &str, value: &SearchResponse) -> String {
+fn render_search(value: &SearchResponse) -> String {
     let mut out = String::new();
-    let count = search_match_count(value);
-    let _ = writeln!(out, "search \"{query}\"\n{count} matches");
-    if value.truncated {
-        out.push_str("truncated • true\n");
+    let alpha_str = if value.mode == "bm25" {
+        String::new()
+    } else {
+        format!(" α={:.2}", value.alpha)
+    };
+    let _ = writeln!(
+        out,
+        "search \"{}\" • {}{} • {} hits / {} chunks in {} files • {}ms",
+        value.query,
+        value.mode,
+        alpha_str,
+        value.results.len(),
+        value.indexed_chunks,
+        value.indexed_files,
+        value.elapsed_ms
+    );
+    if !value.languages.is_empty() {
+        let _ = writeln!(out, "language filter • {}", value.languages.join(", "));
     }
-    if !value.unsampled_dirs.is_empty() {
-        let _ = writeln!(out, "unsampled • {}", value.unsampled_dirs.join(", "));
+    if !value.paths.is_empty() {
+        let _ = writeln!(out, "scope • {}", value.paths.join(", "));
     }
-    render_search_results(&mut out, &value.prefix, &value.results);
-    for group in &value.groups {
-        render_search_results(&mut out, &group.prefix, &group.results);
+    for hit in &value.results {
+        render_search_hit(&mut out, hit);
+    }
+    for warning in &value.warnings {
+        let _ = writeln!(out, "warning • {warning}");
     }
     out
 }
 
-fn render_search_results(
-    out: &mut String,
-    prefix: &str,
-    results: &std::collections::BTreeMap<String, Vec<String>>,
-) {
-    if results.is_empty() {
-        return;
+fn render_search_hit(out: &mut String, hit: &SearchHit) {
+    let lang = hit.language.as_deref().unwrap_or("plaintext");
+    let _ = write!(
+        out,
+        "{}:{}-{}\t{:.4}\t{}\t{lang}",
+        hit.path, hit.lines[0], hit.lines[1], hit.score, hit.source
+    );
+    if let Some(snippet) = &hit.snippet {
+        let _ = write!(out, " :: {snippet}");
     }
-    let render_prefix_once = !prefix.is_empty();
-    if render_prefix_once {
-        let _ = writeln!(out, "{prefix}");
-    }
-    for (path, matches) in results {
-        let path = if render_prefix_once {
-            path.to_string()
-        } else {
-            format!("{prefix}{path}")
-        };
-        render_search_file(out, &path, matches);
-    }
+    out.push('\n');
 }
 
-fn render_search_file(out: &mut String, path: &str, matches: &[String]) {
-    let _ = writeln!(out, "{path}");
-    for entry in matches {
-        let _ = writeln!(out, "  • {entry}");
+fn render_find_related(value: &FindRelatedResponse) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "find-related {}:{} • {} hits / {} chunks in {} files • {}ms",
+        value.path,
+        value.line,
+        value.results.len(),
+        value.indexed_chunks,
+        value.indexed_files,
+        value.elapsed_ms
+    );
+    let _ = writeln!(
+        out,
+        "source • {}:{}-{}",
+        value.source_chunk.path, value.source_chunk.lines[0], value.source_chunk.lines[1]
+    );
+    for hit in &value.results {
+        render_search_hit(&mut out, hit);
     }
+    for warning in &value.warnings {
+        let _ = writeln!(out, "warning • {warning}");
+    }
+    out
+}
+
+fn render_index_status(value: &IndexStatusResponse) -> String {
+    let mut out = String::new();
+    let sparse = if value.sparse_present {
+        "present"
+    } else {
+        "missing"
+    };
+    let dense = if value.dense_present {
+        "present"
+    } else {
+        "missing"
+    };
+    let _ = writeln!(
+        out,
+        "index status\nsparse {sparse} • dense {dense} • {} chunks in {} files",
+        value.indexed_chunks, value.indexed_files
+    );
+    if let Some(file) = &value.cache_file {
+        let _ = writeln!(out, "file • {file}");
+    }
+    if let Some(model_id) = &value.model_id {
+        let _ = write!(out, "model • {model_id}");
+        if let Some(kind) = &value.encoder_kind {
+            let _ = write!(out, " ({kind})");
+        }
+        if let Some(dim) = value.dim {
+            let _ = write!(out, " • dim {dim}");
+        }
+        out.push('\n');
+    }
+    if let Some(fp) = &value.model_fingerprint {
+        let _ = writeln!(out, "fingerprint • {fp}");
+    }
+    if let Some(secs) = value.sparse_built_at_unix_secs {
+        let _ = writeln!(out, "sparse built • {secs}");
+    }
+    if let Some(secs) = value.dense_built_at_unix_secs {
+        let _ = writeln!(out, "dense built • {secs}");
+    }
+    if !value.languages.is_empty() {
+        out.push_str("languages\n");
+        for (lang, count) in &value.languages {
+            let _ = writeln!(out, "  • {lang:<12} {count} chunks");
+        }
+    }
+    out
+}
+
+fn render_index_build(value: &IndexBuildResponse) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "index build • {} • {} chunks in {} files • {}ms",
+        value.mode, value.indexed_chunks, value.indexed_files, value.elapsed_ms
+    );
+    if !value.languages.is_empty() {
+        out.push_str("languages\n");
+        for (lang, count) in &value.languages {
+            let _ = writeln!(out, "  • {lang:<12} {count} chunks");
+        }
+    }
+    for warning in &value.warnings {
+        let _ = writeln!(out, "warning • {warning}");
+    }
+    out
+}
+
+fn render_index_clean(value: &IndexCleanResponse) -> String {
+    let mut out = String::new();
+    let state = if value.cleared {
+        "cleared"
+    } else {
+        "already empty"
+    };
+    let _ = writeln!(out, "index clean • {state}");
+    if let Some(file) = &value.cache_file {
+        let _ = writeln!(out, "file • {file}");
+    }
+    out
 }
 
 fn render_read(path: &str, value: &ReadFileResponse) -> String {
@@ -802,17 +926,6 @@ fn render_diff_hunk(out: &mut String, hunk: &DiffHunk) {
             out.push('\n');
         }
     }
-}
-
-fn search_match_count(value: &SearchResponse) -> usize {
-    let flat = value.results.values().map(Vec::len).sum::<usize>();
-    let grouped = value
-        .groups
-        .iter()
-        .flat_map(|group| group.results.values())
-        .map(Vec::len)
-        .sum::<usize>();
-    flat + grouped
 }
 
 fn find_response_count(value: &FindResponse) -> usize {
