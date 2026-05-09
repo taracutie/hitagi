@@ -13,6 +13,7 @@ const TEST_PACK_LANGUAGES: &[&str] = &[
     "markdown",
     "json",
     "javascript",
+    "kotlin",
 ];
 
 fn fixture_repo() -> PathBuf {
@@ -325,6 +326,42 @@ const miniBackend: ModerationBackend = {
 
     let first = scratch.run(&["symbol", "src/backends.ts", "run"]);
     assert_eq!(first["symbol"]["qualname"], "run");
+}
+
+#[test]
+fn outline_extracts_kotlin_symbols() {
+    let scratch = ScratchRepo::new("outline-kotlin");
+    scratch.write(
+        "src/Sample.kt",
+        r#"
+package com.example
+
+class Sample {
+    fun scan(value: String): Boolean {
+        return value.isNotBlank()
+    }
+}
+
+object Singleton {
+    val count = 1
+}
+"#,
+    );
+
+    let value = scratch.run(&["outline", "src/Sample.kt", "--depth", "2"]);
+    let symbols = value["symbols"].as_array().unwrap();
+    let qualnames: Vec<&str> = symbols
+        .iter()
+        .map(|s| s["qualname"].as_str().unwrap())
+        .collect();
+    assert!(qualnames.contains(&"Sample"));
+    assert!(qualnames.contains(&"Sample.scan"));
+    assert!(qualnames.contains(&"Singleton"));
+    assert!(qualnames.contains(&"Singleton.count"));
+
+    let find = scratch.run(&["find", "scan"]);
+    let matches = find["matches"].as_array().unwrap();
+    assert!(matches.iter().any(|m| m["qualname"] == "Sample.scan"));
 }
 
 #[test]
