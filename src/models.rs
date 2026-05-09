@@ -287,6 +287,69 @@ pub struct FindGroup {
 }
 
 #[derive(Debug, Serialize)]
+pub struct LocSymbolsResponse {
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub paths: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub languages: Vec<String>,
+    pub kinds: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_lines: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_lines: Option<usize>,
+    pub limit: usize,
+    pub sort: String,
+    pub scanned_files: usize,
+    pub total_matches: usize,
+    #[serde(skip_serializing_if = "is_false")]
+    pub truncated: bool,
+    pub results: Vec<LocSymbolResult>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LocSymbolResult {
+    pub path: String,
+    pub language: String,
+    pub kind: String,
+    pub qualname: String,
+    pub lines: [usize; 2],
+    pub code: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<[usize; 2]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LocFilesResponse {
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub globs: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub languages: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_lines: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_lines: Option<usize>,
+    pub limit: usize,
+    pub sort: String,
+    pub scanned_files: usize,
+    pub total_matches: usize,
+    #[serde(skip_serializing_if = "is_false")]
+    pub truncated: bool,
+    pub results: Vec<LocFileResult>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LocFileResult {
+    pub path: String,
+    pub language: String,
+    pub lines: usize,
+    pub code: usize,
+    pub blank: usize,
+    pub comment: usize,
+}
+
+#[derive(Debug, Serialize)]
 pub struct FilesResponse {
     pub files: Vec<String>,
     #[serde(skip_serializing_if = "is_false")]

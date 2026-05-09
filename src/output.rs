@@ -9,9 +9,9 @@ use crate::{
         DiffFileResponse, DiffFileSummary, DiffHunk, DiffMultiFileResponse, DiffOverviewResponse,
         DiffPathsResponse, DiffSummaryFile, DiffSummaryGroup, DiffSummaryResponse, FilesGroup,
         FilesResponse, FindGroup, FindMatch, FindMatches, FindRelatedResponse, FindResponse,
-        IndexBuildResponse, IndexCleanResponse, IndexStatusResponse, LangsResponse,
-        OutlineResponse, OutputSymbol, ReadFileResponse, ReadSummaryResponse, SearchHit,
-        SearchResponse, SymbolResponse,
+        IndexBuildResponse, IndexCleanResponse, IndexStatusResponse, LangsResponse, LocFileResult,
+        LocFilesResponse, LocSymbolResult, LocSymbolsResponse, OutlineResponse, OutputSymbol,
+        ReadFileResponse, ReadSummaryResponse, SearchHit, SearchResponse, SymbolResponse,
     },
 };
 
@@ -67,6 +67,14 @@ pub fn print_find(query: &str, value: &FindResponse, mode: OutputMode) -> AppRes
 
 pub fn print_files(value: &FilesResponse, mode: OutputMode) -> AppResult<()> {
     emit(value, mode, || render_files(value))
+}
+
+pub fn print_loc_symbols(value: &LocSymbolsResponse, mode: OutputMode) -> AppResult<()> {
+    emit(value, mode, || render_loc_symbols(value))
+}
+
+pub fn print_loc_files(value: &LocFilesResponse, mode: OutputMode) -> AppResult<()> {
+    emit(value, mode, || render_loc_files(value))
 }
 
 pub fn print_langs(value: &LangsResponse, mode: OutputMode) -> AppResult<()> {
@@ -504,6 +512,114 @@ fn render_more_in_file(
 ) {
     for (path, count) in more_in_file {
         let _ = writeln!(out, "… {count} more in {prefix}{path}");
+    }
+}
+
+fn render_loc_symbols(value: &LocSymbolsResponse) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "loc symbols\n{} shown / {} matches • {} files scanned • sort {}",
+        value.results.len(),
+        value.total_matches,
+        value.scanned_files,
+        value.sort
+    );
+    render_loc_filters(
+        &mut out,
+        value.min_lines,
+        value.max_lines,
+        Some(&value.kinds),
+        Some(&value.languages),
+        Some(&value.paths),
+    );
+    if value.truncated {
+        out.push_str("truncated • true\n");
+    }
+    for result in &value.results {
+        render_loc_symbol_result(&mut out, result);
+    }
+    out
+}
+
+fn render_loc_symbol_result(out: &mut String, result: &LocSymbolResult) {
+    let _ = write!(
+        out,
+        "• {}:L{}-{} code {} {} {}",
+        result.path, result.lines[0], result.lines[1], result.code, result.kind, result.qualname
+    );
+    if let Some(bytes) = result.bytes {
+        let _ = write!(out, " • bytes {}-{}", bytes[0], bytes[1]);
+    }
+    if let Some(snippet) = &result.snippet {
+        let _ = write!(out, " :: {snippet}");
+    }
+    out.push('\n');
+}
+
+fn render_loc_files(value: &LocFilesResponse) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "loc files\n{} shown / {} matches • {} files scanned • sort {}",
+        value.results.len(),
+        value.total_matches,
+        value.scanned_files,
+        value.sort
+    );
+    render_loc_filters(
+        &mut out,
+        value.min_lines,
+        value.max_lines,
+        None,
+        Some(&value.languages),
+        Some(&value.globs),
+    );
+    if value.truncated {
+        out.push_str("truncated • true\n");
+    }
+    for result in &value.results {
+        render_loc_file_result(&mut out, result);
+    }
+    out
+}
+
+fn render_loc_file_result(out: &mut String, result: &LocFileResult) {
+    let _ = writeln!(
+        out,
+        "• {} code {} / {} lines • blank {} • comment {} • {}",
+        result.path, result.code, result.lines, result.blank, result.comment, result.language
+    );
+}
+
+fn render_loc_filters(
+    out: &mut String,
+    min_lines: Option<usize>,
+    max_lines: Option<usize>,
+    kinds: Option<&[String]>,
+    languages: Option<&[String]>,
+    scopes: Option<&[String]>,
+) {
+    match (min_lines, max_lines) {
+        (Some(min), Some(max)) => {
+            let _ = writeln!(out, "line filter • {min}-{max}");
+        }
+        (Some(min), None) => {
+            let _ = writeln!(out, "line filter • >= {min}");
+        }
+        (None, Some(max)) => {
+            let _ = writeln!(out, "line filter • <= {max}");
+        }
+        (None, None) => {}
+    }
+    if let Some(kinds) = kinds.filter(|kinds| !kinds.is_empty()) {
+        let _ = writeln!(out, "kind filter • {}", kinds.join(", "));
+    }
+    if let Some(languages) = languages.filter(|languages| !languages.is_empty()) {
+        let _ = writeln!(out, "language filter • {}", languages.join(", "));
+    }
+    if let Some(scopes) = scopes.filter(|scopes| !scopes.is_empty()) {
+        let _ = writeln!(out, "scope • {}", scopes.join(", "));
     }
 }
 

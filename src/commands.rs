@@ -17,8 +17,9 @@ use crate::{
         DiffPathsResponse, DiffSummaryFile, DiffSummaryGroup, DiffSummaryResponse, FilesGroup,
         FilesResponse, FindGroup, FindMatch, FindMatches, FindRelatedResponse, FindResponse,
         IndexBuildResponse, IndexCleanResponse, IndexStatusResponse, LangSummary, LangsResponse,
-        OutlineResponse, OutputSymbol, OutputSymbolDetail, ReadFileResponse, ReadSummaryResponse,
-        SearchHit, SearchResponse, SymbolDetail, SymbolInfo, SymbolResponse,
+        LocFileResult, LocFilesResponse, LocSymbolResult, LocSymbolsResponse, OutlineResponse,
+        OutputSymbol, OutputSymbolDetail, ReadFileResponse, ReadSummaryResponse, SearchHit,
+        SearchResponse, SymbolDetail, SymbolInfo, SymbolResponse,
     },
     parser::{parse_source, ParsedFile},
     queries::{
@@ -128,6 +129,48 @@ pub struct FilesOptions {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocSort {
+    CodeDesc,
+    CodeAsc,
+    Path,
+}
+
+impl LocSort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CodeDesc => "code-desc",
+            Self::CodeAsc => "code-asc",
+            Self::Path => "path",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LocSymbolsOptions {
+    pub paths: Vec<String>,
+    pub excludes: Vec<String>,
+    pub kinds: Vec<String>,
+    pub languages: Vec<String>,
+    pub min_lines: Option<usize>,
+    pub max_lines: Option<usize>,
+    pub limit: usize,
+    pub sort: LocSort,
+    pub bytes: bool,
+    pub snippet: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct LocFilesOptions {
+    pub globs: Vec<String>,
+    pub excludes: Vec<String>,
+    pub languages: Vec<String>,
+    pub min_lines: Option<usize>,
+    pub max_lines: Option<usize>,
+    pub limit: usize,
+    pub sort: LocSort,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiffScope {
     All,
     Staged,
@@ -206,6 +249,7 @@ enum FindWorkItem {
 
 struct FindFileResult {
     relative_path: String,
+    language: Language,
     symbols: Vec<SymbolInfo>,
     content: Option<String>,
     cache_update: Option<ParseCacheUpdate>,
@@ -309,9 +353,7 @@ pub fn symbol(
     )?;
     cache.save(false);
 
-    let parsed = ParsedFile {
-        symbols,
-    };
+    let parsed = ParsedFile { symbols };
     let detail = symbol_detail(&parsed, &content, qualname, MAX_RESPONSE_BYTES)?;
 
     Ok(SymbolResponse {
@@ -1101,6 +1143,186 @@ fn format_terse_match(m: FindMatch) -> String {
         s.push_str(&snippet);
     }
     s
+}
+
+pub fn loc_symbols(repo: &RepoRoot, opts: LocSymbolsOptions) -> AppResult<LocSymbolsResponse> {
+    validate_loc_options(opts.min_lines, opts.max_lines, opts.limit)?;
+
+    let kinds = if opts.kinds.is_empty() {
+        vec!["callable".to_string()]
+    } else {
+        opts.kinds.clone()
+    };
+    let exclude_set = build_exclude_set(&opts.excludes)?;
+    let files = apply_excludes(
+        repo.collect_search_files(&opts.paths)?,
+        exclude_set.as_ref(),
+    );
+
+    let mut cache = ParseCache::open(repo.root());
+    let mut results: Vec<LocSymbolResult> = Vec::new();
+    let mut scanned_files = 0usize;
+    let chunk_size = parallel_parse_chunk_size();
+    let mut index = 0usize;
+
+    while index < files.len() {
+        let end = (index + chunk_size).min(files.len());
+        let prepared: Vec<FindWorkItem> = files[index..end]
+            .iter()
+            .cloned()
+            .map(|resolved| prepare_loc_symbol_file(&mut cache, resolved, &opts.languages))
+            .collect();
+        let outcomes: Vec<FindWorkResult> =
+            prepared.into_par_iter().map(execute_find_file).collect();
+
+        index = end;
+
+        for outcome in outcomes {
+            let result = match outcome {
+                FindWorkResult::Skipped { .. } => continue,
+                FindWorkResult::Error { error, .. } => return Err(error),
+                FindWorkResult::Ready(result) => result,
+            };
+
+            if let Some(update) = result.cache_update {
+                insert_cache_update(&mut cache, update);
+            }
+
+            scanned_files += 1;
+            let Some(content) = result.content.as_deref() else {
+                continue;
+            };
+            let language = result.language.as_str().to_string();
+
+            for symbol in result.symbols {
+                if !matches_kinds(&kinds, &symbol.kind) {
+                    continue;
+                }
+
+                let code = symbol_code_lines(content, &symbol, &result.language)?;
+                if !line_count_in_range(code, opts.min_lines, opts.max_lines) {
+                    continue;
+                }
+
+                let snippet = opts.snippet.then(|| {
+                    snippet_for_symbol_signature(
+                        content,
+                        symbol.range.start_byte,
+                        symbol.range.end_byte,
+                    )
+                });
+                results.push(LocSymbolResult {
+                    path: result.relative_path.clone(),
+                    language: language.clone(),
+                    kind: symbol.kind.clone(),
+                    qualname: symbol.qualname.clone(),
+                    lines: [symbol.range.start_line, symbol.range.end_line],
+                    code,
+                    bytes: opts
+                        .bytes
+                        .then_some([symbol.range.start_byte, symbol.range.end_byte]),
+                    snippet,
+                });
+            }
+        }
+    }
+
+    cache.save(false);
+    sort_loc_symbols(&mut results, opts.sort);
+    let total_matches = results.len();
+    let truncated = total_matches > opts.limit;
+    if truncated {
+        results.truncate(opts.limit);
+    }
+
+    Ok(LocSymbolsResponse {
+        paths: opts.paths,
+        languages: opts.languages,
+        kinds,
+        min_lines: opts.min_lines,
+        max_lines: opts.max_lines,
+        limit: opts.limit,
+        sort: opts.sort.as_str().to_string(),
+        scanned_files,
+        total_matches,
+        truncated,
+        results,
+    })
+}
+
+pub fn loc_files(repo: &RepoRoot, opts: LocFilesOptions) -> AppResult<LocFilesResponse> {
+    validate_loc_options(opts.min_lines, opts.max_lines, opts.limit)?;
+
+    let include_set = build_include_set(&opts.globs)?;
+    let exclude_set = build_exclude_set(&opts.excludes)?;
+    let mut cache = ParseCache::open(repo.root());
+    let mut results: Vec<LocFileResult> = Vec::new();
+    let mut scanned_files = 0usize;
+
+    for resolved in repo.collect_search_files(&[])? {
+        if !path_matches_include_set(&resolved.relative_path, include_set.as_ref()) {
+            continue;
+        }
+        if path_matches_exclude_set(&resolved.relative_path, exclude_set.as_ref()) {
+            continue;
+        }
+
+        let metadata = match std::fs::metadata(&resolved.full_path) {
+            Ok(metadata) if metadata.is_file() => metadata,
+            _ => continue,
+        };
+        let language =
+            Language::detect(Path::new(&resolved.full_path)).unwrap_or(Language::Plaintext);
+        if !language.is_parseable() {
+            continue;
+        }
+        if !matches_languages(&opts.languages, &language) {
+            continue;
+        }
+
+        let Some(stats) = cache_line_stats_for(&mut cache, &resolved, &metadata, &language) else {
+            continue;
+        };
+        scanned_files += 1;
+
+        let lines = stats.total as usize;
+        let blank = stats.blank as usize;
+        let comment = stats.comment as usize;
+        let code = lines.saturating_sub(blank).saturating_sub(comment);
+        if !line_count_in_range(code, opts.min_lines, opts.max_lines) {
+            continue;
+        }
+
+        results.push(LocFileResult {
+            path: resolved.relative_path,
+            language: language.as_str().to_string(),
+            lines,
+            code,
+            blank,
+            comment,
+        });
+    }
+
+    cache.save(false);
+    sort_loc_files(&mut results, opts.sort);
+    let total_matches = results.len();
+    let truncated = total_matches > opts.limit;
+    if truncated {
+        results.truncate(opts.limit);
+    }
+
+    Ok(LocFilesResponse {
+        globs: opts.globs,
+        languages: opts.languages,
+        min_lines: opts.min_lines,
+        max_lines: opts.max_lines,
+        limit: opts.limit,
+        sort: opts.sort.as_str().to_string(),
+        scanned_files,
+        total_matches,
+        truncated,
+        results,
+    })
 }
 
 pub fn files(repo: &RepoRoot, opts: FilesOptions) -> AppResult<FilesResponse> {
@@ -2692,6 +2914,23 @@ fn prepare_find_file(
     resolved: ResolvedPath,
     needs_content: bool,
 ) -> FindWorkItem {
+    prepare_parsed_file(cache, resolved, needs_content, &[])
+}
+
+fn prepare_loc_symbol_file(
+    cache: &mut ParseCache,
+    resolved: ResolvedPath,
+    languages: &[String],
+) -> FindWorkItem {
+    prepare_parsed_file(cache, resolved, true, languages)
+}
+
+fn prepare_parsed_file(
+    cache: &mut ParseCache,
+    resolved: ResolvedPath,
+    needs_content: bool,
+    languages: &[String],
+) -> FindWorkItem {
     let stat = match stat_file(&resolved) {
         Ok(value) => value,
         Err(AppError::TooLarge(_)) | Err(AppError::InvalidUtf8(_)) => {
@@ -2715,6 +2954,11 @@ fn prepare_find_file(
             };
         }
     };
+    if !matches_languages(languages, &language) {
+        return FindWorkItem::Skip {
+            relative_path: resolved.relative_path,
+        };
+    }
     let cached_symbols = cache.lookup(&resolved.relative_path, &stat.metadata, &language);
 
     FindWorkItem::Load(PreparedFindFile {
@@ -2763,6 +3007,7 @@ fn execute_find_file(item: FindWorkItem) -> FindWorkResult {
 
         return FindWorkResult::Ready(FindFileResult {
             relative_path: prepared.resolved.relative_path,
+            language: prepared.language,
             symbols,
             content,
             cache_update: None,
@@ -2803,7 +3048,7 @@ fn execute_find_file(item: FindWorkItem) -> FindWorkResult {
     let cache_update = ParseCacheUpdate {
         relative_path: prepared.resolved.relative_path.clone(),
         metadata: prepared.metadata,
-        language: prepared.language,
+        language: prepared.language.clone(),
         line_stats,
         symbols: symbols.clone(),
     };
@@ -2811,6 +3056,7 @@ fn execute_find_file(item: FindWorkItem) -> FindWorkResult {
 
     FindWorkResult::Ready(FindFileResult {
         relative_path: prepared.resolved.relative_path,
+        language: prepared.language,
         symbols,
         content,
         cache_update: Some(cache_update),
@@ -2868,6 +3114,90 @@ fn cache_line_stats_for(
         stats,
     );
     Some(stats)
+}
+
+fn validate_loc_options(
+    min_lines: Option<usize>,
+    max_lines: Option<usize>,
+    limit: usize,
+) -> AppResult<()> {
+    if limit == 0 {
+        return Err(AppError::bad_request("--limit must be at least 1"));
+    }
+    if let (Some(min), Some(max)) = (min_lines, max_lines) {
+        if min > max {
+            return Err(AppError::bad_request(
+                "--min-lines cannot be greater than --max-lines",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn line_count_in_range(code: usize, min_lines: Option<usize>, max_lines: Option<usize>) -> bool {
+    min_lines.map_or(true, |min| code >= min) && max_lines.map_or(true, |max| code <= max)
+}
+
+fn symbol_code_lines(source: &str, symbol: &SymbolInfo, language: &Language) -> AppResult<usize> {
+    if symbol.range.end_byte > source.len() || symbol.range.start_byte > symbol.range.end_byte {
+        return Err(AppError::internal("invalid symbol byte range"));
+    }
+
+    let bytes = &source.as_bytes()[symbol.range.start_byte..symbol.range.end_byte];
+    let stats = count_lines(bytes, language);
+    Ok(stats.total.saturating_sub(stats.blank + stats.comment) as usize)
+}
+
+fn sort_loc_symbols(results: &mut [LocSymbolResult], sort: LocSort) {
+    match sort {
+        LocSort::CodeDesc => results.sort_by(|a, b| {
+            b.code
+                .cmp(&a.code)
+                .then_with(|| a.path.cmp(&b.path))
+                .then_with(|| a.lines[0].cmp(&b.lines[0]))
+                .then_with(|| a.qualname.cmp(&b.qualname))
+        }),
+        LocSort::CodeAsc => results.sort_by(|a, b| {
+            a.code
+                .cmp(&b.code)
+                .then_with(|| a.path.cmp(&b.path))
+                .then_with(|| a.lines[0].cmp(&b.lines[0]))
+                .then_with(|| a.qualname.cmp(&b.qualname))
+        }),
+        LocSort::Path => results.sort_by(|a, b| {
+            a.path
+                .cmp(&b.path)
+                .then_with(|| a.lines[0].cmp(&b.lines[0]))
+                .then_with(|| a.qualname.cmp(&b.qualname))
+        }),
+    }
+}
+
+fn sort_loc_files(results: &mut [LocFileResult], sort: LocSort) {
+    match sort {
+        LocSort::CodeDesc => {
+            results.sort_by(|a, b| b.code.cmp(&a.code).then_with(|| a.path.cmp(&b.path)))
+        }
+        LocSort::CodeAsc => {
+            results.sort_by(|a, b| a.code.cmp(&b.code).then_with(|| a.path.cmp(&b.path)))
+        }
+        LocSort::Path => results.sort_by(|a, b| a.path.cmp(&b.path)),
+    }
+}
+
+fn matches_languages(filter: &[String], language: &Language) -> bool {
+    filter.is_empty()
+        || filter
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(language.as_str()))
+}
+
+fn path_matches_include_set(path: &str, set: Option<&GlobSet>) -> bool {
+    set.map_or(true, |set| set.is_match(path))
+}
+
+fn path_matches_exclude_set(path: &str, set: Option<&GlobSet>) -> bool {
+    set.map_or(false, |set| set.is_match(path))
 }
 
 fn matches_kinds(filter: &[String], kind: &str) -> bool {

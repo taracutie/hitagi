@@ -1026,6 +1026,204 @@ fn find_includes_note_when_no_parseable_files() {
 }
 
 #[test]
+fn loc_symbols_filters_and_sorts_by_code_lines() {
+    let scratch = ScratchRepo::new("loc-symbols");
+    scratch.write(
+        "src/lib.rs",
+        r#"
+fn tiny() {}
+
+fn medium() {
+    let a = 1;
+    // comment-only lines do not count
+    let b = 2;
+
+    let c = a + b;
+}
+
+struct Worker;
+
+impl Worker {
+    fn long(&self) {
+        let a = 1;
+        let b = 2;
+        let c = 3;
+        let d = 4;
+    }
+}
+"#,
+    );
+
+    let value = scratch.run(&[
+        "loc",
+        "symbols",
+        "--min-lines",
+        "5",
+        "--limit",
+        "10",
+        "--sort",
+        "code-desc",
+    ]);
+    assert_eq!(value["kinds"][0], "callable");
+    assert_eq!(value["total_matches"], 2);
+    let results = value["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2);
+    assert!(results[0]["code"].as_u64().unwrap() >= results[1]["code"].as_u64().unwrap());
+
+    let qualnames: Vec<&str> = results
+        .iter()
+        .map(|r| r["qualname"].as_str().unwrap())
+        .collect();
+    assert!(qualnames.iter().any(|q| q.ends_with("long")));
+    assert!(qualnames.contains(&"medium"));
+    assert!(!qualnames.contains(&"tiny"));
+
+    let medium = results
+        .iter()
+        .find(|r| r["qualname"] == "medium")
+        .expect("medium function should be present");
+    assert_eq!(medium["code"], 5);
+}
+
+#[test]
+fn loc_symbols_supports_kind_language_scope_exclude_and_snippet() {
+    let scratch = ScratchRepo::new("loc-symbol-filters");
+    scratch.write(
+        "vendor/generated.rs",
+        r#"
+fn generated() {
+    let a = 1;
+    let b = 2;
+}
+"#,
+    );
+    scratch.write(
+        "src/worker.ts",
+        r#"
+export class Worker {
+  run(): boolean {
+    const value = true;
+    return value;
+  }
+}
+"#,
+    );
+
+    let value = scratch.run(&[
+        "loc",
+        "symbols",
+        "src",
+        "--kind",
+        "method",
+        "--language",
+        "typescript",
+        "--exclude",
+        "vendor",
+        "--bytes",
+        "--snippet",
+        "--sort",
+        "path",
+    ]);
+    let results = value["results"].as_array().unwrap();
+    assert_eq!(results.len(), 1);
+    let result = &results[0];
+    assert_eq!(result["language"], "typescript");
+    assert_eq!(result["kind"], "method");
+    assert!(result["qualname"].as_str().unwrap().ends_with("run"));
+    assert!(result["bytes"].is_array());
+    assert!(result["snippet"].as_str().unwrap().contains("run"));
+    assert!(!result["path"].as_str().unwrap().contains("vendor"));
+}
+
+#[test]
+fn loc_files_filters_globs_and_counts_code_lines() {
+    let scratch = ScratchRepo::new("loc-files");
+    scratch.write(
+        "src/lib.rs",
+        r#"
+// module comment
+fn medium() {
+    let a = 1;
+    let b = 2;
+
+    let c = a + b;
+}
+"#,
+    );
+    scratch.write(
+        "vendor/generated.rs",
+        r#"
+fn generated() {
+    let a = 1;
+    let b = 2;
+    let c = 3;
+    let d = 4;
+}
+"#,
+    );
+    scratch.write(
+        "src/worker.ts",
+        r#"
+export function runWorker() {
+  return true;
+}
+"#,
+    );
+
+    let value = scratch.run(&[
+        "loc",
+        "files",
+        "**/*.rs",
+        "--exclude",
+        "vendor",
+        "--min-lines",
+        "5",
+        "--language",
+        "rust",
+    ]);
+    let results = value["results"].as_array().unwrap();
+    assert_eq!(results.len(), 1);
+    let result = &results[0];
+    assert_eq!(result["path"], "src/lib.rs");
+    assert_eq!(result["language"], "rust");
+    assert_eq!(result["code"], 5);
+    assert!(result["lines"].as_u64().unwrap() > result["code"].as_u64().unwrap());
+    assert_eq!(result["comment"], 1);
+}
+
+#[test]
+fn loc_files_skips_plaintext_files() {
+    let scratch = ScratchRepo::new("loc-files-parseable-only");
+    scratch.write(
+        "Cargo.lock",
+        r#"
+package-a 1
+package-b 2
+package-c 3
+package-d 4
+package-e 5
+"#,
+    );
+    scratch.write("src/lib.rs", "fn main() {}\n");
+
+    let value = scratch.run(&["loc", "files", "--min-lines", "1", "--sort", "path"]);
+    assert_eq!(value["scanned_files"], 1);
+    let results = value["results"].as_array().unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["path"], "src/lib.rs");
+    assert_eq!(results[0]["language"], "rust");
+}
+
+#[test]
+fn loc_validates_limit_and_line_range() {
+    let limit_error = run_failure(&["loc", "symbols", "--limit", "0"]);
+    assert!(limit_error.contains("--limit must be at least 1"));
+
+    let range_error = run_failure(&["loc", "files", "--min-lines", "10", "--max-lines", "3"]);
+    assert!(range_error.contains("--min-lines cannot be greater than --max-lines"));
+}
+
+#[test]
 fn langs_summarises_repo() {
     let value = run(&["langs"]);
     let langs = value["languages"].as_array().unwrap();
@@ -1188,6 +1386,8 @@ fn long_help_includes_llm_prompt_sections() {
         "--paths",
         "--names-only",
         "read --summary",
+        "loc symbols",
+        "--min-lines",
         "Directory diff summary",
         "multi-drilldown",
     ] {

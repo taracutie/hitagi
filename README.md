@@ -21,6 +21,7 @@ Commands:
 - `find-related <FILE> <LINE>` ~ semantically related chunks to one you're already looking at.
 - `read <PATH>` ~ dump a file, a line slice with `--lines S-E`, or metadata-only structure with `--summary`.
 - `find <QUERY> [PATHS...]` ~ locate symbols across the repo by qualname substring (case-insensitive).
+- `loc symbols|files` ~ rank symbols or files by language-aware code-line count.
 - `files [GLOBS...]` ~ list files in the repo (gitignore-aware), optionally filtered by globs.
 - `langs` ~ summarise languages present in the repo (file count + line count per language).
 - `diff [PATHS...]` ~ review uncommitted changes; overview by default, `--commit`/`--summary` for compact review, `--paths` for staging lists, structured hunks when file paths are given.
@@ -32,7 +33,7 @@ When a `find` walk has no positional [PATHS], it visits top-level subdirs round-
 
 Supported languages are pack-driven:
 
-- Files detected by `tree-sitter-language-pack` are parseable and can support `outline`, `symbol`, `find`, syntax-aware `search` chunks, and `diff` symbol annotations.
+- Files detected by `tree-sitter-language-pack` are parseable and can support `outline`, `symbol`, `find`, `loc symbols`, syntax-aware `search` chunks, and `diff` symbol annotations.
 - `Dockerfile` / `Containerfile` and `Makefile` get explicit filename labels in addition to the pack's path detector.
 - Unknown or unsupported files are still available to `read`, `files`, and `langs`, but they are treated as `plaintext` and are not syntax-indexed by `search`.
 
@@ -211,6 +212,34 @@ Flags:
 `searched_files` reports how many parseable files were inspected. When zero (e.g. `find foo vendor`), the response includes a `note` explaining why.
 
 When matches span multiple top-level dirs with no shared prefix, the response switches to a grouped shape: `{"matches": [], "groups": [{"prefix": "...", "matches": [...], "more_in_file": {...}?}, ...]}`. Each group carries its own `prefix` (the longest common prefix within that bucket) with each match's `path` stripped relative to it. The flat-when-shared and grouped-when-spanning behavior keeps the typical case unchanged while saving a lot of bytes when matches scatter across deep monorepo paths.
+
+### `loc symbols|files`
+
+```bash
+hitagi loc symbols --min-lines 80 --snippet
+hitagi loc symbols --min-lines 20 --max-lines 80 src
+hitagi loc files "**/*.rs" --min-lines 300
+```
+
+Ranks parsed symbols or files by language-aware code lines. Code lines are nonblank, noncomment logical lines using the same counter as `langs` and `read --summary`.
+
+`loc symbols` scans parseable files and defaults to `--kind callable` (`function`, `method`, `arrow_function`) so the first results are useful refactoring candidates. It accepts positional `[PATHS]` to scope the scan.
+
+`loc files` scans parseable files only and accepts positional glob patterns like `files`.
+
+Shared flags:
+
+- `--min-lines N` / `--max-lines N` ~ inclusive code-line filters.
+- `--limit N` ~ maximum results after sorting (default `50`).
+- `--sort code-desc|code-asc|path` ~ default `code-desc`.
+- `--language LANG` (repeatable) ~ restrict by detected language label.
+- `--exclude PATTERN` (repeatable) ~ skip matching paths.
+
+Symbol-only flags:
+
+- `--kind K1,K2,...` ~ same syntax and aliases as `find`; defaults to `callable`.
+- `--bytes` ~ include byte ranges.
+- `--snippet` ~ include each symbol's first-line signature.
 
 ### `files [GLOBS...]`
 

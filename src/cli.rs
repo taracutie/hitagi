@@ -6,8 +6,9 @@ use crate::{
     agent_prompt::{self, AgentKind},
     commands::{
         self, DiffBodyMode, DiffFileOptions, DiffOptions, DiffScope, DiffSummaryOptions,
-        FilesOptions, FindOptions, FindRelatedOptions, IndexBuildOptions, OutlineOptions,
-        ReadOptions, SearchModeArg, SearchOptions, SymbolOptions,
+        FilesOptions, FindOptions, FindRelatedOptions, IndexBuildOptions, LocFilesOptions, LocSort,
+        LocSymbolsOptions, OutlineOptions, ReadOptions, SearchModeArg, SearchOptions,
+        SymbolOptions,
     },
     error::{AppError, AppResult},
     output::{self, OutputMode},
@@ -19,6 +20,7 @@ const DEFAULT_FIND_RELATED_LIMIT: usize = 10;
 const DEFAULT_FIND_LIMIT: usize = 50;
 const DEFAULT_PER_FILE: usize = 5;
 const DEFAULT_FILES_LIMIT: usize = 2000;
+const DEFAULT_LOC_LIMIT: usize = 50;
 
 const LONG_ABOUT: &str = "\
 hitagi is a local CLI for tree-sitter-backed structural code queries, built for LLM \
@@ -43,7 +45,8 @@ RECOMMENDED WORKFLOW
   6. search <Q>            ranked hybrid search (BM25 + semantic, RRF-fused)
   7. find-related <FILE> <LINE>   semantically related chunks
   8. read <FILE>           dump content, line slices, or --summary structure
-  9. diff [FILES...]       review changes (overview, --commit, --paths, or drill)
+  9. loc symbols/files     find long methods or files by code-line count
+  10. diff [FILES...]      review changes (overview, --commit, --paths, or drill)
 
 SUPPORTED LANGUAGES
   Language detection and parsing are provided by tree-sitter-language-pack.
@@ -99,11 +102,11 @@ TIPS
 
   Limits and truncation
     Default `--limit` (`-k`) is 10 for `search` / `find-related`, 50 for `find`,
-    2000 for `files`. `find` / `files` carry `\"truncated\": true` when the cap
-    is reached and `files` adds per-glob/per-root first/last samples so truncated
-    discovery stays useful. `search` / `find-related` always return exactly the
-    top-N hits ~ ranking decides what's in vs out; bump `--limit` when you need
-    a wider net.
+    50 for `loc`, and 2000 for `files`. `find` / `loc` / `files` carry
+    `\"truncated\": true` when the cap is reached and `files` adds per-glob/per-root
+    first/last samples so truncated discovery stays useful. `search` /
+    `find-related` always return exactly the top-N hits ~ ranking decides what's
+    in vs out; bump `--limit` when you need a wider net.
 
   Fair sampling on full-repo sweeps
     `find` walks top-level subdirs round-robin (one file per bucket in turn)
@@ -115,8 +118,8 @@ TIPS
     indexes the whole repo unconditionally; `[PATHS]` is a post-rank filter.)
 
   Excluding noise (--exclude)
-    `search`, `find`, and `files` accept --exclude PATTERN (repeatable). Bare names
-    like `--exclude vendor` skip that directory at any depth; full globs like
+    `search`, `find`, `loc`, and `files` accept --exclude PATTERN (repeatable). Bare
+    names like `--exclude vendor` skip that directory at any depth; full globs like
     `--exclude \"vendor/**\"` work too. Typical: --exclude vendor --exclude target
     --exclude node_modules. Cuts grammar-source / build-artifact noise from sweeps.
 
@@ -126,6 +129,13 @@ TIPS
     actually present ~ no need for a second probe call. Aliases: callable =
     function/method/arrow_function, container = class/struct/interface/enum/trait/
     object, value = property/field/variant/variable/constant.
+
+  loc code-line metrics
+    `loc symbols` ranks parsed symbols by language-aware code lines (nonblank,
+    noncomment) and defaults to `--kind callable` for refactoring long methods.
+    Use `--min-lines N` / `--max-lines N` for inclusive filters and `--sort
+    code-desc|code-asc|path` for ordering. `loc files` uses the same code-line
+    metric over whole parseable files and accepts positional globs like `files`.
 
   outline --depth N
     Limits nesting depth: --depth 1 keeps top-level shapes only; --depth 2 also
@@ -243,6 +253,8 @@ COMMON PATTERNS
   List all Rust + TOML files      hitagi files \"**/*.rs\" \"**/*.toml\"
   Find Auth-related classes       hitagi find Auth --kind class,struct --snippet
   Find inside one subtree         hitagi find Network --kind struct src/nnue
+  Find long methods               hitagi loc symbols --min-lines 80 --snippet
+  Find large Rust files            hitagi loc files \"**/*.rs\" --min-lines 300
   Cheap top-level orientation     hitagi outline FILE --depth 1
   Cheap sweep across the repo     hitagi find X --terse --limit 200
   Diverse sweep (cap hot files)   hitagi find X --terse --per-file 3
@@ -309,6 +321,16 @@ JSON OUTPUT SHAPES (--json; compact form ~ omitted optional fields appear only w
   files     {\"files\":[\"a\",\"b\",...],\"truncated\":bool,
             \"groups\":[{\"pattern\":\"...\"?,\"root\":\"...\"?,\"total\":N,
             \"shown\":N,\"first\":[...],\"last\":[...]}]?,\"note\":\"...\"?}
+  loc symbols {\"paths\":[...]?,\"languages\":[...]?,\"kinds\":[...],
+            \"min_lines\":N?,\"max_lines\":N?,\"limit\":N,\"sort\":\"...\",
+            \"scanned_files\":N,\"total_matches\":N,\"truncated\":bool?,
+            \"results\":[{\"path\":\"...\",\"language\":\"...\",\"kind\":\"...\",
+            \"qualname\":\"...\",\"lines\":[s,e],\"code\":N,\"bytes\":[s,e]?,
+            \"snippet\":\"...\"?}]}
+  loc files {\"globs\":[...]?,\"languages\":[...]?,\"min_lines\":N?,
+            \"max_lines\":N?,\"limit\":N,\"sort\":\"...\",\"scanned_files\":N,
+            \"total_matches\":N,\"truncated\":bool?,\"results\":[{\"path\":\"...\",
+            \"language\":\"...\",\"lines\":N,\"code\":N,\"blank\":N,\"comment\":N}]}
   langs     {\"languages\":[{\"language\":\"rust\",\"files\":N,\"lines\":N,
             \"parseable\":bool},...]}
   diff      overview: {\"prefix\":\"...\"?,\"files\":[{\"path\":\"...\",
@@ -530,6 +552,15 @@ enum Commands {
         #[arg(long, default_value_t = DEFAULT_FILES_LIMIT)]
         limit: usize,
     },
+    /// Rank symbols or files by language-aware code lines.
+    ///
+    /// `loc symbols` scans parseable files and defaults to callable symbols
+    /// (functions, methods, arrow functions). `loc files` scans parseable files
+    /// and accepts the same positional glob syntax as `files`.
+    Loc {
+        #[command(subcommand)]
+        action: LocAction,
+    },
     /// Summarize languages present in the repo (file count + line count per language).
     ///
     /// Useful for "is this a Rust project? what other languages?" orientation in one call.
@@ -623,6 +654,84 @@ enum Commands {
         #[arg(long, value_name = "PATTERN")]
         exclude: Vec<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum LocAction {
+    /// Rank parseable symbols by nonblank, noncomment code lines. Defaults to --kind callable.
+    Symbols {
+        /// Optional path prefixes to scope the scan.
+        paths: Vec<String>,
+        /// Keep only symbols with at least this many code lines.
+        #[arg(long = "min-lines", value_name = "N")]
+        min_lines: Option<usize>,
+        /// Keep only symbols with at most this many code lines.
+        #[arg(long = "max-lines", value_name = "N")]
+        max_lines: Option<usize>,
+        /// Maximum results to return after sorting.
+        #[arg(long, default_value_t = DEFAULT_LOC_LIMIT)]
+        limit: usize,
+        /// Sort order.
+        #[arg(long, value_enum, default_value_t = CliLocSortMode::CodeDesc)]
+        sort: CliLocSortMode,
+        /// Filter to symbols of these kinds. Comma-separated. Defaults to callable.
+        #[arg(long, value_delimiter = ',', value_name = "KIND")]
+        kind: Vec<String>,
+        /// Restrict to files of this language label (`rust`, `go`, ...). Repeatable.
+        #[arg(long = "language", value_name = "LANG")]
+        languages: Vec<String>,
+        /// Include byte ranges (`bytes: [start, end]`) on each result.
+        #[arg(long)]
+        bytes: bool,
+        /// Include the symbol's first-line signature as a `snippet` field.
+        #[arg(long)]
+        snippet: bool,
+        /// Glob patterns to exclude (repeatable). Bare names like `vendor`
+        /// exclude that directory at any depth.
+        #[arg(long, value_name = "PATTERN")]
+        exclude: Vec<String>,
+    },
+    /// Rank parseable files by nonblank, noncomment code lines. Positional arguments are glob patterns.
+    Files {
+        /// Glob patterns. Multiple are OR'd. If omitted, scans everything.
+        globs: Vec<String>,
+        /// Keep only files with at least this many code lines.
+        #[arg(long = "min-lines", value_name = "N")]
+        min_lines: Option<usize>,
+        /// Keep only files with at most this many code lines.
+        #[arg(long = "max-lines", value_name = "N")]
+        max_lines: Option<usize>,
+        /// Maximum results to return after sorting.
+        #[arg(long, default_value_t = DEFAULT_LOC_LIMIT)]
+        limit: usize,
+        /// Sort order.
+        #[arg(long, value_enum, default_value_t = CliLocSortMode::CodeDesc)]
+        sort: CliLocSortMode,
+        /// Restrict to files of this language label (`rust`, `go`, ...). Repeatable.
+        #[arg(long = "language", value_name = "LANG")]
+        languages: Vec<String>,
+        /// Glob patterns to exclude (repeatable). Bare names like `vendor`
+        /// exclude that directory at any depth.
+        #[arg(long, value_name = "PATTERN")]
+        exclude: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum CliLocSortMode {
+    CodeDesc,
+    CodeAsc,
+    Path,
+}
+
+impl From<CliLocSortMode> for LocSort {
+    fn from(value: CliLocSortMode) -> Self {
+        match value {
+            CliLocSortMode::CodeDesc => LocSort::CodeDesc,
+            CliLocSortMode::CodeAsc => LocSort::CodeAsc,
+            CliLocSortMode::Path => LocSort::Path,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
@@ -884,6 +993,56 @@ pub fn run() -> AppResult<()> {
                     let response = commands::files(&repo, opts)?;
                     output::print_files(&response, mode)
                 }
+                Commands::Loc { action } => match action {
+                    LocAction::Symbols {
+                        paths,
+                        min_lines,
+                        max_lines,
+                        limit,
+                        sort,
+                        kind,
+                        languages,
+                        bytes,
+                        snippet,
+                        exclude,
+                    } => {
+                        let opts = LocSymbolsOptions {
+                            paths,
+                            excludes: exclude,
+                            kinds: kind,
+                            languages,
+                            min_lines,
+                            max_lines,
+                            limit,
+                            sort: sort.into(),
+                            bytes,
+                            snippet,
+                        };
+                        let response = commands::loc_symbols(&repo, opts)?;
+                        output::print_loc_symbols(&response, mode)
+                    }
+                    LocAction::Files {
+                        globs,
+                        min_lines,
+                        max_lines,
+                        limit,
+                        sort,
+                        languages,
+                        exclude,
+                    } => {
+                        let opts = LocFilesOptions {
+                            globs,
+                            excludes: exclude,
+                            languages,
+                            min_lines,
+                            max_lines,
+                            limit,
+                            sort: sort.into(),
+                        };
+                        let response = commands::loc_files(&repo, opts)?;
+                        output::print_loc_files(&response, mode)
+                    }
+                },
                 Commands::Langs => {
                     let response = commands::langs(&repo)?;
                     output::print_langs(&response, mode)
