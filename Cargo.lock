@@ -852,6 +852,7 @@ dependencies = [
  "rayon",
  "regex",
  "rusqlite",
+ "rustc-hash",
  "safetensors",
  "serde",
  "serde_json",

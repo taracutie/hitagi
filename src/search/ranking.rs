@@ -12,8 +12,8 @@ use std::path::Path;
 use once_cell::sync::Lazy;
 use regex::Regex;
 
+use super::chunk_store::ChunkStore;
 use super::tokens::split_identifier;
-use super::types::IndexedChunk;
 
 static SYMBOL_QUERY_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"^(?:[A-Za-z_][A-Za-z0-9_]*(?:(?:::|\\|->|\.)[A-Za-z_][A-Za-z0-9_]*)+|_[A-Za-z0-9_]*|[A-Za-z][A-Za-z0-9]*[A-Z_][A-Za-z0-9_]*|[A-Z][A-Za-z0-9]*)$")
@@ -281,7 +281,7 @@ fn contains_any_word(text: &str, needles: &[&str]) -> bool {
 /// top of this).
 pub fn boost_multi_chunk_files<S: BuildHasher>(
     scores: &mut HashMap<usize, f32, S>,
-    chunks: &[IndexedChunk],
+    chunks: &ChunkStore,
 ) {
     if scores.is_empty() {
         return;
@@ -293,7 +293,7 @@ pub fn boost_multi_chunk_files<S: BuildHasher>(
     let mut file_sum: HashMap<&str, f32> = HashMap::new();
     let mut best_chunk: HashMap<&str, usize> = HashMap::new();
     for (&chunk_id, &score) in scores.iter() {
-        let file = chunks[chunk_id].file_path.as_str();
+        let file = chunks.file_path(chunk_id);
         *file_sum.entry(file).or_default() += score;
         if best_chunk
             .get(file)
@@ -315,7 +315,7 @@ pub fn apply_query_boost_in_place<S: BuildHasher>(
     mut boosted: HashMap<usize, f32, S>,
     intent: &QueryIntent,
     query: &str,
-    chunks: &[IndexedChunk],
+    chunks: &ChunkStore,
     file_mapping: Option<&BTreeMap<String, Vec<usize>>>,
     selector: Option<&[usize]>,
 ) -> HashMap<usize, f32, S> {
@@ -381,7 +381,7 @@ fn boost_symbol_definitions<S: BuildHasher>(
     boosted: &mut HashMap<usize, f32, S>,
     query: &str,
     max_score: f32,
-    chunks: &[IndexedChunk],
+    chunks: &ChunkStore,
     allowed: Option<&HashSet<usize>>,
 ) {
     let symbol_name = extract_symbol_name(query);
@@ -392,21 +392,35 @@ fn boost_symbol_definitions<S: BuildHasher>(
     let matchers = definition_matchers(&names);
     let boost_unit = max_score * 3.0;
     for chunk_id in boosted.keys().copied().collect::<Vec<_>>() {
-        let tier = definition_tier(&chunks[chunk_id], &names, &matchers, boost_unit);
+        let tier = definition_tier(
+            chunks.content(chunk_id),
+            chunks.file_path(chunk_id),
+            &names,
+            &matchers,
+            boost_unit,
+        );
         if tier > 0.0 {
             *boosted.get_mut(&chunk_id).unwrap() += tier;
         }
     }
-    for (chunk_id, chunk) in chunks.iter().enumerate() {
+    let symbol_lower = symbol_name.to_lowercase();
+    for chunk_id in 0..chunks.len() {
         if boosted.contains_key(&chunk_id) {
             continue;
         }
         if !selector_allows(allowed, chunk_id) {
             continue;
         }
-        let stem = path_stem_lower(&chunk.file_path);
-        if stem_matches(&stem, &symbol_name.to_lowercase()) {
-            let tier = definition_tier(chunk, &names, &matchers, boost_unit);
+        let file_path = chunks.file_path(chunk_id);
+        let stem = path_stem_lower(file_path);
+        if stem_matches(&stem, &symbol_lower) {
+            let tier = definition_tier(
+                chunks.content(chunk_id),
+                file_path,
+                &names,
+                &matchers,
+                boost_unit,
+            );
             if tier > 0.0 {
                 boosted.insert(chunk_id, tier);
             }
@@ -418,7 +432,7 @@ fn boost_embedded_symbols<S: BuildHasher>(
     boosted: &mut HashMap<usize, f32, S>,
     query: &str,
     max_score: f32,
-    chunks: &[IndexedChunk],
+    chunks: &ChunkStore,
     allowed: Option<&HashSet<usize>>,
 ) {
     let names: HashSet<String> = EMBEDDED_SYMBOL_RE
@@ -431,20 +445,27 @@ fn boost_embedded_symbols<S: BuildHasher>(
     let matchers = definition_matchers(&names);
     let boost_unit = max_score * 3.0 * 0.5;
     for chunk_id in boosted.keys().copied().collect::<Vec<_>>() {
-        let tier = definition_tier(&chunks[chunk_id], &names, &matchers, boost_unit);
+        let tier = definition_tier(
+            chunks.content(chunk_id),
+            chunks.file_path(chunk_id),
+            &names,
+            &matchers,
+            boost_unit,
+        );
         if tier > 0.0 {
             *boosted.get_mut(&chunk_id).unwrap() += tier;
         }
     }
     let symbols_lower: Vec<String> = names.iter().map(|s| s.to_lowercase()).collect();
-    for (chunk_id, chunk) in chunks.iter().enumerate() {
+    for chunk_id in 0..chunks.len() {
         if boosted.contains_key(&chunk_id) {
             continue;
         }
         if !selector_allows(allowed, chunk_id) {
             continue;
         }
-        let stem = path_stem_lower(&chunk.file_path);
+        let file_path = chunks.file_path(chunk_id);
+        let stem = path_stem_lower(file_path);
         let stem_norm = stem.replace('_', "");
         let stem_ok = symbols_lower.iter().any(|symbol| {
             stem == *symbol
@@ -453,7 +474,13 @@ fn boost_embedded_symbols<S: BuildHasher>(
                 || (stem_norm.len() >= 4 && symbol.starts_with(&stem_norm))
         });
         if stem_ok {
-            let tier = definition_tier(chunk, &names, &matchers, boost_unit);
+            let tier = definition_tier(
+                chunks.content(chunk_id),
+                file_path,
+                &names,
+                &matchers,
+                boost_unit,
+            );
             if tier > 0.0 {
                 boosted.insert(chunk_id, tier);
             }
@@ -465,7 +492,7 @@ fn boost_stem_matches<S: BuildHasher>(
     boosted: &mut HashMap<usize, f32, S>,
     query: &str,
     max_score: f32,
-    chunks: &[IndexedChunk],
+    chunks: &ChunkStore,
 ) {
     let query_words: Vec<String> = super::tokens::tokenize(query)
         .into_iter()
@@ -478,15 +505,13 @@ fn boost_stem_matches<S: BuildHasher>(
     let public_api = public_api_query(&keywords);
     let mut path_matches: HashMap<String, (usize, bool)> = HashMap::new();
     for (chunk_id, score) in boosted.iter_mut() {
-        let chunk = &chunks[*chunk_id];
-        let entry = path_matches
-            .entry(chunk.file_path.clone())
-            .or_insert_with(|| {
-                (
-                    count_keyword_path_matches(&keywords, &chunk.file_path),
-                    public_api_file(&chunk.file_path),
-                )
-            });
+        let file_path = chunks.file_path(*chunk_id);
+        let entry = path_matches.entry(file_path.to_owned()).or_insert_with(|| {
+            (
+                count_keyword_path_matches(&keywords, file_path),
+                public_api_file(file_path),
+            )
+        });
         let (matches, is_public_api_file) = *entry;
         if matches > 0 {
             *score += max_score * matches as f32 / keywords.len() as f32;
@@ -501,13 +526,13 @@ fn boost_path_intent<S: BuildHasher>(
     boosted: &mut HashMap<usize, f32, S>,
     intent: &QueryIntent,
     max_score: f32,
-    chunks: &[IndexedChunk],
+    chunks: &ChunkStore,
 ) {
     if !intent.has_path_intent() {
         return;
     }
     for (chunk_id, score) in boosted.iter_mut() {
-        let path_score = path_intent_score(intent, &chunks[*chunk_id].file_path);
+        let path_score = path_intent_score(intent, chunks.file_path(*chunk_id));
         if path_score > 0.0 {
             *score += max_score * path_score.min(2.5) * 0.45;
         }
@@ -518,7 +543,7 @@ fn boost_named_non_candidates<S: BuildHasher>(
     boosted: &mut HashMap<usize, f32, S>,
     intent: &QueryIntent,
     max_score: f32,
-    chunks: &[IndexedChunk],
+    chunks: &ChunkStore,
     file_mapping: Option<&BTreeMap<String, Vec<usize>>>,
     allowed: Option<&HashSet<usize>>,
 ) {
@@ -561,21 +586,22 @@ fn boost_named_non_candidates<S: BuildHasher>(
                 definition_matchers(&names)
             }
         });
-        let source_boost = if chunk_defines_any_identifier(&chunks[chunk_id], matchers) {
-            1.35
-        } else {
-            0.85
-        };
+        let source_boost =
+            if chunk_defines_any_identifier(chunks.content(chunk_id), matchers) {
+                1.35
+            } else {
+                0.85
+            };
         boosted.insert(chunk_id, max_score * source_boost * path_score.min(2.0));
         inserted += 1;
     }
 }
 
-fn chunk_defines_any_identifier(chunk: &IndexedChunk, matchers: &[DefinitionMatcher]) -> bool {
+fn chunk_defines_any_identifier(content: &str, matchers: &[DefinitionMatcher]) -> bool {
     if matchers.is_empty() {
         return false;
     }
-    chunk_defines_symbol(chunk, matchers)
+    chunk_defines_symbol(content, matchers)
 }
 
 fn selector_allows(allowed: Option<&HashSet<usize>>, chunk_id: usize) -> bool {
@@ -753,22 +779,23 @@ fn definition_pattern(keywords: &[&str], escaped_name: &str, flags: &str) -> Str
     )
 }
 
-fn chunk_defines_symbol(chunk: &IndexedChunk, matchers: &[DefinitionMatcher]) -> bool {
-    matchers.iter().any(|matcher| {
-        matcher.general.is_match(&chunk.content) || matcher.sql.is_match(&chunk.content)
-    })
+fn chunk_defines_symbol(content: &str, matchers: &[DefinitionMatcher]) -> bool {
+    matchers
+        .iter()
+        .any(|matcher| matcher.general.is_match(content) || matcher.sql.is_match(content))
 }
 
 fn definition_tier(
-    chunk: &IndexedChunk,
+    content: &str,
+    file_path: &str,
     names: &HashSet<String>,
     matchers: &[DefinitionMatcher],
     boost_unit: f32,
 ) -> f32 {
-    if !chunk_defines_symbol(chunk, matchers) {
+    if !chunk_defines_symbol(content, matchers) {
         return 0.0;
     }
-    let stem = path_stem_lower(&chunk.file_path);
+    let stem = path_stem_lower(file_path);
     if names
         .iter()
         .any(|name| stem_matches(&stem, &name.to_lowercase()))
@@ -799,7 +826,7 @@ fn path_stem_lower(file_path: &str) -> String {
 /// hit) before sorting and truncating.
 pub fn rerank_topk<S: BuildHasher>(
     scores: &HashMap<usize, f32, S>,
-    chunks: &[IndexedChunk],
+    chunks: &ChunkStore,
     top_k: usize,
     intent: &QueryIntent,
     penalise_paths: bool,
@@ -811,7 +838,7 @@ pub fn rerank_topk<S: BuildHasher>(
         .iter()
         .map(|(&id, &score)| {
             let penalty = if penalise_paths {
-                file_path_penalty(&chunks[id].file_path, intent)
+                file_path_penalty(chunks.file_path(id), intent)
             } else {
                 1.0
             };
@@ -826,7 +853,7 @@ pub fn rerank_topk<S: BuildHasher>(
         if selected.len() >= top_k && score <= min_selected {
             break;
         }
-        let file = chunks[chunk_id].file_path.as_str();
+        let file = chunks.file_path(chunk_id);
         let already = *file_selected.get(file).unwrap_or(&0);
         let mut eff_score = score;
         if already >= 1 {
@@ -915,6 +942,7 @@ fn is_generated_path(normalized: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{apply_query_boost_in_place, rerank_topk, resolve_alpha, QueryIntent};
+    use crate::search::chunk_store::ChunkStore;
     use crate::search::types::IndexedChunk;
     use std::collections::{BTreeMap, HashMap};
 
@@ -928,11 +956,15 @@ mod tests {
         }
     }
 
+    fn store(chunks: Vec<IndexedChunk>) -> ChunkStore {
+        ChunkStore::from_indexed(chunks)
+    }
+
     #[test]
     fn boosts_definitions_and_penalizes_tests() {
         let defining = chunk("class MyService:\n    pass", "src/my_service.py");
         let other = chunk("x = MyService()", "src/utils.py");
-        let chunks = vec![defining, other];
+        let chunks = store(vec![defining, other]);
         let mut scores = HashMap::new();
         scores.insert(1usize, 0.4);
         let intent = QueryIntent::new("MyService");
@@ -941,7 +973,7 @@ mod tests {
 
         let defining = chunk("pub fn parse_json(input: &str) {}", "src/parser.rs");
         let other = chunk("parse json input", "src/readme.md");
-        let chunks = vec![defining, other];
+        let chunks = store(vec![defining, other]);
         let mut scores = HashMap::new();
         scores.insert(0usize, 0.2);
         scores.insert(1usize, 0.4);
@@ -958,7 +990,7 @@ mod tests {
 
         let regular = chunk("def impl(): pass", "src/regular.py");
         let test = chunk("def impl(): pass", "tests/test_auth.py");
-        let chunks = vec![regular, test];
+        let chunks = store(vec![regular, test]);
         let scores = HashMap::from([(0usize, 1.0), (1usize, 1.0)]);
         let intent = QueryIntent::new("impl");
         let ranked = rerank_topk(&scores, &chunks, 2, &intent, true);
@@ -977,7 +1009,7 @@ mod tests {
             "export function UserCard() { return null; }",
             "src/components/UserCard.tsx",
         );
-        let chunks = vec![other, component];
+        let chunks = store(vec![other, component]);
         let mapping = BTreeMap::from([
             ("src/components/UserCard.tsx".to_owned(), vec![1usize]),
             ("src/other.ts".to_owned(), vec![0usize]),

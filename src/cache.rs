@@ -39,8 +39,11 @@ use crate::{
 // v9 reverts dense vectors to lossless f32 (the column added in v7 stays
 // for forward-compat). Any v8 row tagged "f16" would no longer decode, so
 // v8 caches are invalidated outright.
-const CACHE_VERSION_KEY: &str = concat!("v9-", env!("CARGO_PKG_VERSION"));
-const CACHE_FILE_NAME: &str = "index.v9.sqlite";
+// v10 LZ4-frames the large search blobs (bm25, chunks, file/language mapping,
+// signatures). Compression typically shrinks them ~3x, which cuts the SQLite
+// blob-fetch step on warm searches by roughly the same factor.
+const CACHE_VERSION_KEY: &str = concat!("v10-", env!("CARGO_PKG_VERSION"));
+const CACHE_FILE_NAME: &str = "index.v10.sqlite";
 
 #[derive(Clone)]
 struct FileEntry {
@@ -439,34 +442,50 @@ impl ParseCache {
     /// `None` when the cache is disabled, the file is missing, or the row
     /// hasn't been written yet. Bytes are bincoded by the caller; this
     /// layer doesn't care about the encoding.
+    ///
+    /// `chunks_blob` lives on disk as a sibling file rather than a SQLite
+    /// column: BLOBs > 1-2 MB pay per-page overflow overhead and walking the
+    /// pages dominates warm `load_sparse` time. A flat file read is faster
+    /// (single read + memcpy via `std::fs::read`).
     pub fn lookup_search_sparse(&mut self) -> Option<SearchSparseRow> {
         if !self.enabled {
             return None;
         }
+        let chunks_path = self.chunks_blob_path();
         let conn = self.ensure_read_conn()?;
-        conn.query_row(
-            "SELECT bm25_blob, signatures_blob, chunks_blob, file_mapping_blob,
+        let mut row: SearchSparseRow = conn
+            .query_row(
+                "SELECT bm25_blob, signatures_blob, file_mapping_blob,
                     language_mapping_blob, built_at_unix_secs,
                     indexed_files, indexed_chunks, language_counts_blob
              FROM search_sparse WHERE rowid = 1",
-            [],
-            |row| {
-                Ok(SearchSparseRow {
-                    bm25_blob: row.get(0)?,
-                    signatures_blob: row.get(1)?,
-                    chunks_blob: row.get(2)?,
-                    file_mapping_blob: row.get(3)?,
-                    language_mapping_blob: row.get(4)?,
-                    built_at_unix_secs: row.get(5)?,
-                    indexed_files: row.get::<_, i64>(6)? as usize,
-                    indexed_chunks: row.get::<_, i64>(7)? as usize,
-                    language_counts_blob: row.get(8)?,
-                })
-            },
-        )
-        .optional()
-        .ok()
-        .flatten()
+                [],
+                |row| {
+                    Ok(SearchSparseRow {
+                        bm25_blob: row.get(0)?,
+                        signatures_blob: row.get(1)?,
+                        chunks_blob: Vec::new(),
+                        file_mapping_blob: row.get(2)?,
+                        language_mapping_blob: row.get(3)?,
+                        built_at_unix_secs: row.get(4)?,
+                        indexed_files: row.get::<_, i64>(5)? as usize,
+                        indexed_chunks: row.get::<_, i64>(6)? as usize,
+                        language_counts_blob: row.get(7)?,
+                    })
+                },
+            )
+            .optional()
+            .ok()
+            .flatten()?;
+        row.chunks_blob = std::fs::read(&chunks_path).ok()?;
+        Some(row)
+    }
+
+    /// Where the sibling chunks blob file lives. Always under the same
+    /// cache_dir as the SQLite file, versioned via the file name so a
+    /// schema bump invalidates both at once.
+    pub(crate) fn chunks_blob_path(&self) -> PathBuf {
+        self.cache_dir.join("chunks.v10.bin")
     }
 
     /// Look up the persisted dense-index payload for this repo. Returns
@@ -536,12 +555,13 @@ impl ParseCache {
         if !self.enabled {
             return;
         }
+        let chunks_path = self.chunks_blob_path();
         let retry = {
             let Some(conn) = self.ensure_write_conn() else {
                 return;
             };
             match write_search_sparse_row(conn, row) {
-                Ok(_) => return,
+                Ok(_) => false,
                 Err(_) => !tables_are_readable(conn),
             }
         };
@@ -549,8 +569,15 @@ impl ParseCache {
             let Some(conn) = self.recreate_cache_file() else {
                 return;
             };
-            let _ = write_search_sparse_row(conn, row);
+            if write_search_sparse_row(conn, row).is_err() {
+                return;
+            }
         }
+        // Write chunks blob after SQLite write lands. Doing it before would
+        // race with ensure_write_conn / recreate_cache_file, which can wipe
+        // the cache_dir contents (including the chunks file we just wrote)
+        // when the SQLite tables fail their schema check.
+        let _ = atomic_write(&chunks_path, &row.chunks_blob);
     }
 
     /// Write the dense-index payload (overwrites any existing row). Same
@@ -582,12 +609,15 @@ impl ParseCache {
         if !self.enabled {
             return Ok(false);
         }
+        let chunks_path = self.chunks_blob_path();
+        let chunks_existed = chunks_path.exists();
+        let _ = std::fs::remove_file(&chunks_path);
         let Some(conn) = self.ensure_write_conn() else {
-            return Ok(false);
+            return Ok(chunks_existed);
         };
         let cleared_sparse = conn.execute("DELETE FROM search_sparse", []).unwrap_or(0);
         let cleared_dense = conn.execute("DELETE FROM search_dense", []).unwrap_or(0);
-        Ok(cleared_sparse + cleared_dense > 0)
+        Ok(cleared_sparse + cleared_dense > 0 || chunks_existed)
     }
 
     /// Inspect the on-disk presence of the search-index rows without
@@ -597,6 +627,7 @@ impl ParseCache {
         let repo_root_str = repo_root.to_string_lossy().into_owned();
         let cache_dir = resolve_cache_dir(&repo_root_str);
         let cache_file = cache_dir.as_ref().map(|d| d.join(CACHE_FILE_NAME));
+        let chunks_file = cache_dir.as_ref().map(|d| d.join("chunks.v10.bin"));
         let mut inspection = SearchIndexInspection::default();
         let Some(file) = cache_file else {
             return inspection;
@@ -607,8 +638,13 @@ impl ParseCache {
         let Ok(conn) = Connection::open_with_flags(&file, OpenFlags::SQLITE_OPEN_READ_ONLY) else {
             return inspection;
         };
+        let chunks_bytes = chunks_file
+            .as_ref()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len() as usize)
+            .unwrap_or(0);
         if let Ok(meta) = conn.query_row(
-            "SELECT LENGTH(chunks_blob), LENGTH(file_mapping_blob),
+            "SELECT LENGTH(file_mapping_blob),
                     LENGTH(language_mapping_blob), built_at_unix_secs,
                     indexed_files, indexed_chunks, language_counts_blob
              FROM search_sparse WHERE rowid = 1",
@@ -617,22 +653,21 @@ impl ParseCache {
                 Ok((
                     row.get::<_, i64>(0)? as usize,
                     row.get::<_, i64>(1)? as usize,
-                    row.get::<_, i64>(2)? as usize,
-                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)? as usize,
                     row.get::<_, i64>(4)? as usize,
-                    row.get::<_, i64>(5)? as usize,
-                    row.get::<_, Vec<u8>>(6)?,
+                    row.get::<_, Vec<u8>>(5)?,
                 ))
             },
         ) {
             inspection.sparse_present = true;
-            inspection.sparse_chunks_bytes = meta.0;
-            inspection.sparse_file_mapping_bytes = meta.1;
-            inspection.sparse_language_mapping_bytes = meta.2;
-            inspection.sparse_built_at_unix_secs = Some(meta.3);
-            inspection.sparse_indexed_files = Some(meta.4);
-            inspection.sparse_indexed_chunks = Some(meta.5);
-            inspection.sparse_language_counts = bin_codec::decode::<LanguageCountsBlob>(&meta.6)
+            inspection.sparse_chunks_bytes = chunks_bytes;
+            inspection.sparse_file_mapping_bytes = meta.0;
+            inspection.sparse_language_mapping_bytes = meta.1;
+            inspection.sparse_built_at_unix_secs = Some(meta.2);
+            inspection.sparse_indexed_files = Some(meta.3);
+            inspection.sparse_indexed_chunks = Some(meta.4);
+            inspection.sparse_language_counts = bin_codec::decode::<LanguageCountsBlob>(&meta.5)
                 .map(|b| b.counts)
                 .unwrap_or_default();
         }
@@ -808,6 +843,7 @@ impl ParseCache {
 
         match Connection::open_with_flags(&self.cache_file, OpenFlags::SQLITE_OPEN_READ_WRITE) {
             Ok(conn) if validate_db(&conn, &self.repo_root) => {
+
                 self.conn = Some(conn);
                 self.conn.as_ref()
             }
@@ -830,6 +866,7 @@ impl ParseCache {
                 return None;
             }
             let conn = Connection::open(&self.cache_file).ok()?;
+
             if init_db(&conn, &self.repo_root).is_err() {
                 let _ = std::fs::remove_file(&self.cache_file);
                 return None;
@@ -848,12 +885,17 @@ impl ParseCache {
     fn recreate_cache_file(&mut self) -> Option<&mut Connection> {
         self.conn.take();
         let _ = std::fs::remove_file(&self.cache_file);
+        // Keep the sibling chunks file in sync with the SQLite reset ~ a
+        // search rebuild rewrites both, so a half-stale on-disk chunks blob
+        // would just trip the next load_sparse.
+        let _ = std::fs::remove_file(self.chunks_blob_path());
         self.reset_on_write = false;
 
         if std::fs::create_dir_all(&self.cache_dir).is_err() {
             return None;
         }
         let conn = Connection::open(&self.cache_file).ok()?;
+
         if init_db(&conn, &self.repo_root).is_err() || !validate_db(&conn, &self.repo_root) {
             let _ = std::fs::remove_file(&self.cache_file);
             return None;
@@ -1025,6 +1067,7 @@ fn resolve_cache_dir(repo_root: &str) -> Option<PathBuf> {
     cache_root().map(|base| base.join(repo_hash(repo_root)))
 }
 
+
 fn init_db(conn: &Connection, repo_root: &str) -> rusqlite::Result<()> {
     conn.execute_batch(
         "
@@ -1142,7 +1185,10 @@ fn write_search_sparse_row(conn: &Connection, row: &SearchSparseRow) -> rusqlite
         params![
             row.bm25_blob,
             row.signatures_blob,
-            row.chunks_blob,
+            // chunks_blob column is kept in the schema for back-compat with
+            // any v10 row that still has it inline; new writes only store
+            // an empty marker because the real bytes live in chunks.v10.bin.
+            Vec::<u8>::new(),
             row.file_mapping_blob,
             row.language_mapping_blob,
             row.built_at_unix_secs,
@@ -1151,6 +1197,23 @@ fn write_search_sparse_row(conn: &Connection, row: &SearchSparseRow) -> rusqlite
             row.language_counts_blob,
         ],
     )
+}
+
+/// Write `bytes` to `target` atomically (write to tmp, rename). Failures
+/// bubble up so callers can fall back to "tell SQLite anyway, next load
+/// will rebuild"; same silent-on-error policy as the SQLite store path.
+fn atomic_write(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = target.with_extension(format!("tmp.{}", std::process::id()));
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        use std::io::Write;
+        f.write_all(bytes)?;
+        f.sync_data().ok(); // best-effort; sync isn't load-bearing for our cache.
+    }
+    std::fs::rename(&tmp, target)
 }
 
 fn write_search_dense_row(conn: &Connection, row: &SearchDenseRow) -> rusqlite::Result<usize> {

@@ -5,16 +5,18 @@
 //! truncating to `top_k` first throws away half the signal that boosts
 //! depend on.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use ndarray::Array2;
+use rustc_hash::FxHashMap;
 
+use super::chunk_store::ChunkStore;
 use super::dense::DenseIndex;
 use super::ranking::{
     apply_query_boost_in_place, boost_multi_chunk_files, rerank_topk, resolve_alpha, QueryIntent,
 };
 use super::sparse::Bm25Index;
-use super::types::{IndexedChunk, RankedHit, SearchMode};
+use super::types::{RankedHit, SearchMode};
 
 const RRF_K: f32 = 60.0;
 
@@ -25,7 +27,7 @@ pub trait QueryEncoder {
 pub fn search_bm25(
     query: &str,
     bm25_index: &Bm25Index,
-    chunks: &[IndexedChunk],
+    chunks: &ChunkStore,
     top_k: usize,
     selector: Option<&[usize]>,
 ) -> Vec<RankedHit> {
@@ -33,7 +35,7 @@ pub fn search_bm25(
         .search(query, top_k, selector)
         .into_iter()
         .map(|(idx, score)| RankedHit {
-            chunk: chunks[idx].clone(),
+            chunk: chunks.to_indexed(idx),
             score,
             source: SearchMode::Bm25,
         })
@@ -44,7 +46,7 @@ pub fn search_semantic<E: QueryEncoder + ?Sized>(
     query: &str,
     encoder: &E,
     semantic_index: &DenseIndex,
-    chunks: &[IndexedChunk],
+    chunks: &ChunkStore,
     top_k: usize,
     selector: Option<&[usize]>,
 ) -> Vec<RankedHit> {
@@ -55,7 +57,7 @@ pub fn search_semantic<E: QueryEncoder + ?Sized>(
         .query(&normalized, top_k, selector)
         .into_iter()
         .map(|(idx, score)| RankedHit {
-            chunk: chunks[idx].clone(),
+            chunk: chunks.to_indexed(idx),
             score,
             source: SearchMode::Semantic,
         })
@@ -68,7 +70,7 @@ pub fn search_hybrid<E: QueryEncoder + ?Sized>(
     encoder: &E,
     semantic_index: &DenseIndex,
     bm25_index: &Bm25Index,
-    chunks: &[IndexedChunk],
+    chunks: &ChunkStore,
     file_mapping: &BTreeMap<String, Vec<usize>>,
     top_k: usize,
     alpha: Option<f32>,
@@ -83,8 +85,8 @@ pub fn search_hybrid<E: QueryEncoder + ?Sized>(
     let semantic_scores = semantic_index.query(&vector, candidate_count, selector);
     let bm25_scores = bm25_index.search(query, candidate_count, selector);
 
-    let mut combined: HashMap<usize, f32> =
-        HashMap::with_capacity(semantic_scores.len() + bm25_scores.len());
+    let mut combined: FxHashMap<usize, f32> =
+        FxHashMap::with_capacity_and_hasher(semantic_scores.len() + bm25_scores.len(), Default::default());
     add_rrf_scores(&mut combined, semantic_scores, alpha_weight);
     add_rrf_scores(&mut combined, bm25_scores, 1.0 - alpha_weight);
 
@@ -103,7 +105,7 @@ pub fn search_hybrid<E: QueryEncoder + ?Sized>(
     let hits = ranked
         .into_iter()
         .map(|(idx, score)| RankedHit {
-            chunk: chunks[idx].clone(),
+            chunk: chunks.to_indexed(idx),
             score,
             source: SearchMode::Hybrid,
         })
@@ -111,7 +113,11 @@ pub fn search_hybrid<E: QueryEncoder + ?Sized>(
     (hits, alpha_weight)
 }
 
-fn add_rrf_scores(combined: &mut HashMap<usize, f32>, ranked: Vec<(usize, f32)>, weight: f32) {
+fn add_rrf_scores<S: std::hash::BuildHasher>(
+    combined: &mut std::collections::HashMap<usize, f32, S>,
+    ranked: Vec<(usize, f32)>,
+    weight: f32,
+) {
     for (rank, (id, _)) in ranked.into_iter().enumerate() {
         *combined.entry(id).or_default() += weight / (RRF_K + rank as f32 + 1.0);
     }
@@ -128,6 +134,7 @@ fn normalize_in_place(mut vector: ndarray::Array1<f32>) -> ndarray::Array1<f32> 
 #[cfg(test)]
 mod tests {
     use super::{search_bm25, QueryEncoder};
+    use crate::search::chunk_store::ChunkStore;
     use crate::search::sparse::Bm25Index;
     use crate::search::types::{IndexedChunk, SearchMode};
     use ndarray::{array, Array2};
@@ -156,7 +163,8 @@ mod tests {
     fn bm25_helper_reports_correct_source_mode() {
         let chunks = vec![chunk("fn parse_session_token() {}", "src/auth.rs")];
         let sparse = Bm25Index::build_from_chunks(&chunks);
-        let bm25 = search_bm25("parse_session_token", &sparse, &chunks, 1, None);
+        let store = ChunkStore::from_indexed(chunks);
+        let bm25 = search_bm25("parse_session_token", &sparse, &store, 1, None);
         assert_eq!(bm25[0].source, SearchMode::Bm25);
         // Smoke-test the encoder trait instantiates.
         let _ = TestEncoder.encode_query("anything");

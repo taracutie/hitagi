@@ -2,9 +2,10 @@ use std::{
     cell::OnceCell,
     collections::HashSet,
     path::{Component, Path, PathBuf},
+    sync::Mutex,
 };
 
-use ignore::WalkBuilder;
+use ignore::{WalkBuilder, WalkState};
 
 use crate::error::{AppError, AppResult};
 
@@ -212,9 +213,6 @@ impl RepoRoot {
     }
 
     pub fn collect_search_files(&self, paths: &[String]) -> AppResult<Vec<ResolvedPath>> {
-        let mut files = Vec::new();
-        let mut seen = HashSet::new();
-
         let start_paths: Vec<PathBuf> = if paths.is_empty() {
             vec![self.root.clone()]
         } else {
@@ -224,35 +222,79 @@ impl RepoRoot {
                 .collect::<AppResult<Vec<_>>>()?
         };
 
+        // Parallel directory walk: WalkBuilder's single-threaded `.build()`
+        // reads directories sequentially. On a 2k-file repo this dominates
+        // the warm `ensure_sparse` head (~30 ms of 40 ms). build_parallel
+        // shards traversal across N worker threads; each one fills a local
+        // buffer that's flushed on Drop so we only acquire the shared Mutex
+        // a handful of times per worker, not once per file.
+        let buckets: Mutex<Vec<ResolvedPath>> = Mutex::new(Vec::new());
+
+        struct WorkerSink<'a> {
+            local: Vec<ResolvedPath>,
+            shared: &'a Mutex<Vec<ResolvedPath>>,
+        }
+        impl<'a> WorkerSink<'a> {
+            fn flush(&mut self) {
+                if self.local.is_empty() {
+                    return;
+                }
+                if let Ok(mut shared) = self.shared.lock() {
+                    if shared.is_empty() {
+                        std::mem::swap(&mut self.local, &mut *shared);
+                    } else {
+                        shared.append(&mut self.local);
+                    }
+                }
+            }
+        }
+        impl<'a> Drop for WorkerSink<'a> {
+            fn drop(&mut self) {
+                self.flush();
+            }
+        }
+
         for start in &start_paths {
-            let walker = WalkBuilder::new(start)
+            let mut builder = WalkBuilder::new(start);
+            builder
                 .hidden(true)
                 .git_ignore(true)
                 .git_global(false)
                 .git_exclude(true)
-                .follow_links(false)
-                .build();
-
-            for entry in walker.flatten() {
-                if !entry.file_type().map_or(false, |ft| ft.is_file()) {
-                    continue;
-                }
-
-                let path = entry.into_path();
-                let relative_path = match relative_path_string(&self.root, &path) {
-                    Ok(rp) => rp,
-                    Err(_) => continue,
+                .follow_links(false);
+            let walker = builder.build_parallel();
+            walker.run(|| {
+                let root = self.root.clone();
+                let mut sink = WorkerSink {
+                    local: Vec::new(),
+                    shared: &buckets,
                 };
-
-                if seen.insert(relative_path.clone()) {
-                    files.push(ResolvedPath {
-                        relative_path,
-                        full_path: path,
-                    });
-                }
-            }
+                Box::new(move |entry| {
+                    if let Ok(entry) = entry {
+                        if entry.file_type().is_some_and(|ft| ft.is_file()) {
+                            let path = entry.into_path();
+                            if let Ok(relative_path) = relative_path_string(&root, &path) {
+                                sink.local.push(ResolvedPath {
+                                    relative_path,
+                                    full_path: path,
+                                });
+                                if sink.local.len() >= 256 {
+                                    sink.flush();
+                                }
+                            }
+                        }
+                    }
+                    WalkState::Continue
+                })
+            });
         }
 
+        let mut files = buckets.into_inner().unwrap_or_default();
+
+        // Multiple start paths can yield duplicates (overlapping subtrees);
+        // dedup while preserving discovery order.
+        let mut seen: HashSet<String> = HashSet::with_capacity(files.len());
+        files.retain(|rp| seen.insert(rp.relative_path.clone()));
         Ok(files)
     }
 }

@@ -16,9 +16,10 @@ use crate::bin_codec;
 use crate::cache::{LanguageCountsBlob, ParseCache, SearchDenseRow, SearchSparseRow};
 use crate::error::{AppError, AppResult};
 
+use super::chunk_store::ChunkStore;
 use super::dense::DenseIndex;
 use super::sparse::Bm25Index;
-use super::types::{FileSignature, IndexedChunk};
+use super::types::FileSignature;
 
 /// Persisted dtype for `vectors_blob`. Always "f32" today; the column is kept
 /// so a future compression scheme can tag rows without another schema bump.
@@ -29,7 +30,7 @@ const DENSE_DTYPE_F32: &str = "f32";
 #[derive(Clone, Debug)]
 pub struct SparsePayload {
     pub bm25: Bm25Index,
-    pub chunks: Vec<IndexedChunk>,
+    pub chunks: ChunkStore,
     pub file_mapping: BTreeMap<String, Vec<usize>>,
     pub language_mapping: BTreeMap<String, Vec<usize>>,
     pub signatures: Vec<FileSignature>,
@@ -49,18 +50,23 @@ pub struct DensePayload {
 }
 
 #[derive(Serialize, Deserialize)]
-struct ChunksBlob {
-    chunks: Vec<IndexedChunk>,
-}
-
-#[derive(Serialize, Deserialize)]
 struct SignaturesBlob {
     signatures: Vec<FileSignature>,
+}
+
+#[derive(Serialize)]
+struct SignaturesBlobRef<'a> {
+    signatures: &'a [FileSignature],
 }
 
 #[derive(Serialize, Deserialize)]
 struct MappingBlob {
     map: BTreeMap<String, Vec<usize>>,
+}
+
+#[derive(Serialize)]
+struct MappingBlobRef<'a> {
+    map: &'a BTreeMap<String, Vec<usize>>,
 }
 
 pub fn load_sparse(cache: &mut ParseCache) -> AppResult<Option<SparsePayload>> {
@@ -69,7 +75,7 @@ pub fn load_sparse(cache: &mut ParseCache) -> AppResult<Option<SparsePayload>> {
     };
     let bm25: Bm25Index = bin_codec::decode(&row.bm25_blob)
         .map_err(|err| AppError::internal(format!("decode sparse bm25: {err}")))?;
-    let chunks: ChunksBlob = bin_codec::decode(&row.chunks_blob)
+    let chunks = ChunkStore::decode_from_bytes(&row.chunks_blob)
         .map_err(|err| AppError::internal(format!("decode sparse chunks: {err}")))?;
     let file_mapping: MappingBlob = bin_codec::decode(&row.file_mapping_blob)
         .map_err(|err| AppError::internal(format!("decode sparse file mapping: {err}")))?;
@@ -79,7 +85,7 @@ pub fn load_sparse(cache: &mut ParseCache) -> AppResult<Option<SparsePayload>> {
         .map_err(|err| AppError::internal(format!("decode sparse signatures: {err}")))?;
     Ok(Some(SparsePayload {
         bm25,
-        chunks: chunks.chunks,
+        chunks,
         file_mapping: file_mapping.map,
         language_mapping: language_mapping.map,
         signatures: signatures.signatures,
@@ -90,20 +96,20 @@ pub fn load_sparse(cache: &mut ParseCache) -> AppResult<Option<SparsePayload>> {
 pub fn store_sparse(cache: &mut ParseCache, payload: &SparsePayload) -> AppResult<()> {
     let bm25_blob = bin_codec::encode(&payload.bm25)
         .map_err(|err| AppError::internal(format!("encode sparse bm25: {err}")))?;
-    let chunks_blob = bin_codec::encode(&ChunksBlob {
-        chunks: payload.chunks.clone(),
-    })
-    .map_err(|err| AppError::internal(format!("encode sparse chunks: {err}")))?;
-    let file_mapping_blob = bin_codec::encode(&MappingBlob {
-        map: payload.file_mapping.clone(),
+    // Borrowed wrappers so we don't clone the multi-MB mappings vectors
+    // just to pass them into the bincode encoder. ChunkStore writes its
+    // own packed binary format directly.
+    let chunks_blob = payload.chunks.encode_to_bytes();
+    let file_mapping_blob = bin_codec::encode(&MappingBlobRef {
+        map: &payload.file_mapping,
     })
     .map_err(|err| AppError::internal(format!("encode sparse file mapping: {err}")))?;
-    let language_mapping_blob = bin_codec::encode(&MappingBlob {
-        map: payload.language_mapping.clone(),
+    let language_mapping_blob = bin_codec::encode(&MappingBlobRef {
+        map: &payload.language_mapping,
     })
     .map_err(|err| AppError::internal(format!("encode sparse language mapping: {err}")))?;
-    let signatures_blob = bin_codec::encode(&SignaturesBlob {
-        signatures: payload.signatures.clone(),
+    let signatures_blob = bin_codec::encode(&SignaturesBlobRef {
+        signatures: &payload.signatures,
     })
     .map_err(|err| AppError::internal(format!("encode sparse signatures: {err}")))?;
     let language_counts_blob = bin_codec::encode(&LanguageCountsBlob {

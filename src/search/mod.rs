@@ -7,6 +7,7 @@
 //! hybrid/semantic) Model2Vec embeddings, and persist the result. Warm runs
 //! deserialize the persisted blobs and run the search in ~100ms.
 
+pub mod chunk_store;
 pub mod chunker;
 pub mod dense;
 pub mod engine;

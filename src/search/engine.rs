@@ -248,7 +248,7 @@ fn build_sparse(
 
     Ok(SparsePayload {
         bm25,
-        chunks,
+        chunks: super::chunk_store::ChunkStore::from_indexed(chunks),
         file_mapping,
         language_mapping,
         signatures,
@@ -511,28 +511,30 @@ fn build_dense(
         "index: embedding {} chunks with {encoder_kind}",
         sparse.chunks.len()
     ));
-    let mut all_rows = Array2::<f32>::zeros((sparse.chunks.len(), dim));
+    let total = sparse.chunks.len();
+    let mut all_rows = Array2::<f32>::zeros((total, dim));
     let mut row_offset = 0usize;
-    for batch in sparse.chunks.chunks(ENCODER_BATCH) {
+    while row_offset < total {
+        let batch_end = (row_offset + ENCODER_BATCH).min(total);
+        let batch_len = batch_end - row_offset;
         if row_offset > 0 {
-            progress(format!(
-                "index: embedded {row_offset}/{} chunks",
-                sparse.chunks.len()
-            ));
+            progress(format!("index: embedded {row_offset}/{total} chunks"));
         }
-        let texts: Vec<String> = batch.iter().map(|c| c.content.clone()).collect();
+        let texts: Vec<String> = (row_offset..batch_end)
+            .map(|id| sparse.chunks.content(id).to_owned())
+            .collect();
         let encoded = encoder.encode(&texts);
-        if encoded.shape() != [batch.len(), dim] {
+        if encoded.shape() != [batch_len, dim] {
             return Err(AppError::internal(format!(
                 "encoder returned {:?} for batch of {} (expected dim {})",
                 encoded.shape(),
-                batch.len(),
+                batch_len,
                 dim
             )));
         }
-        let mut slice = all_rows.slice_mut(ndarray::s![row_offset..row_offset + batch.len(), ..]);
+        let mut slice = all_rows.slice_mut(ndarray::s![row_offset..batch_end, ..]);
         slice.assign(&encoded);
-        row_offset += batch.len();
+        row_offset = batch_end;
     }
     progress(format!(
         "index: embedded {}/{} chunks",
@@ -572,10 +574,7 @@ pub fn find_chunk_at_line(payload: &SparsePayload, path: &str, line: usize) -> O
     chunk_ids
         .iter()
         .copied()
-        .find(|&id| {
-            let chunk = &payload.chunks[id];
-            line >= chunk.start_line && line <= chunk.end_line
-        })
+        .find(|&id| line >= payload.chunks.start_line(id) && line <= payload.chunks.end_line(id))
         .or_else(|| chunk_ids.iter().copied().next())
 }
 

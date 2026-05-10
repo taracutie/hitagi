@@ -492,7 +492,7 @@ pub fn find_related(
                 resolved.relative_path
             ))
         })?;
-    let source_chunk = sparse.chunks[chunk_id].clone();
+    let source_chunk = sparse.chunks.to_indexed(chunk_id);
 
     let (encoder, encoder_kind, model_id, fingerprint, files_meta, encoder_warning) =
         load_encoder_with_policy(
