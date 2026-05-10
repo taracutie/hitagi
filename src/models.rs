@@ -391,6 +391,68 @@ pub struct LangSummary {
     pub parseable: bool,
 }
 
+// ~~ Framework support (Next.js, etc.) ~~
+
+#[derive(Debug, Serialize)]
+pub struct NextInfoResponse {
+    pub framework: &'static str,
+    pub detected: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub router: Option<String>,
+    #[serde(skip_serializing_if = "is_false")]
+    pub src_layout: bool,
+    pub root: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct NextRoutesResponse {
+    pub framework: &'static str,
+    pub root: String,
+    pub routes: Vec<NextRoute>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct NextRoute {
+    pub pattern: String,
+    pub file: String,
+    pub kind: &'static str,
+    pub router: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub methods: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "is_false")]
+    pub advanced: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct NextLayoutsResponse {
+    pub framework: &'static str,
+    pub root: String,
+    pub layouts: Vec<NextLayout>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct NextLayout {
+    pub kind: &'static str,
+    pub file: String,
+    pub scope: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct NextServerActionsResponse {
+    pub framework: &'static str,
+    pub root: String,
+    pub actions: Vec<NextServerAction>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct NextServerAction {
+    pub file: String,
+    pub name: String,
+    pub scope: &'static str,
+}
+
 #[derive(Debug, Serialize)]
 pub struct AgentPromptResponse {
     pub action: String,

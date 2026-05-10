@@ -143,9 +143,9 @@ fn push_kotlin_symbols(source: &str, symbols: &mut Vec<SymbolInfo>) -> AppResult
             "failed to initialize kotlin parser with tree-sitter-language-pack: {error}"
         ))
     })?;
-    let tree = parser.parse(source, None).ok_or_else(|| {
-        AppError::parse("failed to parse kotlin with tree-sitter-language-pack")
-    })?;
+    let tree = parser
+        .parse(source, None)
+        .ok_or_else(|| AppError::parse("failed to parse kotlin with tree-sitter-language-pack"))?;
     if tree.root_node().has_error() {
         return Err(AppError::parse(
             "failed to parse kotlin with tree-sitter-language-pack",

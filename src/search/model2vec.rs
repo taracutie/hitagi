@@ -108,6 +108,35 @@ pub fn model_fingerprint(options: &ModelOptions) -> AppResult<String> {
     Ok(format!("{:016x}", hasher.finish()))
 }
 
+/// Cheap stat-only signature of the three model files. Used as a fast-path
+/// hint by `load_encoder_with_policy`: if the persisted dense row's
+/// `model_files_meta` matches a fresh tuple, the multi-MB SHA pass in
+/// `model_fingerprint` can be skipped and the cached fingerprint reused.
+pub fn model_files_meta(options: &ModelOptions) -> AppResult<String> {
+    let (tokenizer_path, model_path, config_path) = model_files(options)?;
+    let parts = [&tokenizer_path, &model_path, &config_path]
+        .into_iter()
+        .map(|p| {
+            let md = fs::metadata(p).map_err(|err| {
+                AppError::internal(format!("stat model file {}: {err}", p.display()))
+            })?;
+            let mtime = md
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos() as i128)
+                .unwrap_or(0);
+            let name = p
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+            Ok::<_, AppError>(format!("{}:{}:{}", name, mtime, md.len()))
+        })
+        .collect::<AppResult<Vec<_>>>()?;
+    Ok(parts.join("|"))
+}
+
 pub struct Model2VecEncoder {
     tokenizer: Tokenizer,
     embeddings: Array2<f32>,

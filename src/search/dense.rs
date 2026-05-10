@@ -1,12 +1,14 @@
 //! Dense (cosine-similarity index) implementation.
 //!
 //! Vectors are L2-normalized at construction so the per-query cosine
-//! reduces to a dot product. Per-chunk dot is parallel via rayon ~ on a
-//! 5k-chunk index this is the difference between 4 ms and 30 ms per
-//! search call.
+//! reduces to a dot product. Without a selector we run a single
+//! `Array2::dot(&Array1)` matvec ~ ndarray's matrixmultiply backend
+//! gives us SIMD-vectorized contiguous access in one pass. With a
+//! selector we fall back to per-row dots in parallel via rayon, since
+//! a sparse-row matvec would compute a lot of unused scores.
 
 use ndarray::{Array1, Array2, Axis};
-use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
 
 use super::ranking::truncate_top_k;
@@ -24,6 +26,14 @@ impl DenseIndex {
                 row.mapv_inplace(|v| v / norm);
             }
         }
+        Self { vectors }
+    }
+
+    /// Construct without re-normalizing. Use when the caller has already
+    /// produced unit-norm rows (the engine builder does this before
+    /// persisting; the lossless f32 on-disk blob preserves it exactly).
+    /// Saves an O(rows * dim) sweep per warm hybrid/semantic search.
+    pub fn from_normalized(vectors: Array2<f32>) -> Self {
         Self { vectors }
     }
 
@@ -54,28 +64,15 @@ impl DenseIndex {
         let mut scores: Vec<(usize, f32)> = match selector {
             Some(candidates) => candidates
                 .par_iter()
-                .map(|&idx| {
-                    let row = self.vectors.row(idx);
-                    let score = row
-                        .iter()
-                        .zip(vector.iter())
-                        .map(|(a, b)| a * b)
-                        .sum::<f32>();
-                    (idx, score)
-                })
+                .map(|&idx| (idx, self.vectors.row(idx).dot(vector)))
                 .collect(),
-            None => (0..self.len())
-                .into_par_iter()
-                .map(|idx| {
-                    let row = self.vectors.row(idx);
-                    let score = row
-                        .iter()
-                        .zip(vector.iter())
-                        .map(|(a, b)| a * b)
-                        .sum::<f32>();
-                    (idx, score)
-                })
-                .collect(),
+            None => {
+                // ndarray's matrixmultiply-backed gemv: a single contiguous
+                // SIMD pass over the whole matrix is faster than rayon
+                // parallelism over per-row hand-rolled zip+fold.
+                let dots = self.vectors.dot(vector);
+                dots.iter().copied().enumerate().collect()
+            }
         };
         truncate_top_k(&mut scores, k);
         scores
@@ -100,5 +97,28 @@ mod tests {
         let index = DenseIndex::new(array![[1.0, 0.0], [0.0, 1.0]]);
         let results = index.query(&array![1.0, 0.0], 10, Some(&[]));
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn unfiltered_query_matches_all_row_selector() {
+        let index = DenseIndex::new(array![
+            [1.0, 0.0, 0.2],
+            [0.9, 0.2, 0.1],
+            [0.0, 1.0, 0.3],
+            [0.5, 0.5, 0.5]
+        ]);
+        let query = array![0.8, 0.2, 0.1];
+        let all_rows = [0, 1, 2, 3];
+
+        let unfiltered = index.query(&query, 3, None);
+        let selected = index.query(&query, 3, Some(&all_rows));
+
+        assert_eq!(unfiltered.len(), selected.len());
+        for ((left_id, left_score), (right_id, right_score)) in
+            unfiltered.iter().zip(selected.iter())
+        {
+            assert_eq!(left_id, right_id);
+            assert!((left_score - right_score).abs() < 1e-6);
+        }
     }
 }

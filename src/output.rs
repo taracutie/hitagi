@@ -10,8 +10,10 @@ use crate::{
         DiffPathsResponse, DiffSummaryFile, DiffSummaryGroup, DiffSummaryResponse, FilesGroup,
         FilesResponse, FindGroup, FindMatch, FindMatches, FindRelatedResponse, FindResponse,
         IndexBuildResponse, IndexCleanResponse, IndexStatusResponse, LangsResponse, LocFileResult,
-        LocFilesResponse, LocSymbolResult, LocSymbolsResponse, OutlineResponse, OutputSymbol,
-        ReadFileResponse, ReadSummaryResponse, SearchHit, SearchResponse, SymbolResponse,
+        LocFilesResponse, LocSymbolResult, LocSymbolsResponse, NextInfoResponse,
+        NextLayoutsResponse, NextRoutesResponse, NextServerActionsResponse, OutlineResponse,
+        OutputSymbol, ReadFileResponse, ReadSummaryResponse, SearchHit, SearchResponse,
+        SymbolResponse,
     },
 };
 
@@ -79,6 +81,25 @@ pub fn print_loc_files(value: &LocFilesResponse, mode: OutputMode) -> AppResult<
 
 pub fn print_langs(value: &LangsResponse, mode: OutputMode) -> AppResult<()> {
     emit(value, mode, || render_langs(value))
+}
+
+pub fn print_next_info(value: &NextInfoResponse, mode: OutputMode) -> AppResult<()> {
+    emit(value, mode, || render_next_info(value))
+}
+
+pub fn print_next_routes(value: &NextRoutesResponse, mode: OutputMode) -> AppResult<()> {
+    emit(value, mode, || render_next_routes(value))
+}
+
+pub fn print_next_layouts(value: &NextLayoutsResponse, mode: OutputMode) -> AppResult<()> {
+    emit(value, mode, || render_next_layouts(value))
+}
+
+pub fn print_next_server_actions(
+    value: &NextServerActionsResponse,
+    mode: OutputMode,
+) -> AppResult<()> {
+    emit(value, mode, || render_next_server_actions(value))
 }
 
 pub fn print_agent_prompt(value: &AgentPromptResponse, mode: OutputMode) -> AppResult<()> {
@@ -685,6 +706,78 @@ fn render_langs(value: &LangsResponse) -> String {
             out,
             "• {:<12} {:>5} files {:>7} lines {:>7} code {:>6} comm {:>6} blank • {parseable}",
             lang.language, lang.files, lang.lines, lang.code, lang.comment, lang.blank
+        );
+    }
+    out
+}
+
+fn render_next_info(value: &NextInfoResponse) -> String {
+    let mut out = String::new();
+    let header = match (value.detected, &value.router) {
+        (true, Some(r)) => format!("next • detected • {} router", r),
+        (true, None) => "next • detected • no router dirs".to_string(),
+        (false, _) => "next • not detected".to_string(),
+    };
+    let layout = if value.src_layout { " • src/" } else { "" };
+    let _ = writeln!(out, "{header}{layout}");
+    if let Some(version) = &value.version {
+        let _ = writeln!(out, "version {version}");
+    }
+    let _ = writeln!(out, "root {}", value.root);
+    out
+}
+
+fn render_next_routes(value: &NextRoutesResponse) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "routes • {} • root {}", value.routes.len(), value.root);
+    for route in &value.routes {
+        let methods = route
+            .methods
+            .as_ref()
+            .filter(|m| !m.is_empty())
+            .map(|m| format!(" • {}", m.join(" ")))
+            .unwrap_or_default();
+        let advanced = if route.advanced { " (advanced)" } else { "" };
+        let _ = writeln!(
+            out,
+            "• {:<32} {:<4} {:<5} {}{}{}",
+            route.pattern, route.kind, route.router, route.file, methods, advanced
+        );
+    }
+    out
+}
+
+fn render_next_layouts(value: &NextLayoutsResponse) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "layouts • {} • root {}",
+        value.layouts.len(),
+        value.root
+    );
+    for layout in &value.layouts {
+        let _ = writeln!(
+            out,
+            "• {:<13} {:<32} {}",
+            layout.kind, layout.scope, layout.file
+        );
+    }
+    out
+}
+
+fn render_next_server_actions(value: &NextServerActionsResponse) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "server-actions • {} • root {}",
+        value.actions.len(),
+        value.root
+    );
+    for action in &value.actions {
+        let _ = writeln!(
+            out,
+            "• {:<8} {:<24} {}",
+            action.scope, action.name, action.file
         );
     }
     out

@@ -436,6 +436,7 @@ pub fn ensure_dense(
     encoder_kind: &str,
     model_id: &str,
     model_fingerprint: &str,
+    model_files_meta: &str,
 ) -> AppResult<DensePayload> {
     if let Some(persisted) = load_dense(cache)? {
         let fingerprint_ok = persisted.encoder_kind == encoder_kind
@@ -453,6 +454,7 @@ pub fn ensure_dense(
         encoder_kind,
         model_id,
         model_fingerprint,
+        model_files_meta,
     )
 }
 
@@ -464,6 +466,7 @@ pub fn rebuild_dense(
     encoder_kind: &str,
     model_id: &str,
     model_fingerprint: &str,
+    model_files_meta: &str,
 ) -> AppResult<DensePayload> {
     build_dense(
         cache,
@@ -472,6 +475,7 @@ pub fn rebuild_dense(
         encoder_kind,
         model_id,
         model_fingerprint,
+        model_files_meta,
     )
 }
 
@@ -482,6 +486,7 @@ fn build_dense(
     encoder_kind: &str,
     model_id: &str,
     model_fingerprint: &str,
+    model_files_meta: &str,
 ) -> AppResult<DensePayload> {
     let dim = encoder.dim();
     if sparse.chunks.is_empty() {
@@ -496,6 +501,7 @@ fn build_dense(
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0),
+            model_files_meta: model_files_meta.to_string(),
         };
         store_dense(cache, &payload, &raw)?;
         return Ok(payload);
@@ -533,9 +539,9 @@ fn build_dense(
         row_offset,
         sparse.chunks.len()
     ));
-    // L2-normalize each row in place; `DenseIndex::new` does this defensively
-    // again, but normalizing here avoids re-normalizing the persisted blob
-    // on every load.
+    // L2-normalize each row in place. `DenseIndex::from_normalized` then
+    // skips a redundant per-row sweep ~ same vectors get persisted, and
+    // the load path doesn't re-normalize either.
     for mut row in all_rows.axis_iter_mut(Axis(0)) {
         let norm = row.iter().map(|v| v * v).sum::<f32>().sqrt();
         if norm > 1e-8 {
@@ -544,7 +550,7 @@ fn build_dense(
     }
     let raw = all_rows.clone();
     let payload = DensePayload {
-        vectors: DenseIndex::new(all_rows),
+        vectors: DenseIndex::from_normalized(all_rows),
         encoder_kind: encoder_kind.to_string(),
         model_id: model_id.to_string(),
         model_fingerprint: model_fingerprint.to_string(),
@@ -552,6 +558,7 @@ fn build_dense(
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0),
+        model_files_meta: model_files_meta.to_string(),
     };
     store_dense(cache, &payload, &raw)?;
     progress("index: dense index ready");

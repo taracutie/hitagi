@@ -13,12 +13,16 @@ use ndarray::Array2;
 use serde::{Deserialize, Serialize};
 
 use crate::bin_codec;
-use crate::cache::{ParseCache, SearchDenseRow, SearchSparseRow};
+use crate::cache::{LanguageCountsBlob, ParseCache, SearchDenseRow, SearchSparseRow};
 use crate::error::{AppError, AppResult};
 
 use super::dense::DenseIndex;
 use super::sparse::Bm25Index;
 use super::types::{FileSignature, IndexedChunk};
+
+/// Persisted dtype for `vectors_blob`. Always "f32" today; the column is kept
+/// so a future compression scheme can tag rows without another schema bump.
+const DENSE_DTYPE_F32: &str = "f32";
 
 /// All sparse-side state for one indexed repo. Held in memory after a load
 /// or build; written/read as a single SQLite row.
@@ -39,6 +43,9 @@ pub struct DensePayload {
     pub model_id: String,
     pub model_fingerprint: String,
     pub built_at_unix_secs: i64,
+    /// Cheap stat-tuple of the model files used to build these vectors. Lets
+    /// the next process skip rehashing if the files haven't changed.
+    pub model_files_meta: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -99,6 +106,14 @@ pub fn store_sparse(cache: &mut ParseCache, payload: &SparsePayload) -> AppResul
         signatures: payload.signatures.clone(),
     })
     .map_err(|err| AppError::internal(format!("encode sparse signatures: {err}")))?;
+    let language_counts_blob = bin_codec::encode(&LanguageCountsBlob {
+        counts: payload
+            .language_mapping
+            .iter()
+            .map(|(lang, ids)| (lang.clone(), ids.len()))
+            .collect(),
+    })
+    .map_err(|err| AppError::internal(format!("encode sparse language counts: {err}")))?;
     cache.store_search_sparse(&SearchSparseRow {
         bm25_blob,
         signatures_blob,
@@ -106,6 +121,9 @@ pub fn store_sparse(cache: &mut ParseCache, payload: &SparsePayload) -> AppResul
         file_mapping_blob,
         language_mapping_blob,
         built_at_unix_secs: payload.built_at_unix_secs,
+        indexed_files: payload.file_mapping.len(),
+        indexed_chunks: payload.chunks.len(),
+        language_counts_blob,
     });
     Ok(())
 }
@@ -114,8 +132,16 @@ pub fn load_dense(cache: &mut ParseCache) -> AppResult<Option<DensePayload>> {
     let Some(row) = cache.lookup_search_dense() else {
         return Ok(None);
     };
-    let vectors: Array2<f32> = bin_codec::decode(&row.vectors_blob)
-        .map_err(|err| AppError::internal(format!("decode dense vectors: {err}")))?;
+    let vectors: Array2<f32> = match row.vectors_dtype.as_str() {
+        DENSE_DTYPE_F32 | "" => bin_codec::decode(&row.vectors_blob)
+            .map_err(|err| AppError::internal(format!("decode f32 dense vectors: {err}")))?,
+        other => {
+            return Err(AppError::internal(format!(
+                "unknown dense vectors_dtype {:?}",
+                other
+            )));
+        }
+    };
     if vectors.ncols() != row.dim {
         return Err(AppError::internal(format!(
             "dense row dim {} doesn't match vectors {}",
@@ -124,11 +150,15 @@ pub fn load_dense(cache: &mut ParseCache) -> AppResult<Option<DensePayload>> {
         )));
     }
     Ok(Some(DensePayload {
-        vectors: DenseIndex::new(vectors),
+        // Vectors were unit-normalized before persistence in `store_dense`,
+        // so `from_normalized` skips the per-row L2 sweep that the generic
+        // constructor would otherwise do.
+        vectors: DenseIndex::from_normalized(vectors),
         encoder_kind: row.encoder_kind,
         model_id: row.model_id,
         model_fingerprint: row.model_fingerprint,
         built_at_unix_secs: row.built_at_unix_secs,
+        model_files_meta: row.model_files_meta,
     }))
 }
 
@@ -138,14 +168,16 @@ pub fn store_dense(
     raw_vectors: &Array2<f32>,
 ) -> AppResult<()> {
     let vectors_blob = bin_codec::encode(raw_vectors)
-        .map_err(|err| AppError::internal(format!("encode dense vectors: {err}")))?;
+        .map_err(|err| AppError::internal(format!("encode f32 dense vectors: {err}")))?;
     cache.store_search_dense(&SearchDenseRow {
         encoder_kind: payload.encoder_kind.clone(),
         model_id: payload.model_id.clone(),
         model_fingerprint: payload.model_fingerprint.clone(),
         dim: payload.vectors.dim(),
+        vectors_dtype: DENSE_DTYPE_F32.to_string(),
         vectors_blob,
         built_at_unix_secs: payload.built_at_unix_secs,
+        model_files_meta: payload.model_files_meta.clone(),
     });
     Ok(())
 }

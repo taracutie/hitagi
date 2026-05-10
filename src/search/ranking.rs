@@ -148,7 +148,7 @@ fn is_short_keyword_query(query: &str) -> bool {
 }
 
 #[derive(Clone, Debug)]
-struct QueryIntent {
+pub struct QueryIntent {
     keywords: Vec<String>,
     identifiers: Vec<String>,
     wants_test: bool,
@@ -168,7 +168,7 @@ struct QueryIntent {
 }
 
 impl QueryIntent {
-    fn new(query: &str) -> Self {
+    pub fn new(query: &str) -> Self {
         let lowered = query.trim().to_lowercase();
         let keywords = unique_words(
             super::tokens::tokenize(query)
@@ -313,6 +313,7 @@ pub fn boost_multi_chunk_files<S: BuildHasher>(
 
 pub fn apply_query_boost_in_place<S: BuildHasher>(
     mut boosted: HashMap<usize, f32, S>,
+    intent: &QueryIntent,
     query: &str,
     chunks: &[IndexedChunk],
     file_mapping: Option<&BTreeMap<String, Vec<usize>>>,
@@ -322,7 +323,6 @@ pub fn apply_query_boost_in_place<S: BuildHasher>(
         return boosted;
     }
     let max_score = boosted.values().copied().fold(f32::NEG_INFINITY, f32::max);
-    let intent = QueryIntent::new(query);
     let allowed: Option<HashSet<usize>> = selector.map(|ids| ids.iter().copied().collect());
     let allowed = allowed.as_ref();
     if is_symbol_query(query) {
@@ -335,10 +335,10 @@ pub fn apply_query_boost_in_place<S: BuildHasher>(
             boost_embedded_symbols(&mut boosted, query, max_score, chunks, allowed);
         }
     }
-    boost_path_intent(&mut boosted, &intent, max_score, chunks);
+    boost_path_intent(&mut boosted, intent, max_score, chunks);
     boost_named_non_candidates(
         &mut boosted,
-        &intent,
+        intent,
         max_score,
         chunks,
         file_mapping,
@@ -528,6 +528,11 @@ fn boost_named_non_candidates<S: BuildHasher>(
     let Some(file_mapping) = file_mapping else {
         return;
     };
+    // `definition_matchers` is regex-heavy. Don't pay the build cost up
+    // front (most queries never trigger an insertion here); lazy-init on
+    // the first chunk that gets close enough to qualify, then reuse for
+    // every subsequent chunk in the loop.
+    let mut identifier_matchers: Option<Vec<DefinitionMatcher>> = None;
     let mut inserted = 0usize;
     let max_insertions = 24usize;
     for (path, chunk_ids) in file_mapping {
@@ -548,7 +553,15 @@ fn boost_named_non_candidates<S: BuildHasher>(
         else {
             continue;
         };
-        let source_boost = if chunk_defines_any_identifier(&chunks[chunk_id], intent) {
+        let matchers = identifier_matchers.get_or_insert_with(|| {
+            if intent.identifiers.is_empty() {
+                Vec::new()
+            } else {
+                let names: HashSet<String> = intent.identifiers.iter().cloned().collect();
+                definition_matchers(&names)
+            }
+        });
+        let source_boost = if chunk_defines_any_identifier(&chunks[chunk_id], matchers) {
             1.35
         } else {
             0.85
@@ -558,13 +571,11 @@ fn boost_named_non_candidates<S: BuildHasher>(
     }
 }
 
-fn chunk_defines_any_identifier(chunk: &IndexedChunk, intent: &QueryIntent) -> bool {
-    if intent.identifiers.is_empty() {
+fn chunk_defines_any_identifier(chunk: &IndexedChunk, matchers: &[DefinitionMatcher]) -> bool {
+    if matchers.is_empty() {
         return false;
     }
-    let names: HashSet<String> = intent.identifiers.iter().cloned().collect();
-    let matchers = definition_matchers(&names);
-    chunk_defines_symbol(chunk, &matchers)
+    chunk_defines_symbol(chunk, matchers)
 }
 
 fn selector_allows(allowed: Option<&HashSet<usize>>, chunk_id: usize) -> bool {
@@ -790,18 +801,17 @@ pub fn rerank_topk<S: BuildHasher>(
     scores: &HashMap<usize, f32, S>,
     chunks: &[IndexedChunk],
     top_k: usize,
-    query: &str,
+    intent: &QueryIntent,
     penalise_paths: bool,
 ) -> Vec<(usize, f32)> {
     if scores.is_empty() || top_k == 0 {
         return Vec::new();
     }
-    let intent = QueryIntent::new(query);
     let mut penalized: Vec<(usize, f32)> = scores
         .iter()
         .map(|(&id, &score)| {
             let penalty = if penalise_paths {
-                file_path_penalty(&chunks[id].file_path, &intent)
+                file_path_penalty(&chunks[id].file_path, intent)
             } else {
                 1.0
             };
@@ -904,7 +914,7 @@ fn is_generated_path(normalized: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_query_boost_in_place, rerank_topk, resolve_alpha};
+    use super::{apply_query_boost_in_place, rerank_topk, resolve_alpha, QueryIntent};
     use crate::search::types::IndexedChunk;
     use std::collections::{BTreeMap, HashMap};
 
@@ -925,7 +935,8 @@ mod tests {
         let chunks = vec![defining, other];
         let mut scores = HashMap::new();
         scores.insert(1usize, 0.4);
-        let boosted = apply_query_boost_in_place(scores, "MyService", &chunks, None, None);
+        let intent = QueryIntent::new("MyService");
+        let boosted = apply_query_boost_in_place(scores, &intent, "MyService", &chunks, None, None);
         assert!(boosted[&0] > boosted[&1]);
 
         let defining = chunk("pub fn parse_json(input: &str) {}", "src/parser.rs");
@@ -934,19 +945,28 @@ mod tests {
         let mut scores = HashMap::new();
         scores.insert(0usize, 0.2);
         scores.insert(1usize, 0.4);
-        let boosted =
-            apply_query_boost_in_place(scores, "where is parse_json handled", &chunks, None, None);
+        let intent = QueryIntent::new("where is parse_json handled");
+        let boosted = apply_query_boost_in_place(
+            scores,
+            &intent,
+            "where is parse_json handled",
+            &chunks,
+            None,
+            None,
+        );
         assert!(boosted[&0] > boosted[&1]);
 
         let regular = chunk("def impl(): pass", "src/regular.py");
         let test = chunk("def impl(): pass", "tests/test_auth.py");
         let chunks = vec![regular, test];
         let scores = HashMap::from([(0usize, 1.0), (1usize, 1.0)]);
-        let ranked = rerank_topk(&scores, &chunks, 2, "impl", true);
+        let intent = QueryIntent::new("impl");
+        let ranked = rerank_topk(&scores, &chunks, 2, &intent, true);
         assert_eq!(ranked[0].0, 0);
 
         let scores = HashMap::from([(0usize, 1.0), (1usize, 1.1)]);
-        let ranked = rerank_topk(&scores, &chunks, 2, "test impl", true);
+        let intent = QueryIntent::new("test impl");
+        let ranked = rerank_topk(&scores, &chunks, 2, &intent, true);
         assert_eq!(ranked[0].0, 1);
     }
 
@@ -963,9 +983,11 @@ mod tests {
             ("src/other.ts".to_owned(), vec![0usize]),
         ]);
         let scores = HashMap::from([(0usize, 1.0)]);
+        let intent = QueryIntent::new("UserCard React component");
 
         let excluded = apply_query_boost_in_place(
             scores.clone(),
+            &intent,
             "UserCard React component",
             &chunks,
             Some(&mapping),
@@ -975,6 +997,7 @@ mod tests {
 
         let included = apply_query_boost_in_place(
             scores,
+            &intent,
             "UserCard React component",
             &chunks,
             Some(&mapping),

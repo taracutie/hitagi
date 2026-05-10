@@ -654,6 +654,75 @@ enum Commands {
         #[arg(long, value_name = "PATTERN")]
         exclude: Vec<String>,
     },
+    /// Framework-aware queries (Next.js for now).
+    ///
+    /// Each framework has its own subcommand. Pass `--root <path>` to scope
+    /// detection inside a monorepo (default: repo root). For Next.js, supported
+    /// actions are: `info` (detect + version), `list-routes` (page + API),
+    /// `list-layouts`, and `list-server-actions`.
+    Framework {
+        #[command(subcommand)]
+        framework: FrameworkSubcommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum FrameworkSubcommand {
+    /// Next.js queries.
+    Next {
+        #[command(subcommand)]
+        action: NextAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum NextAction {
+    /// Detect Next.js presence, version, and router type.
+    ///
+    /// Reads `<root>/package.json` and looks for `next` in dependencies,
+    /// devDependencies, or peerDependencies. Detects which router(s) are in
+    /// use by checking for `app/`, `pages/`, `src/app/`, or `src/pages/`.
+    Info {
+        /// Project root inside the repo (default: repo root). Useful for
+        /// monorepos where the Next.js app lives in a subdirectory.
+        #[arg(long, value_name = "PATH")]
+        root: Option<String>,
+    },
+    /// List page and API routes from the app/ and pages/ routers.
+    ///
+    /// App-router routes come from `page.{tsx,ts,jsx,js}` (pages) and
+    /// `route.{tsx,ts,jsx,js}` (API); pure route groups `(name)/` are dropped
+    /// from the URL pattern, dynamic segments `[id]` / `[...slug]` are kept
+    /// verbatim. API routes parse exported HTTP-verb handlers (GET, POST, ...)
+    /// into a `methods` field. Pages-router routes come from `*.{tsx,ts,jsx,js}`
+    /// under `pages/`, with special files (`_app`, `_document`, ...) excluded.
+    ListRoutes {
+        /// Project root inside the repo (default: repo root).
+        #[arg(long, value_name = "PATH")]
+        root: Option<String>,
+    },
+    /// List layout / template / loading / error files in the app router.
+    ///
+    /// Walks `app/` (or `src/app/`) for the special filenames Next.js
+    /// recognises: `layout`, `template`, `loading`, `error`, `not-found`,
+    /// `default`, `global-error`. Each result has a `scope` ~ the route
+    /// pattern the file applies to.
+    ListLayouts {
+        /// Project root inside the repo (default: repo root).
+        #[arg(long, value_name = "PATH")]
+        root: Option<String>,
+    },
+    /// List server actions (the "use server" directive).
+    ///
+    /// Walks the app and pages roots, pre-filters on the `"use server"`
+    /// substring, then parses survivors with tree-sitter. Reports both
+    /// file-level directives (`"use server"` at the top of the module) and
+    /// function-level directives (first statement inside a function body).
+    ListServerActions {
+        /// Project root inside the repo (default: repo root).
+        #[arg(long, value_name = "PATH")]
+        root: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1265,6 +1334,31 @@ pub fn run() -> AppResult<()> {
                         output::print_diff_files(&response, mode)
                     }
                 }
+                Commands::Framework { framework } => match framework {
+                    FrameworkSubcommand::Next { action } => match action {
+                        NextAction::Info { root } => {
+                            let response = commands::framework_next_info(&repo, root.as_deref())?;
+                            output::print_next_info(&response, mode)
+                        }
+                        NextAction::ListRoutes { root } => {
+                            let response =
+                                commands::framework_next_list_routes(&repo, root.as_deref())?;
+                            output::print_next_routes(&response, mode)
+                        }
+                        NextAction::ListLayouts { root } => {
+                            let response =
+                                commands::framework_next_list_layouts(&repo, root.as_deref())?;
+                            output::print_next_layouts(&response, mode)
+                        }
+                        NextAction::ListServerActions { root } => {
+                            let response = commands::framework_next_list_server_actions(
+                                &repo,
+                                root.as_deref(),
+                            )?;
+                            output::print_next_server_actions(&response, mode)
+                        }
+                    },
+                },
                 Commands::Install { .. } | Commands::Uninstall { .. } => unreachable!(),
             }
         }

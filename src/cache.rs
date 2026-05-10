@@ -30,8 +30,17 @@ use crate::{
 // v6 switches to bincode 2's standard config and makes parser metadata
 // tree-sitter-language-pack driven, so old symbol blobs are intentionally
 // unreadable.
-const CACHE_VERSION_KEY: &str = concat!("v6-", env!("CARGO_PKG_VERSION"));
-const CACHE_FILE_NAME: &str = "index.v6.sqlite";
+// v7 adds `vectors_dtype` to search_dense so we can persist f16 vectors
+// (half the on-disk size; widened back to f32 at load time). Existing
+// v6 caches are dropped rather than migrated.
+// v8 adds `indexed_files`, `indexed_chunks`, and `language_counts_blob`
+// columns to search_sparse so `index status` can report counts without
+// deserializing the ~50 MB chunk + mapping blobs. v7 caches are dropped.
+// v9 reverts dense vectors to lossless f32 (the column added in v7 stays
+// for forward-compat). Any v8 row tagged "f16" would no longer decode, so
+// v8 caches are invalidated outright.
+const CACHE_VERSION_KEY: &str = concat!("v9-", env!("CARGO_PKG_VERSION"));
+const CACHE_FILE_NAME: &str = "index.v9.sqlite";
 
 #[derive(Clone)]
 struct FileEntry {
@@ -376,7 +385,8 @@ impl ParseCache {
         let conn = self.ensure_read_conn()?;
         conn.query_row(
             "SELECT bm25_blob, signatures_blob, chunks_blob, file_mapping_blob,
-                    language_mapping_blob, built_at_unix_secs
+                    language_mapping_blob, built_at_unix_secs,
+                    indexed_files, indexed_chunks, language_counts_blob
              FROM search_sparse WHERE rowid = 1",
             [],
             |row| {
@@ -387,6 +397,9 @@ impl ParseCache {
                     file_mapping_blob: row.get(3)?,
                     language_mapping_blob: row.get(4)?,
                     built_at_unix_secs: row.get(5)?,
+                    indexed_files: row.get::<_, i64>(6)? as usize,
+                    indexed_chunks: row.get::<_, i64>(7)? as usize,
+                    language_counts_blob: row.get(8)?,
                 })
             },
         )
@@ -403,8 +416,8 @@ impl ParseCache {
         }
         let conn = self.ensure_read_conn()?;
         conn.query_row(
-            "SELECT encoder_kind, model_id, model_fingerprint, dim, vectors_blob,
-                    built_at_unix_secs
+            "SELECT encoder_kind, model_id, model_fingerprint, dim, vectors_dtype,
+                    vectors_blob, built_at_unix_secs, model_files_meta
              FROM search_dense WHERE rowid = 1",
             [],
             |row| {
@@ -413,8 +426,40 @@ impl ParseCache {
                     model_id: row.get(1)?,
                     model_fingerprint: row.get(2)?,
                     dim: row.get::<_, i64>(3)? as usize,
-                    vectors_blob: row.get(4)?,
+                    vectors_dtype: row.get(4)?,
+                    vectors_blob: row.get(5)?,
+                    built_at_unix_secs: row.get(6)?,
+                    model_files_meta: row.get(7)?,
+                })
+            },
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    /// Look up dense-index metadata without reading the vector blob. Used by
+    /// encoder loading to avoid pulling a multi-MB blob just to validate the
+    /// cached model fingerprint fast path.
+    pub fn lookup_search_dense_metadata(&mut self) -> Option<SearchDenseMetadataRow> {
+        if !self.enabled {
+            return None;
+        }
+        let conn = self.ensure_read_conn()?;
+        conn.query_row(
+            "SELECT encoder_kind, model_id, model_fingerprint, dim, vectors_dtype,
+                    built_at_unix_secs, model_files_meta
+             FROM search_dense WHERE rowid = 1",
+            [],
+            |row| {
+                Ok(SearchDenseMetadataRow {
+                    encoder_kind: row.get(0)?,
+                    model_id: row.get(1)?,
+                    model_fingerprint: row.get(2)?,
+                    dim: row.get::<_, i64>(3)? as usize,
+                    vectors_dtype: row.get(4)?,
                     built_at_unix_secs: row.get(5)?,
+                    model_files_meta: row.get(6)?,
                 })
             },
         )
@@ -430,30 +475,21 @@ impl ParseCache {
         if !self.enabled {
             return;
         }
-        let Some(conn) = self.ensure_write_conn() else {
-            return;
+        let retry = {
+            let Some(conn) = self.ensure_write_conn() else {
+                return;
+            };
+            match write_search_sparse_row(conn, row) {
+                Ok(_) => return,
+                Err(_) => !tables_are_readable(conn),
+            }
         };
-        let _ = conn.execute(
-            "INSERT INTO search_sparse (
-                rowid, bm25_blob, signatures_blob, chunks_blob,
-                file_mapping_blob, language_mapping_blob, built_at_unix_secs
-             ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(rowid) DO UPDATE SET
-                bm25_blob = excluded.bm25_blob,
-                signatures_blob = excluded.signatures_blob,
-                chunks_blob = excluded.chunks_blob,
-                file_mapping_blob = excluded.file_mapping_blob,
-                language_mapping_blob = excluded.language_mapping_blob,
-                built_at_unix_secs = excluded.built_at_unix_secs",
-            params![
-                row.bm25_blob,
-                row.signatures_blob,
-                row.chunks_blob,
-                row.file_mapping_blob,
-                row.language_mapping_blob,
-                row.built_at_unix_secs,
-            ],
-        );
+        if retry {
+            let Some(conn) = self.recreate_cache_file() else {
+                return;
+            };
+            let _ = write_search_sparse_row(conn, row);
+        }
     }
 
     /// Write the dense-index payload (overwrites any existing row). Same
@@ -462,30 +498,21 @@ impl ParseCache {
         if !self.enabled {
             return;
         }
-        let Some(conn) = self.ensure_write_conn() else {
-            return;
+        let retry = {
+            let Some(conn) = self.ensure_write_conn() else {
+                return;
+            };
+            match write_search_dense_row(conn, row) {
+                Ok(_) => return,
+                Err(_) => !tables_are_readable(conn),
+            }
         };
-        let _ = conn.execute(
-            "INSERT INTO search_dense (
-                rowid, encoder_kind, model_id, model_fingerprint, dim,
-                vectors_blob, built_at_unix_secs
-             ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(rowid) DO UPDATE SET
-                encoder_kind = excluded.encoder_kind,
-                model_id = excluded.model_id,
-                model_fingerprint = excluded.model_fingerprint,
-                dim = excluded.dim,
-                vectors_blob = excluded.vectors_blob,
-                built_at_unix_secs = excluded.built_at_unix_secs",
-            params![
-                row.encoder_kind,
-                row.model_id,
-                row.model_fingerprint,
-                row.dim as i64,
-                row.vectors_blob,
-                row.built_at_unix_secs,
-            ],
-        );
+        if retry {
+            let Some(conn) = self.recreate_cache_file() else {
+                return;
+            };
+            let _ = write_search_dense_row(conn, row);
+        }
     }
 
     /// Drop just the search-index rows (sparse + dense). Parse cache rows in
@@ -520,24 +547,33 @@ impl ParseCache {
             return inspection;
         };
         if let Ok(meta) = conn.query_row(
-            "SELECT chunks_blob, file_mapping_blob, language_mapping_blob,
-                    built_at_unix_secs
+            "SELECT LENGTH(chunks_blob), LENGTH(file_mapping_blob),
+                    LENGTH(language_mapping_blob), built_at_unix_secs,
+                    indexed_files, indexed_chunks, language_counts_blob
              FROM search_sparse WHERE rowid = 1",
             [],
             |row| {
                 Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, i64>(0)? as usize,
+                    row.get::<_, i64>(1)? as usize,
+                    row.get::<_, i64>(2)? as usize,
                     row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)? as usize,
+                    row.get::<_, i64>(5)? as usize,
+                    row.get::<_, Vec<u8>>(6)?,
                 ))
             },
         ) {
             inspection.sparse_present = true;
-            inspection.sparse_chunks_bytes = meta.0.len();
-            inspection.sparse_file_mapping_bytes = meta.1.len();
-            inspection.sparse_language_mapping_bytes = meta.2.len();
+            inspection.sparse_chunks_bytes = meta.0;
+            inspection.sparse_file_mapping_bytes = meta.1;
+            inspection.sparse_language_mapping_bytes = meta.2;
             inspection.sparse_built_at_unix_secs = Some(meta.3);
+            inspection.sparse_indexed_files = Some(meta.4);
+            inspection.sparse_indexed_chunks = Some(meta.5);
+            inspection.sparse_language_counts = bin_codec::decode::<LanguageCountsBlob>(&meta.6)
+                .map(|b| b.counts)
+                .unwrap_or_default();
         }
         if let Ok(meta) = conn.query_row(
             "SELECT encoder_kind, model_id, model_fingerprint, dim,
@@ -737,10 +773,35 @@ impl ParseCache {
                 let _ = std::fs::remove_file(&self.cache_file);
                 return None;
             }
+            if !validate_db(&conn, &self.repo_root) {
+                drop(conn);
+                return self.recreate_cache_file();
+            }
             self.checked_existing = true;
             self.conn = Some(conn);
         }
 
+        self.conn.as_mut()
+    }
+
+    fn recreate_cache_file(&mut self) -> Option<&mut Connection> {
+        self.conn.take();
+        let _ = std::fs::remove_file(&self.cache_file);
+        self.reset_on_write = false;
+
+        if std::fs::create_dir_all(&self.cache_dir).is_err() {
+            return None;
+        }
+        let conn = Connection::open(&self.cache_file).ok()?;
+        if init_db(&conn, &self.repo_root).is_err() || !validate_db(&conn, &self.repo_root) {
+            let _ = std::fs::remove_file(&self.cache_file);
+            return None;
+        }
+        self.checked_existing = true;
+        self.loaded.clear();
+        self.loaded_done = false;
+        self.seen.clear();
+        self.conn = Some(conn);
         self.conn.as_mut()
     }
 }
@@ -796,6 +857,23 @@ pub struct SearchSparseRow {
     /// Used by language filters.
     pub language_mapping_blob: Vec<u8>,
     pub built_at_unix_secs: i64,
+    /// Pre-computed counts so `index status` and the persist-load summary
+    /// don't have to deserialize file_mapping_blob and chunks_blob just to
+    /// answer "how many files / chunks are in here?"
+    pub indexed_files: usize,
+    pub indexed_chunks: usize,
+    /// Bincoded `LanguageCountsBlob` ~ small `BTreeMap<String, u32>` giving
+    /// chunks-per-language. Same motivation as the counts above; saves the
+    /// language_mapping_blob deserialize from the status path.
+    pub language_counts_blob: Vec<u8>,
+}
+
+/// Tiny per-language chunk-count summary, persisted alongside the sparse
+/// payload so `index status` can answer language breakdowns without
+/// touching `language_mapping_blob`.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct LanguageCountsBlob {
+    pub counts: BTreeMap<String, usize>,
 }
 
 /// One persisted dense-search payload. Independent of `SearchSparseRow` so
@@ -809,9 +887,28 @@ pub struct SearchDenseRow {
     /// Hash of model files; mismatch invalidates the row.
     pub model_fingerprint: String,
     pub dim: usize,
-    /// Bincoded normalized `Array2<f32>` in chunk-id-aligned row order.
+    /// On-disk numeric dtype of `vectors_blob`. Always "f32" today; the
+    /// column is kept so a future compression / dtype change can tag rows
+    /// without another schema bump.
+    pub vectors_dtype: String,
+    /// Bincoded normalized f32 vector matrix in chunk-id-aligned row order.
     pub vectors_blob: Vec<u8>,
     pub built_at_unix_secs: i64,
+    /// Cheap (mtime + len) tuple per model file, joined by `|`. On the next
+    /// warm encoder load we compare this against a fresh stat-tuple and
+    /// skip the multi-MB SHA pass in `model_fingerprint` when it matches.
+    pub model_files_meta: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SearchDenseMetadataRow {
+    pub encoder_kind: String,
+    pub model_id: String,
+    pub model_fingerprint: String,
+    pub dim: usize,
+    pub vectors_dtype: String,
+    pub built_at_unix_secs: i64,
+    pub model_files_meta: String,
 }
 
 /// Read-only inspection of the search-index portion of the cache. Used by
@@ -823,6 +920,13 @@ pub struct SearchIndexInspection {
     pub sparse_file_mapping_bytes: usize,
     pub sparse_language_mapping_bytes: usize,
     pub sparse_built_at_unix_secs: Option<i64>,
+    /// Files indexed in the sparse row, taken from the dedicated column
+    /// rather than from `file_mapping_blob`. `None` when sparse is absent.
+    pub sparse_indexed_files: Option<usize>,
+    /// Chunks indexed in the sparse row. Same motivation.
+    pub sparse_indexed_chunks: Option<usize>,
+    /// Per-language chunk counts. Empty when sparse is absent.
+    pub sparse_language_counts: BTreeMap<String, usize>,
     pub dense_present: bool,
     pub dense_encoder_kind: Option<String>,
     pub dense_model_id: Option<String>,
@@ -886,7 +990,10 @@ fn init_db(conn: &Connection, repo_root: &str) -> rusqlite::Result<()> {
             chunks_blob BLOB NOT NULL,
             file_mapping_blob BLOB NOT NULL,
             language_mapping_blob BLOB NOT NULL,
-            built_at_unix_secs INTEGER NOT NULL
+            built_at_unix_secs INTEGER NOT NULL,
+            indexed_files INTEGER NOT NULL,
+            indexed_chunks INTEGER NOT NULL,
+            language_counts_blob BLOB NOT NULL
         );
         CREATE TABLE IF NOT EXISTS search_dense (
             rowid INTEGER PRIMARY KEY CHECK (rowid = 1),
@@ -894,8 +1001,10 @@ fn init_db(conn: &Connection, repo_root: &str) -> rusqlite::Result<()> {
             model_id TEXT NOT NULL,
             model_fingerprint TEXT NOT NULL,
             dim INTEGER NOT NULL,
+            vectors_dtype TEXT NOT NULL DEFAULT 'f32',
             vectors_blob BLOB NOT NULL,
-            built_at_unix_secs INTEGER NOT NULL
+            built_at_unix_secs INTEGER NOT NULL,
+            model_files_meta TEXT NOT NULL DEFAULT ''
         );
         ",
     )?;
@@ -937,17 +1046,78 @@ fn tables_are_readable(conn: &Connection) -> bool {
         && conn
             .prepare(
                 "SELECT bm25_blob, signatures_blob, chunks_blob, file_mapping_blob,
-                        language_mapping_blob, built_at_unix_secs
+                        language_mapping_blob, built_at_unix_secs,
+                        indexed_files, indexed_chunks, language_counts_blob
                  FROM search_sparse LIMIT 0",
             )
             .is_ok()
         && conn
             .prepare(
                 "SELECT encoder_kind, model_id, model_fingerprint, dim,
-                        vectors_blob, built_at_unix_secs
+                        vectors_dtype, vectors_blob, built_at_unix_secs,
+                        model_files_meta
                  FROM search_dense LIMIT 0",
             )
             .is_ok()
+}
+
+fn write_search_sparse_row(conn: &Connection, row: &SearchSparseRow) -> rusqlite::Result<usize> {
+    conn.execute(
+        "INSERT INTO search_sparse (
+            rowid, bm25_blob, signatures_blob, chunks_blob,
+            file_mapping_blob, language_mapping_blob, built_at_unix_secs,
+            indexed_files, indexed_chunks, language_counts_blob
+         ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT(rowid) DO UPDATE SET
+            bm25_blob = excluded.bm25_blob,
+            signatures_blob = excluded.signatures_blob,
+            chunks_blob = excluded.chunks_blob,
+            file_mapping_blob = excluded.file_mapping_blob,
+            language_mapping_blob = excluded.language_mapping_blob,
+            built_at_unix_secs = excluded.built_at_unix_secs,
+            indexed_files = excluded.indexed_files,
+            indexed_chunks = excluded.indexed_chunks,
+            language_counts_blob = excluded.language_counts_blob",
+        params![
+            row.bm25_blob,
+            row.signatures_blob,
+            row.chunks_blob,
+            row.file_mapping_blob,
+            row.language_mapping_blob,
+            row.built_at_unix_secs,
+            row.indexed_files as i64,
+            row.indexed_chunks as i64,
+            row.language_counts_blob,
+        ],
+    )
+}
+
+fn write_search_dense_row(conn: &Connection, row: &SearchDenseRow) -> rusqlite::Result<usize> {
+    conn.execute(
+        "INSERT INTO search_dense (
+            rowid, encoder_kind, model_id, model_fingerprint, dim,
+            vectors_dtype, vectors_blob, built_at_unix_secs, model_files_meta
+         ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(rowid) DO UPDATE SET
+            encoder_kind = excluded.encoder_kind,
+            model_id = excluded.model_id,
+            model_fingerprint = excluded.model_fingerprint,
+            dim = excluded.dim,
+            vectors_dtype = excluded.vectors_dtype,
+            vectors_blob = excluded.vectors_blob,
+            built_at_unix_secs = excluded.built_at_unix_secs,
+            model_files_meta = excluded.model_files_meta",
+        params![
+            row.encoder_kind,
+            row.model_id,
+            row.model_fingerprint,
+            row.dim as i64,
+            row.vectors_dtype,
+            row.vectors_blob,
+            row.built_at_unix_secs,
+            row.model_files_meta,
+        ],
+    )
 }
 
 struct RawEntry {
@@ -1281,6 +1451,75 @@ mod tests {
         }
     }
 
+    fn break_search_sparse_table(cache_file: &Path) {
+        let conn = Connection::open(cache_file).unwrap();
+        conn.execute_batch(
+            "
+            DROP TABLE search_sparse;
+            CREATE TABLE search_sparse (
+                rowid INTEGER PRIMARY KEY CHECK (rowid = 1),
+                bm25_blob BLOB NOT NULL,
+                signatures_blob BLOB NOT NULL,
+                chunks_blob BLOB NOT NULL,
+                file_mapping_blob BLOB NOT NULL,
+                language_mapping_blob BLOB NOT NULL,
+                built_at_unix_secs INTEGER NOT NULL
+            );
+            ",
+        )
+        .unwrap();
+    }
+
+    fn break_search_dense_table(cache_file: &Path) {
+        let conn = Connection::open(cache_file).unwrap();
+        conn.execute_batch(
+            "
+            DROP TABLE search_dense;
+            CREATE TABLE search_dense (
+                rowid INTEGER PRIMARY KEY CHECK (rowid = 1),
+                encoder_kind TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                model_fingerprint TEXT NOT NULL,
+                dim INTEGER NOT NULL,
+                vectors_blob BLOB NOT NULL,
+                built_at_unix_secs INTEGER NOT NULL
+            );
+            ",
+        )
+        .unwrap();
+    }
+
+    fn sample_sparse_row(indexed_files: usize, indexed_chunks: usize) -> SearchSparseRow {
+        let language_counts_blob = crate::bin_codec::encode(&LanguageCountsBlob {
+            counts: BTreeMap::from([("rust".to_string(), indexed_chunks)]),
+        })
+        .unwrap();
+        SearchSparseRow {
+            bm25_blob: vec![1, 2, 3],
+            signatures_blob: vec![4, 5, 6],
+            chunks_blob: vec![7, 8, 9],
+            file_mapping_blob: vec![10, 11, 12],
+            language_mapping_blob: vec![13, 14, 15],
+            built_at_unix_secs: 123,
+            indexed_files,
+            indexed_chunks,
+            language_counts_blob,
+        }
+    }
+
+    fn sample_dense_row(model_fingerprint: &str) -> SearchDenseRow {
+        SearchDenseRow {
+            encoder_kind: "model2vec".to_string(),
+            model_id: "test-model".to_string(),
+            model_fingerprint: model_fingerprint.to_string(),
+            dim: 2,
+            vectors_dtype: "f32".to_string(),
+            vectors_blob: vec![1, 2, 3, 4],
+            built_at_unix_secs: 456,
+            model_files_meta: "tokenizer:1:2|model:3:4|config:5:6".to_string(),
+        }
+    }
+
     #[test]
     fn roundtrip_insert_save_lookup() {
         let tmp = CacheTmp::new("roundtrip");
@@ -1461,6 +1700,76 @@ mod tests {
             cache.lookup("a.rs", &metadata, rust()),
             Some(sample_symbols())
         );
+    }
+
+    #[test]
+    fn incompatible_search_sparse_table_is_recreated_on_store() {
+        let tmp = CacheTmp::new("bad-search-sparse-table");
+
+        {
+            let mut cache = tmp.open();
+            cache.store_search_sparse(&sample_sparse_row(1, 2));
+        }
+        break_search_sparse_table(&tmp.cache_file());
+
+        let replacement = sample_sparse_row(3, 4);
+        let mut cache = tmp.open();
+        cache.store_search_sparse(&replacement);
+
+        let loaded = cache
+            .lookup_search_sparse()
+            .expect("recreated sparse row should load");
+        assert_eq!(loaded.indexed_files, replacement.indexed_files);
+        assert_eq!(loaded.indexed_chunks, replacement.indexed_chunks);
+        assert_eq!(
+            loaded.language_counts_blob,
+            replacement.language_counts_blob
+        );
+    }
+
+    #[test]
+    fn incompatible_search_dense_table_is_recreated_on_store() {
+        let tmp = CacheTmp::new("bad-search-dense-table");
+
+        {
+            let mut cache = tmp.open();
+            cache.store_search_dense(&sample_dense_row("old-fingerprint"));
+        }
+        break_search_dense_table(&tmp.cache_file());
+
+        let replacement = sample_dense_row("new-fingerprint");
+        let mut cache = tmp.open();
+        cache.store_search_dense(&replacement);
+
+        let loaded = cache
+            .lookup_search_dense()
+            .expect("recreated dense row should load");
+        assert_eq!(loaded.model_fingerprint, replacement.model_fingerprint);
+        assert_eq!(loaded.vectors_dtype, replacement.vectors_dtype);
+        assert_eq!(loaded.model_files_meta, replacement.model_files_meta);
+    }
+
+    #[test]
+    fn dense_metadata_lookup_skips_vector_payload() {
+        let tmp = CacheTmp::new("dense-metadata");
+        let row = sample_dense_row("cached-fingerprint");
+
+        {
+            let mut cache = tmp.open();
+            cache.store_search_dense(&row);
+        }
+
+        let mut cache = tmp.open();
+        let meta = cache
+            .lookup_search_dense_metadata()
+            .expect("metadata row should load");
+        assert_eq!(meta.encoder_kind, row.encoder_kind);
+        assert_eq!(meta.model_id, row.model_id);
+        assert_eq!(meta.model_fingerprint, row.model_fingerprint);
+        assert_eq!(meta.dim, row.dim);
+        assert_eq!(meta.vectors_dtype, row.vectors_dtype);
+        assert_eq!(meta.built_at_unix_secs, row.built_at_unix_secs);
+        assert_eq!(meta.model_files_meta, row.model_files_meta);
     }
 
     #[test]

@@ -11,7 +11,7 @@ use ndarray::Array2;
 
 use super::dense::DenseIndex;
 use super::ranking::{
-    apply_query_boost_in_place, boost_multi_chunk_files, rerank_topk, resolve_alpha,
+    apply_query_boost_in_place, boost_multi_chunk_files, rerank_topk, resolve_alpha, QueryIntent,
 };
 use super::sparse::Bm25Index;
 use super::types::{IndexedChunk, RankedHit, SearchMode};
@@ -89,8 +89,16 @@ pub fn search_hybrid<E: QueryEncoder + ?Sized>(
     add_rrf_scores(&mut combined, bm25_scores, 1.0 - alpha_weight);
 
     boost_multi_chunk_files(&mut combined, chunks);
-    let boosted = apply_query_boost_in_place(combined, query, chunks, Some(file_mapping), selector);
-    let ranked = rerank_topk(&boosted, chunks, top_k, query, alpha_weight < 1.0);
+    let intent = QueryIntent::new(query);
+    let boosted = apply_query_boost_in_place(
+        combined,
+        &intent,
+        query,
+        chunks,
+        Some(file_mapping),
+        selector,
+    );
+    let ranked = rerank_topk(&boosted, chunks, top_k, &intent, alpha_weight < 1.0);
 
     let hits = ranked
         .into_iter()

@@ -9,7 +9,7 @@ use rayon::prelude::*;
 use crate::{
     cache::ParseCache,
     error::{AppError, AppResult},
-    git,
+    framework, git,
     lang::{count_lines, Language, LineStats},
     models::{
         CacheClearResponse, CacheLangCount, CachePathResponse, CacheStatusResponse,
@@ -17,7 +17,8 @@ use crate::{
         DiffPathsResponse, DiffSummaryFile, DiffSummaryGroup, DiffSummaryResponse, FilesGroup,
         FilesResponse, FindGroup, FindMatch, FindMatches, FindRelatedResponse, FindResponse,
         IndexBuildResponse, IndexCleanResponse, IndexStatusResponse, LangSummary, LangsResponse,
-        LocFileResult, LocFilesResponse, LocSymbolResult, LocSymbolsResponse, OutlineResponse,
+        LocFileResult, LocFilesResponse, LocSymbolResult, LocSymbolsResponse, NextInfoResponse,
+        NextLayoutsResponse, NextRoutesResponse, NextServerActionsResponse, OutlineResponse,
         OutputSymbol, OutputSymbolDetail, ReadFileResponse, ReadSummaryResponse, SearchHit,
         SearchResponse, SymbolDetail, SymbolInfo, SymbolResponse,
     },
@@ -390,8 +391,9 @@ pub fn search(repo: &RepoRoot, query: &str, opts: SearchOptions) -> AppResult<Se
             exclude_set.as_ref(),
         ),
         SearchModeArg::Hybrid | SearchModeArg::Semantic => {
-            let (encoder, encoder_kind, model_id, fingerprint, encoder_warning) =
+            let (encoder, encoder_kind, model_id, fingerprint, files_meta, encoder_warning) =
                 load_encoder_with_policy(
+                    &mut cache,
                     opts.hashing,
                     opts.no_download,
                     opts.offline,
@@ -407,6 +409,7 @@ pub fn search(repo: &RepoRoot, query: &str, opts: SearchOptions) -> AppResult<Se
                 &encoder_kind,
                 &model_id,
                 &fingerprint,
+                &files_meta,
             )?;
             match opts.mode {
                 SearchModeArg::Semantic => search::engine::run_semantic(
@@ -491,12 +494,14 @@ pub fn find_related(
         })?;
     let source_chunk = sparse.chunks[chunk_id].clone();
 
-    let (encoder, encoder_kind, model_id, fingerprint, encoder_warning) = load_encoder_with_policy(
-        opts.hashing,
-        opts.no_download,
-        opts.offline,
-        opts.model.as_deref(),
-    )?;
+    let (encoder, encoder_kind, model_id, fingerprint, files_meta, encoder_warning) =
+        load_encoder_with_policy(
+            &mut cache,
+            opts.hashing,
+            opts.no_download,
+            opts.offline,
+            opts.model.as_deref(),
+        )?;
     if let Some(w) = encoder_warning {
         warnings.push(w);
     }
@@ -507,6 +512,7 @@ pub fn find_related(
         &encoder_kind,
         &model_id,
         &fingerprint,
+        &files_meta,
     )?;
 
     let started = std::time::Instant::now();
@@ -561,12 +567,14 @@ pub fn find_related(
 /// set and the Model2Vec model isn't locally cached, emitting a warning so
 /// the user knows quality is degraded.
 fn load_encoder_with_policy(
+    cache: &mut ParseCache,
     hashing: bool,
     no_download: bool,
     offline: bool,
     model: Option<&str>,
 ) -> AppResult<(
     Box<dyn search::model2vec::Encoder>,
+    String,
     String,
     String,
     String,
@@ -579,6 +587,7 @@ fn load_encoder_with_policy(
             "hashing".to_string(),
             format!("hashing-{}", search::model2vec::DEFAULT_DIM),
             format!("hashing-{}", search::model2vec::DEFAULT_DIM),
+            String::new(),
             None,
         ));
     }
@@ -606,13 +615,33 @@ fn load_encoder_with_policy(
 
     match search::model2vec::load_model(&options) {
         Ok(encoder) => {
-            let fingerprint = search::model2vec::model_fingerprint(&options)
-                .unwrap_or_else(|_| options.model.clone());
+            // Fast path: if the cached dense row is for the same model and
+            // its file-metadata signature still matches what's on disk,
+            // reuse the cached fingerprint instead of re-hashing 30+ MB
+            // of model weights.
+            let cached = cache.lookup_search_dense_metadata();
+            let current_meta = search::model2vec::model_files_meta(&options).ok();
+            let (fingerprint, files_meta) = match (&cached, &current_meta) {
+                (Some(row), Some(meta))
+                    if row.encoder_kind == "model2vec"
+                        && row.model_id == options.model
+                        && !row.model_files_meta.is_empty()
+                        && row.model_files_meta == *meta =>
+                {
+                    (row.model_fingerprint.clone(), meta.clone())
+                }
+                _ => {
+                    let fp = search::model2vec::model_fingerprint(&options)
+                        .unwrap_or_else(|_| options.model.clone());
+                    (fp, current_meta.unwrap_or_default())
+                }
+            };
             Ok((
                 encoder,
                 "model2vec".to_string(),
                 options.model.clone(),
                 fingerprint,
+                files_meta,
                 None,
             ))
         }
@@ -625,6 +654,7 @@ fn load_encoder_with_policy(
                 "hashing".to_string(),
                 format!("hashing-{}", search::model2vec::DEFAULT_DIM),
                 format!("hashing-{}", search::model2vec::DEFAULT_DIM),
+                String::new(),
                 Some(format!(
                     "model unavailable ({err}); falling back to hashing encoder"
                 )),
@@ -642,25 +672,9 @@ pub fn index_status(repo: &RepoRoot) -> IndexStatusResponse {
         .as_ref()
         .map(|p| p.display().to_string());
 
-    let (indexed_files, indexed_chunks, languages) = if inspection.sparse_present {
-        // Decode the chunks/file_mapping/language_mapping from a fresh load
-        // so the status report has true counts. Cheap because the file is
-        // already in the page cache after the inspect.
-        let mut cache = ParseCache::open(repo.root());
-        match search::persist::load_sparse(&mut cache) {
-            Ok(Some(payload)) => {
-                let langs: BTreeMap<String, usize> = payload
-                    .language_mapping
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.len()))
-                    .collect();
-                (payload.file_mapping.len(), payload.chunks.len(), langs)
-            }
-            _ => (0, 0, BTreeMap::new()),
-        }
-    } else {
-        (0, 0, BTreeMap::new())
-    };
+    let indexed_files = inspection.sparse_indexed_files.unwrap_or(0);
+    let indexed_chunks = inspection.sparse_indexed_chunks.unwrap_or(0);
+    let languages = inspection.sparse_language_counts.clone();
 
     IndexStatusResponse {
         cache_file,
@@ -691,8 +705,9 @@ pub fn index_build(repo: &RepoRoot, opts: IndexBuildOptions) -> AppResult<IndexB
     let mut warnings: Vec<String> = Vec::new();
 
     if matches!(opts.mode, SearchModeArg::Hybrid | SearchModeArg::Semantic) {
-        let (encoder, encoder_kind, model_id, fingerprint, encoder_warning) =
+        let (encoder, encoder_kind, model_id, fingerprint, files_meta, encoder_warning) =
             load_encoder_with_policy(
+                &mut cache,
                 opts.hashing,
                 opts.no_download,
                 opts.offline,
@@ -708,6 +723,7 @@ pub fn index_build(repo: &RepoRoot, opts: IndexBuildOptions) -> AppResult<IndexB
             &encoder_kind,
             &model_id,
             &fingerprint,
+            &files_meta,
         )?;
     }
 
@@ -1520,6 +1536,31 @@ pub fn langs(repo: &RepoRoot) -> AppResult<LangsResponse> {
     Ok(LangsResponse {
         languages: summaries,
     })
+}
+
+pub fn framework_next_info(repo: &RepoRoot, root: Option<&str>) -> AppResult<NextInfoResponse> {
+    framework::next_info(repo, root)
+}
+
+pub fn framework_next_list_routes(
+    repo: &RepoRoot,
+    root: Option<&str>,
+) -> AppResult<NextRoutesResponse> {
+    framework::next_list_routes(repo, root)
+}
+
+pub fn framework_next_list_layouts(
+    repo: &RepoRoot,
+    root: Option<&str>,
+) -> AppResult<NextLayoutsResponse> {
+    framework::next_list_layouts(repo, root)
+}
+
+pub fn framework_next_list_server_actions(
+    repo: &RepoRoot,
+    root: Option<&str>,
+) -> AppResult<NextServerActionsResponse> {
+    framework::next_list_server_actions(repo, root)
 }
 
 pub fn cache_status(repo: &RepoRoot) -> CacheStatusResponse {
