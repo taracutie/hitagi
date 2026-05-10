@@ -285,6 +285,45 @@ pub fn diff_one_file(
     Ok(diffs.remove(0))
 }
 
+pub fn diff_many_files(
+    toplevel: &Path,
+    base_ref: Option<&str>,
+    cached: bool,
+    rel_paths: &[String],
+    unified_zero: bool,
+) -> AppResult<Vec<ParsedFileDiff>> {
+    if rel_paths.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut out = Vec::new();
+    for chunk in rel_paths.chunks(128) {
+        let mut args: Vec<String> = vec!["diff".into()];
+        if unified_zero {
+            args.push("-U0".into());
+        }
+        args.push("--no-color".into());
+        args.push("-M".into());
+        // Don't pass --text: it forces text treatment of binary files, which we
+        // explicitly want to detect via `Binary files ... differ` in the parser.
+        if cached {
+            args.push("--cached".into());
+        }
+        if let Some(r) = base_ref {
+            args.push(r.into());
+        }
+        args.push("--".into());
+        args.extend(chunk.iter().cloned());
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let bytes = run_git(toplevel, &arg_refs)?;
+        let text = String::from_utf8(bytes)
+            .map_err(|_| AppError::InvalidUtf8("git diff produced non-UTF-8 output".into()))?;
+        out.extend(parse_unified_diff(&text)?);
+    }
+
+    Ok(out)
+}
+
 pub fn show_blob(toplevel: &Path, base_ref: &str, rel_path: &str) -> AppResult<Vec<u8>> {
     let pathspec = format!("{base_ref}:{rel_path}");
     run_git(toplevel, &["show", &pathspec])

@@ -965,6 +965,7 @@ fn find_resolved_files(
     let mut truncated = false;
     let mut searched_files = 0usize;
     let mut all_kinds: BTreeSet<String> = BTreeSet::new();
+    let collect_available_kinds = !opts.kinds.is_empty();
     // Suppression counter populated when `--per-file N` (N >= 1) caps a file.
     // Keys are full repo-relative paths; prefix-strip happens at response build.
     let mut more_in_file: BTreeMap<String, usize> = BTreeMap::new();
@@ -984,8 +985,7 @@ fn find_resolved_files(
             .cloned()
             .map(|resolved| prepare_find_file(cache, resolved, needs_content_for_output))
             .collect();
-        let outcomes: Vec<FindWorkResult> =
-            prepared.into_par_iter().map(execute_find_file).collect();
+        let outcomes = execute_find_items(prepared);
 
         index = end;
 
@@ -995,8 +995,8 @@ fn find_resolved_files(
                 break 'outer;
             }
 
-            let relative_path = find_result_path(&outcome).to_string();
-            if let Some(top) = top_level_dir(&relative_path) {
+            let relative_path = find_result_path(&outcome);
+            if let Some(top) = top_level_dir(relative_path) {
                 visited_top_levels.insert(top.to_string());
             }
 
@@ -1021,8 +1021,10 @@ fn find_resolved_files(
                     truncated = true;
                     break 'outer;
                 }
-                if symbol.qualname.to_lowercase().contains(&needle) {
-                    all_kinds.insert(symbol.kind.clone());
+                if qualname_matches_query(&symbol.qualname, &needle) {
+                    if collect_available_kinds {
+                        all_kinds.insert(symbol.kind.clone());
+                    }
                     if !matches_kinds(&opts.kinds, &symbol.kind) {
                         continue;
                     }
@@ -1072,8 +1074,7 @@ fn find_resolved_files(
     // Decide flat-vs-grouped output. Rule: non-empty global LCP → flat (single
     // bucket already implied since common_prefix() truncates back to the last
     // `/`). Empty LCP → bucket by top-level dir; if 2+ buckets, emit groups.
-    let path_list: Vec<String> = matches.iter().map(|m| m.path.clone()).collect();
-    let global_prefix = common_prefix(&path_list);
+    let global_prefix = common_prefix(matches.iter().map(|m| m.path.as_str()));
 
     let (prefix_out, matches_out, groups_out, more_in_file_out) = if !global_prefix.is_empty() {
         for m in &mut matches {
@@ -1107,8 +1108,7 @@ fn find_resolved_files(
         } else {
             let mut groups: Vec<FindGroup> = Vec::new();
             for (_bucket, mut bmatches) in by_bucket {
-                let bucket_paths: Vec<String> = bmatches.iter().map(|m| m.path.clone()).collect();
-                let bp = common_prefix(&bucket_paths);
+                let bp = common_prefix(bmatches.iter().map(|m| m.path.as_str()));
                 let local_overflow: BTreeMap<String, usize> = more_in_file
                     .iter()
                     .filter(|(p, _)| p.starts_with(&bp))
@@ -1647,45 +1647,67 @@ pub fn diff_overview(repo: &RepoRoot, opts: DiffOptions) -> AppResult<DiffOvervi
     // additionally probes staged-only and unstaged-only sets so per-file
     // staged/unstaged booleans are accurate; narrow scopes skip those probes.
     let (cached, base_ref) = scope_to_diff_args(&opts);
-    let (primary_entries, primary_numstat) = if opts.scope == DiffScope::Untracked {
-        (Vec::new(), Vec::new())
-    } else {
-        (
-            git::name_status(&git_root.toplevel, base_ref, cached)?,
-            git::numstat(&git_root.toplevel, base_ref, cached)?,
-        )
-    };
+    let (primary_entries, primary_numstat, staged_set, unstaged_set, untracked) =
+        std::thread::scope(|scope| -> AppResult<_> {
+            let primary_entries_handle = (opts.scope != DiffScope::Untracked)
+                .then(|| scope.spawn(|| git::name_status(&git_root.toplevel, base_ref, cached)));
+            let primary_numstat_handle = (opts.scope != DiffScope::Untracked)
+                .then(|| scope.spawn(|| git::numstat(&git_root.toplevel, base_ref, cached)));
+            let staged_handle = (opts.scope == DiffScope::All).then(|| {
+                scope.spawn(|| {
+                    git::name_status(&git_root.toplevel, Some(opts.against.as_str()), true)
+                })
+            });
+            let unstaged_handle = (opts.scope == DiffScope::All)
+                .then(|| scope.spawn(|| git::name_status(&git_root.toplevel, None, false)));
+            let untracked_handle = (opts.scope != DiffScope::Staged)
+                .then(|| scope.spawn(|| git::list_untracked(&git_root.toplevel)));
 
-    let (staged_set, unstaged_set) = if opts.scope == DiffScope::All {
-        // Renames have two endpoints; insert both so cross-subtree rename
-        // synthesized entries (which key on the in-subtree side) still match
-        // their staged/unstaged origin.
-        let mut staged: HashSet<String> = HashSet::new();
-        for e in
-            git::name_status(&git_root.toplevel, Some(opts.against.as_str()), true)?.into_iter()
-        {
-            if let Some(op) = e.old_path {
-                staged.insert(op);
-            }
-            staged.insert(e.path);
-        }
-        let mut unstaged: HashSet<String> = HashSet::new();
-        for e in git::name_status(&git_root.toplevel, None, false)?.into_iter() {
-            if let Some(op) = e.old_path {
-                unstaged.insert(op);
-            }
-            unstaged.insert(e.path);
-        }
-        (staged, unstaged)
-    } else {
-        (HashSet::new(), HashSet::new())
-    };
+            let primary_entries = match primary_entries_handle {
+                Some(handle) => join_git_worker(handle)?,
+                None => Vec::new(),
+            };
+            let primary_numstat = match primary_numstat_handle {
+                Some(handle) => join_git_worker(handle)?,
+                None => Vec::new(),
+            };
 
-    let untracked = if opts.scope == DiffScope::Staged {
-        Vec::new()
-    } else {
-        git::list_untracked(&git_root.toplevel)?
-    };
+            // Renames have two endpoints; insert both so cross-subtree rename
+            // synthesized entries (which key on the in-subtree side) still match
+            // their staged/unstaged origin.
+            let mut staged: HashSet<String> = HashSet::new();
+            if let Some(handle) = staged_handle {
+                for e in join_git_worker(handle)? {
+                    if let Some(op) = e.old_path {
+                        staged.insert(op);
+                    }
+                    staged.insert(e.path);
+                }
+            }
+
+            let mut unstaged: HashSet<String> = HashSet::new();
+            if let Some(handle) = unstaged_handle {
+                for e in join_git_worker(handle)? {
+                    if let Some(op) = e.old_path {
+                        unstaged.insert(op);
+                    }
+                    unstaged.insert(e.path);
+                }
+            }
+
+            let untracked = match untracked_handle {
+                Some(handle) => join_git_worker(handle)?,
+                None => Vec::new(),
+            };
+
+            Ok((
+                primary_entries,
+                primary_numstat,
+                staged,
+                unstaged,
+                untracked,
+            ))
+        })?;
 
     // Index numstat by path for quick lookup. Renames key on the new path.
     let numstat_map: BTreeMap<String, git::NumstatEntry> = primary_numstat
@@ -1829,8 +1851,7 @@ pub fn diff_overview(repo: &RepoRoot, opts: DiffOptions) -> AppResult<DiffOvervi
 
     summaries.sort_by(|a, b| a.path.cmp(&b.path));
 
-    let path_list: Vec<String> = summaries.iter().map(|f| f.path.clone()).collect();
-    let prefix = common_prefix(&path_list);
+    let prefix = common_prefix(summaries.iter().map(|f| f.path.as_str()));
     if !prefix.is_empty() {
         for f in &mut summaries {
             f.path = strip_prefix(&f.path, &prefix);
@@ -2087,19 +2108,7 @@ pub fn diff_summary(
     let mut files = selection.files;
 
     if summary.symbols {
-        let drill = DiffFileOptions {
-            symbol: None,
-            raw: false,
-            body: DiffBodyMode::None,
-            snippet: false,
-        };
-        files = files
-            .into_iter()
-            .map(|base| {
-                let file = diff_file(repo, &base.path, opts.clone(), drill.clone())?;
-                Ok(summary_from_file(file, true, Some(&base)))
-            })
-            .collect::<AppResult<Vec<_>>>()?;
+        files = annotate_diff_summary_symbols(repo, &opts, files)?;
     }
 
     let groups = build_diff_summary_groups(&selection.groups, &files);
@@ -2166,6 +2175,125 @@ struct DiffSummaryFilter {
     path: String,
     paths: Vec<String>,
     is_dir: bool,
+}
+
+fn annotate_diff_summary_symbols(
+    repo: &RepoRoot,
+    opts: &DiffOptions,
+    mut files: Vec<DiffSummaryFile>,
+) -> AppResult<Vec<DiffSummaryFile>> {
+    if files.is_empty() {
+        return Ok(files);
+    }
+
+    let git_root = git::resolve_git_root(repo.root())?;
+    let drill = DiffFileOptions {
+        symbol: None,
+        raw: false,
+        body: DiffBodyMode::None,
+        snippet: false,
+    };
+
+    let mut tracked = Vec::new();
+    let mut tracked_paths = Vec::new();
+    let mut untracked = Vec::new();
+    for (idx, file) in files.iter().enumerate() {
+        if file.status.starts_with(UNTRACKED_STATUS) {
+            untracked.push(idx);
+            continue;
+        }
+        let toplevel_relative = toplevel_relative_diff_path(&file.path, &git_root.repo_subdir);
+        tracked.push((idx, toplevel_relative.clone()));
+        tracked_paths.push(toplevel_relative);
+    }
+
+    let (cached, base_ref) = scope_to_diff_args(opts);
+    let parsed_diffs =
+        git::diff_many_files(&git_root.toplevel, base_ref, cached, &tracked_paths, true)?;
+    let mut parsed_by_path: BTreeMap<String, usize> = BTreeMap::new();
+    for (idx, parsed) in parsed_diffs.iter().enumerate() {
+        if let Some(path) = parsed.new_path.as_ref().or(parsed.old_path.as_ref()) {
+            parsed_by_path.insert(path.clone(), idx);
+        }
+        if let Some(path) = parsed.old_path.as_ref() {
+            parsed_by_path.entry(path.clone()).or_insert(idx);
+        }
+    }
+
+    let mut cache = ParseCache::open(repo.root());
+    for (idx, toplevel_relative) in tracked {
+        files[idx].language = Language::detect(Path::new(&files[idx].path))
+            .ok()
+            .map(|l| l.as_str().to_string());
+        if files[idx].binary {
+            if files[idx].note.is_none() {
+                files[idx].note = Some("binary file ~ no diff content".to_string());
+            }
+            continue;
+        }
+
+        let status = files[idx].status.chars().next().unwrap_or('M');
+        let old_path = files[idx]
+            .old_path
+            .as_ref()
+            .map(|p| toplevel_relative_diff_path(p, &git_root.repo_subdir));
+        let candidate = DiffCandidate {
+            repo_relative: files[idx].path.clone(),
+            toplevel_relative: toplevel_relative.clone(),
+            status,
+            old_path,
+        };
+        let (lang_label, _, symbols) = collect_symbols_for_diff_cached(
+            repo,
+            &git_root,
+            &candidate,
+            &opts.against,
+            &mut cache,
+        )?;
+        files[idx].language = lang_label;
+
+        let parsed = parsed_by_path
+            .get(&toplevel_relative)
+            .and_then(|pos| parsed_diffs.get(*pos));
+        let Some(parsed) = parsed else {
+            continue;
+        };
+        if parsed.binary {
+            files[idx].binary = true;
+            if files[idx].note.is_none() {
+                files[idx].note = Some("binary file ~ no diff content".to_string());
+            }
+            continue;
+        }
+
+        let hunks: Vec<DiffHunk> = parsed
+            .hunks
+            .iter()
+            .map(|h| build_diff_hunk(h, &symbols, DiffBodyMode::None, false))
+            .collect();
+        let (symbols, more_symbols) = summary_symbols(Some(&hunks));
+        files[idx].symbols = symbols;
+        files[idx].more_symbols = more_symbols;
+    }
+    cache.save(false);
+
+    for idx in untracked {
+        let base = files[idx].clone();
+        let file = diff_file(repo, &base.path, opts.clone(), drill.clone())?;
+        files[idx] = summary_from_file(file, true, Some(&base));
+    }
+
+    Ok(files)
+}
+
+fn toplevel_relative_diff_path(repo_relative: &str, repo_subdir: &str) -> String {
+    if repo_subdir.is_empty() {
+        repo_relative.to_string()
+    } else if repo_relative.is_empty() {
+        repo_subdir.to_string()
+    } else {
+        format!("{repo_subdir}/{repo_relative}")
+    }
 }
 
 fn summary_files_from_overview(overview: DiffOverviewResponse) -> Vec<DiffSummaryFile> {
@@ -2508,6 +2636,12 @@ fn scope_to_diff_args(opts: &DiffOptions) -> (bool, Option<&str>) {
     }
 }
 
+fn join_git_worker<T>(handle: std::thread::ScopedJoinHandle<'_, AppResult<T>>) -> AppResult<T> {
+    handle
+        .join()
+        .map_err(|_| AppError::internal("git worker panicked"))?
+}
+
 fn rebase_to_subdir(toplevel_path: &str, subdir: &str) -> Option<String> {
     if subdir.is_empty() {
         return Some(toplevel_path.to_string());
@@ -2623,6 +2757,19 @@ fn collect_symbols_for_diff(
     candidate: &DiffCandidate,
     against: &str,
 ) -> AppResult<(Option<String>, Option<Language>, Vec<SymbolInfo>)> {
+    let mut cache = ParseCache::open(repo.root());
+    let result = collect_symbols_for_diff_cached(repo, git_root, candidate, against, &mut cache);
+    cache.save(false);
+    result
+}
+
+fn collect_symbols_for_diff_cached(
+    repo: &RepoRoot,
+    git_root: &git::GitRoot,
+    candidate: &DiffCandidate,
+    against: &str,
+    cache: &mut ParseCache,
+) -> AppResult<(Option<String>, Option<Language>, Vec<SymbolInfo>)> {
     let detected = Language::detect(Path::new(&candidate.repo_relative)).ok();
     let lang_label = detected.as_ref().map(|l| l.as_str().to_string());
     let parseable = detected.filter(|l| l.is_parseable());
@@ -2667,13 +2814,10 @@ fn collect_symbols_for_diff(
         if stat.language.as_ref() != Some(&language) {
             return Ok((lang_label, None, Vec::new()));
         }
-        let mut cache = ParseCache::open(repo.root());
-        let symbols = match cached_or_parsed(&mut cache, &resolved, &stat.metadata, &language, None)
-        {
+        let symbols = match cached_or_parsed(cache, &resolved, &stat.metadata, &language, None) {
             Ok(s) => s,
             Err(_) => Vec::new(),
         };
-        cache.save(false);
         Ok((lang_label, Some(language), symbols))
     }
 }
@@ -2921,7 +3065,7 @@ fn cached_or_parsed(
     language: &Language,
     content: Option<&str>,
 ) -> AppResult<Vec<SymbolInfo>> {
-    if let Some(symbols) = cache.lookup(&resolved.relative_path, metadata, language) {
+    if let Some(symbols) = cache.lookup_one(&resolved.relative_path, metadata, language) {
         return Ok(symbols);
     }
 
@@ -3104,6 +3248,25 @@ fn execute_find_file(item: FindWorkItem) -> FindWorkResult {
     })
 }
 
+fn execute_find_items(items: Vec<FindWorkItem>) -> Vec<FindWorkResult> {
+    // Warm, no-snippet `find` work is already in memory; Rayon only helps when
+    // a chunk may need file reads or parsing.
+    if items.iter().all(can_execute_find_item_inline) {
+        return items.into_iter().map(execute_find_file).collect();
+    }
+
+    items.into_par_iter().map(execute_find_file).collect()
+}
+
+fn can_execute_find_item_inline(item: &FindWorkItem) -> bool {
+    match item {
+        FindWorkItem::Skip { .. } | FindWorkItem::Error { .. } => true,
+        FindWorkItem::Load(prepared) => {
+            prepared.cached_symbols.is_some() && !prepared.needs_content
+        }
+    }
+}
+
 fn find_result_path(result: &FindWorkResult) -> &str {
     match result {
         FindWorkResult::Skipped { relative_path } | FindWorkResult::Error { relative_path, .. } => {
@@ -3245,23 +3408,48 @@ fn matches_kinds(filter: &[String], kind: &str) -> bool {
     filter.is_empty() || filter.iter().any(|k| kind_filter_matches(k, kind))
 }
 
+fn qualname_matches_query(qualname: &str, needle_lower: &str) -> bool {
+    if qualname.is_ascii() && needle_lower.is_ascii() {
+        return contains_ascii_case_insensitive(qualname.as_bytes(), needle_lower.as_bytes());
+    }
+    qualname.to_lowercase().contains(needle_lower)
+}
+
+fn contains_ascii_case_insensitive(haystack: &[u8], needle_lower: &[u8]) -> bool {
+    if needle_lower.is_empty() {
+        return true;
+    }
+    if needle_lower.len() > haystack.len() {
+        return false;
+    }
+
+    haystack
+        .windows(needle_lower.len())
+        .any(|window| window.eq_ignore_ascii_case(needle_lower))
+}
+
 fn kind_filter_matches(filter: &str, kind: &str) -> bool {
     if filter.eq_ignore_ascii_case(kind) {
         return true;
     }
 
-    match filter.to_ascii_lowercase().as_str() {
-        "callable" => kind_matches_any(kind, &["function", "method", "arrow_function"]),
-        "container" => kind_matches_any(
+    if filter.eq_ignore_ascii_case("callable") {
+        return kind_matches_any(kind, &["function", "method", "arrow_function"]);
+    }
+    if filter.eq_ignore_ascii_case("container") {
+        return kind_matches_any(
             kind,
             &["class", "struct", "interface", "enum", "trait", "object"],
-        ),
-        "value" => kind_matches_any(
+        );
+    }
+    if filter.eq_ignore_ascii_case("value") {
+        return kind_matches_any(
             kind,
             &["property", "field", "variant", "variable", "constant"],
-        ),
-        _ => false,
+        );
     }
+
+    false
 }
 
 fn kind_matches_any(kind: &str, candidates: &[&str]) -> bool {
@@ -3407,14 +3595,13 @@ fn unsampled_top_levels(
         .collect()
 }
 
-fn common_prefix(paths: &[String]) -> String {
-    if paths.is_empty() {
+fn common_prefix<'a>(paths: impl IntoIterator<Item = &'a str>) -> String {
+    let mut paths = paths.into_iter();
+    let Some(mut prefix) = paths.next() else {
         return String::new();
-    }
+    };
 
-    let mut prefix = paths[0].as_str();
-
-    for path in &paths[1..] {
+    for path in paths {
         let mut end = 0;
         for ((i, left), (_, right)) in prefix.char_indices().zip(path.char_indices()) {
             if left != right {
@@ -3538,5 +3725,21 @@ mod tests {
         };
         let paths: Vec<&str> = matches.iter().map(|m| m.path.as_str()).collect();
         assert_eq!(paths, vec!["仩/one.rs", "重/two.rs"]);
+    }
+
+    #[test]
+    fn qualname_query_match_preserves_case_insensitive_semantics() {
+        assert!(qualname_matches_query("SearchEngine.runBM25", "search"));
+        assert!(qualname_matches_query("SearchEngine.runBM25", "bm25"));
+        assert!(!qualname_matches_query("SearchEngine.runBM25", "dense"));
+        assert!(qualname_matches_query("İndex", &"İ".to_lowercase()));
+    }
+
+    #[test]
+    fn kind_alias_match_is_case_insensitive_without_allocating_aliases() {
+        assert!(kind_filter_matches("CALLABLE", "function"));
+        assert!(kind_filter_matches("Container", "struct"));
+        assert!(kind_filter_matches("value", "constant"));
+        assert!(!kind_filter_matches("callable", "struct"));
     }
 }

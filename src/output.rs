@@ -511,11 +511,10 @@ fn find_matches_is_empty(matches: &FindMatches) -> bool {
 }
 
 fn render_find_match(out: &mut String, prefix: &str, m: &FindMatch) {
-    let path = format!("{prefix}{}", m.path);
     let _ = write!(
         out,
-        "• {path}:L{}-{} {} {}",
-        m.lines[0], m.lines[1], m.kind, m.qualname
+        "• {prefix}{}:L{}-{} {} {}",
+        m.path, m.lines[0], m.lines[1], m.kind, m.qualname
     );
     if let Some(bytes) = m.bytes {
         let _ = write!(out, " • bytes {}-{}", bytes[0], bytes[1]);

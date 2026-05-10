@@ -604,21 +604,34 @@ fn summary_mode_returns_compact_files_and_symbols_when_requested() {
         "a.rs",
         "pub fn alpha() {\n    let x = 1;\n}\n\npub fn beta() {\n    let y = 2;\n}\n",
     );
+    r.write("b.rs", "pub fn gamma() {\n    let z = 3;\n}\n");
     r.commit("base");
     r.write(
         "a.rs",
         "pub fn alpha() {\n    let x = 11;\n}\n\npub fn beta() {\n    let y = 2;\n}\n",
     );
+    r.write("b.rs", "pub fn gamma() {\n    let z = 4;\n}\n");
 
     let compact = r.run(&["diff", "--summary"]);
     let files = compact["files"].as_array().unwrap();
-    assert_eq!(files.len(), 1);
-    assert!(files[0].get("hunks").is_none());
-    assert!(files[0].get("symbols").is_none());
+    assert_eq!(files.len(), 2);
+    assert!(files.iter().all(|file| file.get("hunks").is_none()));
+    assert!(files.iter().all(|file| file.get("symbols").is_none()));
 
     let with_symbols = r.run(&["diff", "--summary", "--symbols"]);
-    let symbols = with_symbols["files"][0]["symbols"].as_array().unwrap();
-    assert!(symbols.iter().any(|s| s == "alpha"));
+    let files = with_symbols["files"].as_array().unwrap();
+    let a = files
+        .iter()
+        .find(|file| file["path"].as_str() == Some("a.rs"))
+        .unwrap();
+    let b = files
+        .iter()
+        .find(|file| file["path"].as_str() == Some("b.rs"))
+        .unwrap();
+    let a_symbols = a["symbols"].as_array().unwrap();
+    let b_symbols = b["symbols"].as_array().unwrap();
+    assert!(a_symbols.iter().any(|s| s == "alpha"));
+    assert!(b_symbols.iter().any(|s| s == "gamma"));
 }
 
 #[test]

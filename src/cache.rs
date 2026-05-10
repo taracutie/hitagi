@@ -167,6 +167,20 @@ impl ParseCache {
         Some(entry.symbols)
     }
 
+    pub fn lookup_one(
+        &mut self,
+        rel_path: &str,
+        metadata: &Metadata,
+        language: impl Borrow<Language>,
+    ) -> Option<Vec<SymbolInfo>> {
+        let language = language.borrow();
+        let entry = self.lookup_entry_one(rel_path, metadata, language)?;
+        if !entry.parsed_for_symbols {
+            return None;
+        }
+        Some(entry.symbols)
+    }
+
     /// Returns the cached line count when (mtime, size, language) match.
     /// Used by `langs` to skip re-reading every file's bytes on warm runs.
     /// Lang-only entries (symbols.is_empty()) populate this for non-parseable
@@ -205,6 +219,53 @@ impl ParseCache {
 
         let entry = self.loaded.get(rel_path)?;
         entry_matches(entry, metadata, language).then(|| entry.clone())
+    }
+
+    fn lookup_entry_one(
+        &mut self,
+        rel_path: &str,
+        metadata: &Metadata,
+        language: &Language,
+    ) -> Option<FileEntry> {
+        if !self.enabled {
+            return None;
+        }
+        self.seen.insert(rel_path.to_string());
+
+        if let Some(entry) = self.pending.get(rel_path) {
+            return entry_matches(entry, metadata, language).then(|| entry.clone());
+        }
+
+        if self.loaded_done {
+            let entry = self.loaded.get(rel_path)?;
+            return entry_matches(entry, metadata, language).then(|| entry.clone());
+        }
+
+        let raw = {
+            let Some(conn) = self.ensure_read_conn() else {
+                return None;
+            };
+            match conn
+                .query_row(
+                    "SELECT rel_path, mtime_secs, mtime_nanos, size, language,
+                            line_total, line_blank, line_comment, parsed_for_symbols, symbols_blob
+                     FROM files
+                     WHERE rel_path = ?1",
+                    params![rel_path],
+                    read_raw_entry,
+                )
+                .optional()
+            {
+                Ok(value) => value,
+                Err(_) => {
+                    self.reset_on_write = true;
+                    return None;
+                }
+            }
+        }?;
+
+        let (_, entry) = decode_entry(raw)?;
+        entry_matches(&entry, metadata, language).then_some(entry)
     }
 
     /// Bulk-load every row from `files` into `self.loaded`. Idempotent: the
@@ -1840,6 +1901,32 @@ mod tests {
         cache.save(false);
         let after = fs::metadata(tmp.cache_file()).unwrap().modified().unwrap();
         assert_eq!(before, after, "warm hit + save(false) must not rewrite DB");
+    }
+
+    #[test]
+    fn lookup_one_hits_without_bulk_loading_cache() {
+        let tmp = CacheTmp::new("lookup-one");
+        let metadata = write_file(&tmp.repo_root, "a.rs", "fn foo() {}");
+
+        {
+            let mut cache = tmp.open();
+            cache.insert(
+                "a.rs".to_string(),
+                &metadata,
+                rust(),
+                None,
+                sample_symbols(),
+            );
+            cache.save(false);
+        }
+
+        let mut cache = tmp.open();
+        assert!(cache.lookup_one("a.rs", &metadata, rust()).is_some());
+        assert!(
+            !cache.loaded_done,
+            "single-file lookup should not materialize the full cache"
+        );
+        assert!(cache.loaded.is_empty());
     }
 
     #[test]
