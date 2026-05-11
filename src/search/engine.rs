@@ -29,7 +29,7 @@ use super::persist::{
 };
 use super::sparse::Bm25Index;
 use super::types::{FileSignature, IndexedChunk, RankedHit, SearchMode, SearchStats};
-use super::walker::{walk_for_index, WalkOptions, WalkedFile};
+use super::walker::{ensure_languages_resolved, walk_for_index, WalkOptions, WalkedFile};
 
 /// Encoder batch size tuned for tokenizer throughput and stable memory usage.
 const ENCODER_BATCH: usize = 1024;
@@ -133,10 +133,9 @@ fn query_selector(
 /// payload (chunks + BM25 + mappings + signatures + timestamp) ready for
 /// `search_*` to use.
 pub fn ensure_sparse(repo: &RepoRoot, cache: &mut ParseCache) -> AppResult<SparsePayload> {
-    // Walk + signature snapshot (~25 ms on the web repo) and the four
-    // SQLite-blob decodes inside `load_sparse` (~30 ms via rayon::join
-    // there) are independent ~ the persisted blob doesn't depend on
-    // whether the on-disk file set has changed. Fan them out via
+    // Walk + signature snapshot and the sibling-file decodes inside
+    // `load_sparse` are independent ~ the persisted blob doesn't depend
+    // on whether the on-disk file set has changed. Fan them out via
     // `rayon::join` so the longer side bounds the wall instead of their
     // sum. The mismatch case still rebuilds; on a hit (the overwhelmingly
     // common case) we skip the wait that the sequential ordering used to
@@ -216,9 +215,13 @@ fn signatures_match(a: &[FileSignature], b: &[FileSignature]) -> bool {
 /// in parallel batches (rayon `par_chunks`); BM25 build happens once at
 /// the end on the full chunk vector.
 fn build_sparse(
-    walked: Vec<WalkedFile>,
+    mut walked: Vec<WalkedFile>,
     signatures: Vec<FileSignature>,
 ) -> AppResult<SparsePayload> {
+    // Resolve language labels now ~ the walk skips this step so warm
+    // searches don't pay 2.5k extension lookups when the signatures match
+    // and we never reach `build_sparse`.
+    ensure_languages_resolved(&mut walked);
     ensure_language_parsers(&walked)?;
 
     progress(format!("index: chunking {} files", walked.len()));
@@ -462,11 +465,11 @@ pub fn ensure_dense(
     )
 }
 
-/// Same as `ensure_dense`, but lets the caller hand in a `Array2<f32>` that
-/// was speculatively mmap+memcpy'd on another thread in parallel with the
+/// Same as `ensure_dense`, but lets the caller hand in a `MappedDense`
+/// that was opened speculatively on another thread in parallel with the
 /// sparse and encoder loads. We validate the hint against the cached
 /// metadata: if encoder + fingerprint + chunk count + dim all line up, we
-/// adopt the speculative matrix and skip the sequential `load_dense` IO
+/// adopt the speculative mapping and skip the sequential `load_dense` IO
 /// entirely. A failed validation (or no hint) falls through to the
 /// classic path so the slow lane stays identical to before.
 pub fn ensure_dense_with_hint(
@@ -477,21 +480,21 @@ pub fn ensure_dense_with_hint(
     model_id: &str,
     model_fingerprint: &str,
     model_files_meta: &str,
-    hint: Option<Array2<f32>>,
+    hint: Option<super::dense::MappedDense>,
 ) -> AppResult<DensePayload> {
-    if let Some(hint_vectors) = hint {
+    if let Some(hint_mapped) = hint {
         // Speculative load only adopted when the cached metadata says the
         // same encoder + fingerprint + shape produced it. The metadata
         // lookup is a sub-millisecond SQLite read.
         if let Some(meta) = cache.lookup_search_dense_metadata() {
-            let shape_ok = hint_vectors.nrows() == sparse.chunks.len()
-                && hint_vectors.ncols() == encoder.dim();
+            let shape_ok =
+                hint_mapped.rows() == sparse.chunks.len() && hint_mapped.cols() == encoder.dim();
             let meta_ok = meta.encoder_kind == encoder_kind
                 && meta.model_fingerprint == model_fingerprint
                 && meta.dim == encoder.dim();
             if shape_ok && meta_ok {
                 return Ok(DensePayload {
-                    vectors: super::dense::DenseIndex::from_normalized(hint_vectors),
+                    vectors: super::dense::DenseIndex::from_mapped(hint_mapped),
                     encoder_kind: meta.encoder_kind,
                     model_id: meta.model_id,
                     model_fingerprint: meta.model_fingerprint,

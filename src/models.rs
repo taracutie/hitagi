@@ -32,7 +32,7 @@ pub struct SymbolDetail {
     pub range: RangeInfo,
 }
 
-// External output: the JSON shape the CLI prints.
+// Structured response models shared by the command layer and test assertions.
 
 fn is_false(b: &bool) -> bool {
     !*b
@@ -386,7 +386,7 @@ pub struct LangSummary {
     pub lines: usize,
     pub blank: usize,
     pub comment: usize,
-    /// `lines - blank - comment`. Pre-computed so JSON consumers don't have to.
+    /// `lines - blank - comment`. Pre-computed so callers do not have to.
     pub code: usize,
     pub parseable: bool,
 }

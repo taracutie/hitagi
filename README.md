@@ -51,7 +51,7 @@ This builds the release binary and drops it at `~/.cargo/bin/hitagi`.
 
 Paths are repo-relative. If an exact repo-relative path isn't found, path-taking commands fall back to a unique repo-internal suffix ~ e.g. `src-tauri/src/main.rs` resolves to `apps/desktop/src-tauri/src/main.rs` if there's exactly one match. Ambiguous suffixes return an error listing the candidates.
 
-Output is concise text to stdout by default. Pass `--json` for the stable compact JSON shape. Errors go to stderr with a non-zero exit code.
+Output is concise text to stdout. Errors go to stderr with a non-zero exit code.
 
 ### Agent prompts
 
@@ -180,7 +180,7 @@ Prints a short metadata header followed by the file content. For files with no r
 
 Flags:
 
-- `--lines S-E` ~ slice to a 1-indexed inclusive line range, e.g. `--lines 100-200`. The end clamps to the file; if `S` is past EOF you get an error (`--lines start (X) is past end of file (file has N lines)`). With `--json`, slicing adds `"lines": [s, e]` and `"total_lines": N` to the response.
+- `--lines S-E` ~ slice to a 1-indexed inclusive line range, e.g. `--lines 100-200`. The end clamps to the file; if `S` is past EOF you get an error (`--lines start (X) is past end of file (file has N lines)`).
 - `--summary` ~ emit metadata, line stats, parseability, and outline symbols without `content`. Useful for untracked/new files when you need structure before deciding what to read.
 
 ### `find <QUERY> [PATHS...]`
@@ -201,17 +201,17 @@ Pass extra positional paths to scope the walk.
 
 Flags:
 
-- `--limit N` ~ default `50`. Response includes `"truncated": true` when hit.
+- `--limit N` ~ default `50`. Text output notes when the cap is hit.
 - `--kind K1,K2,...` ~ case-insensitive symbol-kind filter, same syntax as outline. Empty matches → `available_kinds` hint.
 - `--bytes` ~ include byte ranges.
-- `--snippet` ~ include each symbol's first-line signature as a `snippet` field.
-- `--terse` ~ compact output mode: `matches` becomes a flat list of strings like `"src/foo.rs:42 Foo.bar(method)"` (with snippet appended after ` :: ` if `--snippet` is also passed). Most useful with `--json` or grouped multi-prefix sweeps.
-- `--per-file N` ~ cap matches per file at `N` (default `5`; pass `0` for no cap). Suppressed match counts are reported in `more_in_file: { "path": <count>, ... }` (top-level on flat responses, inside the containing group on grouped responses). The cap counts toward `--limit` ~ this is a diversity control, not a bypass. Useful when one class with many methods would otherwise eat the whole budget.
+- `--snippet` ~ include each symbol's first-line signature after ` :: `.
+- `--terse` ~ compact output mode: match rows become strings like `src/foo.rs:42 Foo.bar(method)` (with snippet appended after ` :: ` if `--snippet` is also passed).
+- `--per-file N` ~ cap matches per file at `N` (default `5`; pass `0` for no cap). Suppressed match counts are reported as `… N more in <path>`. The cap counts toward `--limit` ~ this is a diversity control, not a bypass. Useful when one class with many methods would otherwise eat the whole budget.
 - `--exclude PATTERN` (repeatable) ~ skip matching files (same syntax as `search --exclude`).
 
 `searched_files` reports how many parseable files were inspected. When zero (e.g. `find foo vendor`), the response includes a `note` explaining why.
 
-When matches span multiple top-level dirs with no shared prefix, the response switches to a grouped shape: `{"matches": [], "groups": [{"prefix": "...", "matches": [...], "more_in_file": {...}?}, ...]}`. Each group carries its own `prefix` (the longest common prefix within that bucket) with each match's `path` stripped relative to it. The flat-when-shared and grouped-when-spanning behavior keeps the typical case unchanged while saving a lot of bytes when matches scatter across deep monorepo paths.
+When matches span multiple top-level dirs with no shared prefix, text output switches to grouped sections. Each group carries its own prefix with each match's path stripped relative to it. The flat-when-shared and grouped-when-spanning behavior keeps the typical case unchanged while saving a lot of bytes when matches scatter across deep monorepo paths.
 
 ### `loc symbols|files`
 
@@ -269,7 +269,7 @@ Lists all files in the repo, sorted alphabetically. Respects `.gitignore` (and `
 
 Flags:
 
-- `--limit N` ~ maximum number of files to return (default `2000`). When truncated, text output switches to per-glob or per-root first/last samples; `--json` includes `"truncated": true`, `"groups"`, and a `"note"` field.
+- `--limit N` ~ maximum number of files to return (default `2000`). When truncated, text output switches to per-glob or per-root first/last samples.
 - `--exclude PATTERN` (repeatable) ~ skip files matching the pattern. Bare names like `--exclude vendor` skip that directory at any depth.
 
 ### `langs`
@@ -299,15 +299,20 @@ hitagi diff
 ```text
 diff
 5 files
-M src/cli.rs +12 -3 • unstaged
-A src/git.rs +140 -0 • staged • unstaged
-D docs/old.md +0 -33 • unstaged
-R src/renamed.rs +3 -3 ← src/orig.rs • unstaged
-? notes.txt
+▾ docs/ • 1 file • +0 -33
+  └─ D docs/old.md +0 -33 • unstaged
+
+▾ ./ • 1 file
+  └─ ? notes.txt
+
+▾ src/ • 3 files • +155 -6
+  ├─ M src/cli.rs +12 -3 • unstaged
+  ├─ A src/git.rs +140 -0 • staged • unstaged
+  └─ R src/renamed.rs +3 -3 ← src/orig.rs • unstaged
 ```
 
 Status codes: `M` modified, `A` added, `D` deleted, `R` renamed, `C` copied, `?` untracked. Untracked files have no `added`/`removed` in the overview, but path drilldown treats text files as synthetic additions.
-Default text overview groups combined-scope changes into `staged+unstaged`, `staged`, `unstaged`, and `untracked` sections when those states are present. JSON overview remains the stable flat `files` array.
+Default text overview groups changes by the top-level parent folder in the current repo root and keeps status / staged-state markers on each file line.
 
 ```bash
 hitagi diff src/cli.rs
@@ -327,7 +332,7 @@ Each hunk's `symbol` / `kind` is the innermost parsed symbol that contains the h
 hitagi diff src/cli.rs src/output.rs
 ```
 
-Multi-file drilldown concatenates file sections in text mode. JSON uses `{ "files": [ ... ] }`; one-file JSON stays the single `DiffFileResponse` shape for compatibility.
+Multi-file drilldown concatenates file sections in text mode.
 
 ```bash
 hitagi diff --summary --symbols
@@ -392,31 +397,6 @@ hitagi cache status       # full info: size, entry count, language breakdown
 hitagi cache path         # just the cache directory for this repo
 hitagi cache clear        # delete this repo's cache subdir
 hitagi cache clear --all  # nuke every repo's cache
-```
-
-With `--json`, `status` returns:
-
-```json
-{
-  "enabled": true,
-  "disabled_via_env": false,
-  "current_version": "v6-0.1.0",
-  "cache_dir": "/home/user/.cache/hitagi/abc123def4567890",
-  "cache_file": "/home/user/.cache/hitagi/abc123def4567890/index.v6.sqlite",
-  "exists": true,
-  "size_bytes": 7324880,
-  "modified_unix_secs": 1714728000,
-  "stored_version": "v6-0.1.0",
-  "stored_repo_root": "/home/user/code/myrepo",
-  "version_match": true,
-  "repo_root_match": true,
-  "entry_count": 3201,
-  "languages": [
-    { "language": "typescript", "files": 1893 },
-    { "language": "rust",       "files": 642 },
-    { "language": "tsx",        "files": 412 }
-  ]
-}
 ```
 
 `version_match`/`repo_root_match` flag stale caches: bumping `Cargo.toml`'s version invalidates everything (cheapest proxy for "visitor logic might have changed"); a `false` `repo_root_match` means a hash collision (run `cache clear` and move on).

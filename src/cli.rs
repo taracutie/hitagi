@@ -11,7 +11,7 @@ use crate::{
         SymbolOptions,
     },
     error::{AppError, AppResult},
-    output::{self, OutputMode},
+    output,
     repo::RepoRoot,
 };
 
@@ -28,7 +28,7 @@ coding agents (Claude Code, Codex, etc.) to navigate a codebase token-efficientl
 Every command parses on demand, prints concise text to stdout, and exits ~ no daemon, \
 no auth. The default `search` mode also runs a small embedding model locally for \
 hybrid ranking (~30 MB, downloaded on first use; pass `--offline` or `--hashing` to \
-skip). Pass --json for machine-readable output.
+skip).
 
 PRINCIPLE
   Minimize tokens spent reading code. Use outline / find / search to locate the right \
@@ -59,9 +59,9 @@ const AFTER_LONG_HELP: &str = "\
 TIPS
 
   Token-efficient defaults
-    Concise text to stdout by default. Use --json for machine-readable compact
-    JSON. Outline omits start_byte/end_byte and parent (derivable from qualname);
-    pass --bytes only when you actually need byte offsets.
+    Concise text to stdout. Outline omits start_byte/end_byte and parent
+    (derivable from qualname); pass --bytes only when you actually need byte
+    offsets.
 
   Path resolution
     File path is repo-relative (e.g. src/auth.ts) OR a unique repo-internal suffix
@@ -102,11 +102,11 @@ TIPS
 
   Limits and truncation
     Default `--limit` (`-k`) is 10 for `search` / `find-related`, 50 for `find`,
-    50 for `loc`, and 2000 for `files`. `find` / `loc` / `files` carry
-    `\"truncated\": true` when the cap is reached and `files` adds per-glob/per-root
-    first/last samples so truncated discovery stays useful. `search` /
-    `find-related` always return exactly the top-N hits ~ ranking decides what's
-    in vs out; bump `--limit` when you need a wider net.
+    50 for `loc`, and 2000 for `files`. `find` / `loc` / `files` note when the
+    cap is reached and `files` adds per-glob/per-root first/last samples so
+    truncated discovery stays useful. `search` / `find-related` always return
+    exactly the top-N hits ~ ranking decides what's in vs out; bump `--limit`
+    when you need a wider net.
 
   Fair sampling on full-repo sweeps
     `find` walks top-level subdirs round-robin (one file per bucket in turn)
@@ -150,9 +150,9 @@ TIPS
 
   find --terse
     Compact output mode. `matches` becomes a list of strings like
-    `path:line qualname(kind)` instead of structured objects. Most useful with
-    --json or grouped multi-prefix sweeps. With --snippet the line continues
-    with ` :: <signature>`.
+    `path:line qualname(kind)` instead of structured objects. Most useful for
+    grouped multi-prefix sweeps. With --snippet the line continues with
+    ` :: <signature>`.
 
   find --per-file N
     Cap matches per file at N (default 5; pass 0 for no cap). Useful when one file has
@@ -202,12 +202,25 @@ TIPS
     inspect, `hitagi index clean` to drop just the search rows (parse cache
     untouched), `hitagi index build [--mode hybrid]` to force a rebuild.
 
+  Framework-aware queries (`framework`)
+    `framework` exposes framework-specific navigation that is cheaper than a
+    repo-wide search when you know the stack. Next.js support is under
+    `hitagi framework next`: `info` detects Next.js, version, router type, and
+    src/ layout; pass `--root apps/web` to scope detection inside a monorepo.
+    `list-routes` reports app-router and pages-router pages/API routes with
+    route kind, router, file, and HTTP methods for API handlers. It drops route
+    groups from URL patterns, skips special pages files and private folders,
+    and keeps dynamic segments like `[id]` / `[...slug]` verbatim. `list-layouts`
+    reports app-router layout/template/loading/error files with their route
+    scope. `list-server-actions` finds file-level and function-level
+    `\"use server\"` directives and reports the action name, scope, and file.
+
   Uncommitted changes (`diff`)
     `diff` (no PATH) prints a per-file overview ~ status code (M/A/D/R/C/?),
-    ±line counts, staged/unstaged flags, and grouped text sections in the default
-    combined scope. `diff <PATH...>` prints structured hunks for one or more
-    files; one-path JSON remains the single-file response, multi-path JSON is
-    `{ \"files\": [...] }`. Directory PATHS default to grouped summaries. Untracked
+    ±line counts, staged/unstaged flags, and top-level folder-grouped text
+    sections. `diff <PATH...>` prints structured hunks for one or more
+    files; one path uses the single-file response shape, while multiple paths
+    are grouped under `files`. Directory PATHS default to grouped summaries. Untracked
     files are drillable as synthetic additions. `--commit` is the pre-commit
     preset: summary + touched symbols + no hunk bodies + grouped text sections.
     `--summary` emits compact per-file output; add `--symbols` to include touched
@@ -258,6 +271,11 @@ COMMON PATTERNS
   Cheap top-level orientation     hitagi outline FILE --depth 1
   Cheap sweep across the repo     hitagi find X --terse --limit 200
   Diverse sweep (cap hot files)   hitagi find X --terse --per-file 3
+  Detect a Next.js app            hitagi framework next info
+  Next.js app in a monorepo       hitagi framework next info --root apps/web
+  List Next.js routes             hitagi framework next list-routes
+  List Next.js layouts/errors     hitagi framework next list-layouts
+  Find Next.js server actions     hitagi framework next list-server-actions
   What's uncommitted?             hitagi diff
   Changed paths only              hitagi diff --paths
   Hunks for one file?             hitagi diff src/foo.rs
@@ -285,76 +303,9 @@ ANTI-PATTERNS (token waste)
                                            # need byte offsets ~ they ~double the
                                            # output size.
 
-JSON OUTPUT SHAPES (--json; compact form ~ omitted optional fields appear only when set)
-
-  outline   {\"language\":\"rust\",\"symbols\":[{\"kind\":\"...\",\"name\":\"...\",
-            \"qualname\":\"...\",\"lines\":[s,e]}],\"available_kinds\":[...]?}
-  symbol    {\"language\":\"rust\",\"symbol\":{\"kind\":\"...\",\"name\":\"...\",
-            \"qualname\":\"...\",\"content\":\"...\",\"lines\":[s,e]}}
-  search    {\"query\":\"...\",\"mode\":\"hybrid|bm25|semantic\",\"alpha\":F,
-            \"limit\":N,\"languages\":[...]?,\"paths\":[...]?,\"elapsed_ms\":N,
-            \"indexed_files\":N,\"indexed_chunks\":N,\"warnings\":[...]?,
-            \"results\":[{\"path\":\"...\",\"lines\":[s,e],\"language\":\"...\"?,
-            \"score\":F,\"source\":\"bm25|semantic|hybrid\",
-            \"snippet\":\"...\"?}]}
-  find-related  {\"path\":\"...\",\"line\":N,\"limit\":N,\"elapsed_ms\":N,
-            \"indexed_files\":N,\"indexed_chunks\":N,\"source_chunk\":{...hit...},
-            \"warnings\":[...]?,\"results\":[{...hit...},...]}
-  index status  {\"cache_file\":\"...\",\"sparse_present\":bool,\"dense_present\":bool,
-            \"indexed_files\":N,\"indexed_chunks\":N,\"languages\":{lang:N,...},
-            \"model_id\":\"...\"?,\"encoder_kind\":\"...\"?,
-            \"model_fingerprint\":\"...\"?,\"dim\":N?,
-            \"sparse_built_at_unix_secs\":N?,\"dense_built_at_unix_secs\":N?,
-            \"sparse_size_bytes\":N?,\"dense_size_bytes\":N?}
-  read      content: {\"language\":\"rust\",\"content\":\"...\",\"lines\":[s,e],
-            \"total_lines\":N}
-            summary: {\"language\":\"rust\",\"lines\":N,\"bytes\":N,\"parseable\":bool,
-            \"total_symbols\":N,\"symbols\":[...]}
-  find      {\"prefix\":\"src/\"?,\"matches\":[{\"path\":\"...\",\"kind\":\"...\",
-            \"name\":\"...\",\"qualname\":\"...\",\"lines\":[s,e]}],
-            \"more_in_file\":{\"path\":N,...}?,\"truncated\":bool,
-            \"searched_files\":N,\"available_kinds\":[...]?,\"note\":\"...\"?}
-            grouped (when matches span top-levels with no shared prefix):
-            {\"matches\":[],\"groups\":[{\"prefix\":\"a/\",\"matches\":[...],
-            \"more_in_file\":{...}?},...],\"truncated\":bool,
-            \"searched_files\":N,...}
-  files     {\"files\":[\"a\",\"b\",...],\"truncated\":bool,
-            \"groups\":[{\"pattern\":\"...\"?,\"root\":\"...\"?,\"total\":N,
-            \"shown\":N,\"first\":[...],\"last\":[...]}]?,\"note\":\"...\"?}
-  loc symbols {\"paths\":[...]?,\"languages\":[...]?,\"kinds\":[...],
-            \"min_lines\":N?,\"max_lines\":N?,\"limit\":N,\"sort\":\"...\",
-            \"scanned_files\":N,\"total_matches\":N,\"truncated\":bool?,
-            \"results\":[{\"path\":\"...\",\"language\":\"...\",\"kind\":\"...\",
-            \"qualname\":\"...\",\"lines\":[s,e],\"code\":N,\"bytes\":[s,e]?,
-            \"snippet\":\"...\"?}]}
-  loc files {\"globs\":[...]?,\"languages\":[...]?,\"min_lines\":N?,
-            \"max_lines\":N?,\"limit\":N,\"sort\":\"...\",\"scanned_files\":N,
-            \"total_matches\":N,\"truncated\":bool?,\"results\":[{\"path\":\"...\",
-            \"language\":\"...\",\"lines\":N,\"code\":N,\"blank\":N,\"comment\":N}]}
-  langs     {\"languages\":[{\"language\":\"rust\",\"files\":N,\"lines\":N,
-            \"parseable\":bool},...]}
-  diff      overview: {\"prefix\":\"...\"?,\"files\":[{\"path\":\"...\",
-            \"status\":\"M|A|D|R|C|?\",\"old_path\":\"...\"?,\"added\":N?,
-            \"removed\":N?,\"staged\":bool?,\"unstaged\":bool?,\"binary\":
-            bool?,\"note\":\"...\"?},...],\"against\":\"...\"?,
-            \"scope\":\"staged|unstaged|untracked\"?,\"clean\":bool?,\"note\":\"...\"?}
-            drilldown: {\"path\":\"...\",\"status\":\"...\",\"old_path\":\"...\"?,
-            \"added\":N?,\"removed\":N?,\"language\":\"...\"?,\"hunks\":
-            [{\"old_lines\":[s,e],\"new_lines\":[s,e],\"added\":N,\"removed\":N,
-            \"symbol\":\"...\"?,\"kind\":\"...\"?,\"spans\":[\"...\"]?,
-            \"snippet\":\"...\"?,\"body\":\"...\"?}],\"raw\":\"...\"?,\"binary\":
-            bool?,\"note\":\"...\"?}
-            multi-drilldown: {\"files\":[{...drilldown...},...]}
-            paths: {\"paths\":[\"a\",\"b\",...],\"scope\":\"...\"?,\"against\":\"...\"?}
-            summary: {\"files\":[{\"path\":\"...\",\"status\":\"...\",\"added\":N?,
-            \"removed\":N?,\"language\":\"...\"?,\"symbols\":[\"...\"]?,
-            \"more_symbols\":N?}],\"groups\":[{\"path\":\"...\",\"file_count\":N,
-            \"added\":N,\"removed\":N,\"files\":[...]}]?,\"commit\":bool?,
-            \"scope\":\"...\"?,\"against\":\"...\"?}
-
-  find --terse override:
-    matches (and each group's matches when grouped) becomes a flat list of
-    strings like `\"src/foo.rs:42 Foo.bar(method) :: pub fn bar(...) {\"`.
+  find --terse:
+    match rows become compact strings like
+    `src/foo.rs:42 Foo.bar(method) :: pub fn bar(...) {`.
 
 ERRORS
   Errors print to stderr as `error: <msg>` and exit 1. Path-not-found, ambiguous
@@ -375,10 +326,6 @@ struct Cli {
     /// Repo root to query. Defaults to the current working directory.
     #[arg(long, global = true, value_name = "PATH")]
     repo: Option<PathBuf>,
-
-    /// Emit compact JSON instead of the default concise text output.
-    #[arg(long, global = true)]
-    json: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -883,21 +830,16 @@ enum CacheAction {
 
 pub fn run() -> AppResult<()> {
     let cli = Cli::parse();
-    let mode = if cli.json {
-        OutputMode::Json
-    } else {
-        OutputMode::Text
-    };
     let command = cli.command;
 
     match command {
         Commands::Install { agent } => {
             let response = agent_prompt::install(agent)?;
-            output::print_agent_prompt(&response, mode)
+            output::print_agent_prompt(&response)
         }
         Commands::Uninstall { agent } => {
             let response = agent_prompt::uninstall(agent)?;
-            output::print_agent_prompt(&response, mode)
+            output::print_agent_prompt(&response)
         }
         command => {
             let repo_root = resolve_repo_root(cli.repo)?;
@@ -916,7 +858,7 @@ pub fn run() -> AppResult<()> {
                         depth,
                     };
                     let response = commands::outline(&repo, &path, opts)?;
-                    output::print_outline(&path, &response, mode)
+                    output::print_outline(&path, &response)
                 }
                 Commands::Symbol {
                     path,
@@ -925,7 +867,7 @@ pub fn run() -> AppResult<()> {
                 } => {
                     let opts = SymbolOptions { bytes };
                     let response = commands::symbol(&repo, &path, &qualname, opts)?;
-                    output::print_symbol(&path, &response, mode)
+                    output::print_symbol(&path, &response)
                 }
                 Commands::Search {
                     query,
@@ -955,7 +897,7 @@ pub fn run() -> AppResult<()> {
                         model,
                     };
                     let response = commands::search(&repo, &query, opts)?;
-                    output::print_search(&response, mode)
+                    output::print_search(&response)
                 }
                 Commands::FindRelated {
                     path,
@@ -974,12 +916,12 @@ pub fn run() -> AppResult<()> {
                         model,
                     };
                     let response = commands::find_related(&repo, &path, line, opts)?;
-                    output::print_find_related(&response, mode)
+                    output::print_find_related(&response)
                 }
                 Commands::Index { action } => match action.unwrap_or(IndexAction::Status) {
                     IndexAction::Status => {
                         let response = commands::index_status(&repo);
-                        output::print_index_status(&response, mode)
+                        output::print_index_status(&response)
                     }
                     IndexAction::Build {
                         mode: build_mode,
@@ -996,11 +938,11 @@ pub fn run() -> AppResult<()> {
                             model,
                         };
                         let response = commands::index_build(&repo, opts)?;
-                        output::print_index_build(&response, mode)
+                        output::print_index_build(&response)
                     }
                     IndexAction::Clean => {
                         let response = commands::index_clean(&repo)?;
-                        output::print_index_clean(&response, mode)
+                        output::print_index_clean(&response)
                     }
                 },
                 Commands::Read {
@@ -1019,10 +961,10 @@ pub fn run() -> AppResult<()> {
                     };
                     if opts.summary {
                         let response = commands::read_summary(&repo, &path)?;
-                        output::print_read_summary(&path, &response, mode)
+                        output::print_read_summary(&path, &response)
                     } else {
                         let response = commands::read_file(&repo, &path, opts)?;
-                        output::print_read(&path, &response, mode)
+                        output::print_read(&path, &response)
                     }
                 }
                 Commands::Find {
@@ -1047,7 +989,7 @@ pub fn run() -> AppResult<()> {
                         per_file,
                     };
                     let response = commands::find(&repo, &query, opts)?;
-                    output::print_find(&query, &response, mode)
+                    output::print_find(&query, &response)
                 }
                 Commands::Files {
                     globs,
@@ -1060,7 +1002,7 @@ pub fn run() -> AppResult<()> {
                         limit,
                     };
                     let response = commands::files(&repo, opts)?;
-                    output::print_files(&response, mode)
+                    output::print_files(&response)
                 }
                 Commands::Loc { action } => match action {
                     LocAction::Symbols {
@@ -1088,7 +1030,7 @@ pub fn run() -> AppResult<()> {
                             snippet,
                         };
                         let response = commands::loc_symbols(&repo, opts)?;
-                        output::print_loc_symbols(&response, mode)
+                        output::print_loc_symbols(&response)
                     }
                     LocAction::Files {
                         globs,
@@ -1109,25 +1051,25 @@ pub fn run() -> AppResult<()> {
                             sort: sort.into(),
                         };
                         let response = commands::loc_files(&repo, opts)?;
-                        output::print_loc_files(&response, mode)
+                        output::print_loc_files(&response)
                     }
                 },
                 Commands::Langs => {
                     let response = commands::langs(&repo)?;
-                    output::print_langs(&response, mode)
+                    output::print_langs(&response)
                 }
                 Commands::Cache { action } => match action.unwrap_or(CacheAction::Status) {
                     CacheAction::Status => {
                         let response = commands::cache_status(&repo);
-                        output::print_cache_status(&response, mode)
+                        output::print_cache_status(&response)
                     }
                     CacheAction::Path => {
                         let response = commands::cache_path(&repo);
-                        output::print_cache_path(&response, mode)
+                        output::print_cache_path(&response)
                     }
                     CacheAction::Clear { all } => {
                         let response = commands::cache_clear(&repo, all)?;
-                        output::print_cache_clear(&response, mode)
+                        output::print_cache_clear(&response)
                     }
                 },
                 Commands::Diff {
@@ -1200,7 +1142,7 @@ pub fn run() -> AppResult<()> {
                             ));
                         }
                         let response = commands::diff_paths(&repo, &paths, opts)?;
-                        return output::print_diff_paths(&response, mode);
+                        return output::print_diff_paths(&response);
                     }
                     if commit {
                         if summary {
@@ -1238,7 +1180,7 @@ pub fn run() -> AppResult<()> {
                                 group_by_state: true,
                             },
                         )?;
-                        return output::print_diff_summary(&response, mode);
+                        return output::print_diff_summary(&response);
                     }
                     if symbols && !summary {
                         return Err(AppError::bad_request(
@@ -1276,7 +1218,7 @@ pub fn run() -> AppResult<()> {
                                 group_by_state: false,
                             },
                         )?;
-                        return output::print_diff_summary(&response, mode);
+                        return output::print_diff_summary(&response);
                     }
                     let no_drill_flags =
                         !raw && symbol.is_none() && body == DiffBodyMode::Full && !snippet;
@@ -1294,7 +1236,7 @@ pub fn run() -> AppResult<()> {
                             return Err(AppError::bad_request("--snippet requires PATH"));
                         }
                         let response = commands::diff_overview(&repo, opts)?;
-                        output::print_diff_overview(&response, mode)
+                        output::print_diff_overview(&response)
                     } else if no_drill_flags
                         && commands::diff_paths_are_all_directories(&repo, &paths, opts.clone())?
                     {
@@ -1308,7 +1250,7 @@ pub fn run() -> AppResult<()> {
                                 group_by_state: false,
                             },
                         )?;
-                        output::print_diff_summary(&response, mode)
+                        output::print_diff_summary(&response)
                     } else if paths.len() == 1 {
                         let drill = DiffFileOptions {
                             symbol,
@@ -1317,7 +1259,7 @@ pub fn run() -> AppResult<()> {
                             snippet,
                         };
                         let response = commands::diff_file(&repo, &paths[0], opts, drill)?;
-                        output::print_diff_file(&paths[0], &response, mode)
+                        output::print_diff_file(&paths[0], &response)
                     } else {
                         if symbol.is_some() {
                             return Err(AppError::bad_request(
@@ -1331,31 +1273,31 @@ pub fn run() -> AppResult<()> {
                             snippet,
                         };
                         let response = commands::diff_files(&repo, &paths, opts, drill)?;
-                        output::print_diff_files(&response, mode)
+                        output::print_diff_files(&response)
                     }
                 }
                 Commands::Framework { framework } => match framework {
                     FrameworkSubcommand::Next { action } => match action {
                         NextAction::Info { root } => {
                             let response = commands::framework_next_info(&repo, root.as_deref())?;
-                            output::print_next_info(&response, mode)
+                            output::print_next_info(&response)
                         }
                         NextAction::ListRoutes { root } => {
                             let response =
                                 commands::framework_next_list_routes(&repo, root.as_deref())?;
-                            output::print_next_routes(&response, mode)
+                            output::print_next_routes(&response)
                         }
                         NextAction::ListLayouts { root } => {
                             let response =
                                 commands::framework_next_list_layouts(&repo, root.as_deref())?;
-                            output::print_next_layouts(&response, mode)
+                            output::print_next_layouts(&response)
                         }
                         NextAction::ListServerActions { root } => {
                             let response = commands::framework_next_list_server_actions(
                                 &repo,
                                 root.as_deref(),
                             )?;
-                            output::print_next_server_actions(&response, mode)
+                            output::print_next_server_actions(&response)
                         }
                     },
                 },

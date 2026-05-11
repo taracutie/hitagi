@@ -4,9 +4,17 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use assert_cmd::Command;
+use hitagi::{
+    commands::{
+        self as app_commands, DiffBodyMode, DiffFileOptions, DiffOptions, DiffScope,
+        DiffSummaryOptions,
+    },
+    repo::RepoRoot,
+};
+use serde::Serialize;
 use serde_json::Value;
 
 const TEST_PACK_LANGUAGES: &[&str] = &["rust"];
@@ -103,7 +111,6 @@ impl DiffRepo {
             .env("HITAGI_CACHE_DIR", &self.cache_dir)
             .arg("--repo")
             .arg(&self.repo)
-            .arg("--json")
             .args(args)
             .assert()
             .failure();
@@ -135,24 +142,207 @@ impl Drop for DiffRepo {
 
 fn run_in(repo: &Path, cache_dir: &Path, args: &[&str]) -> Value {
     prewarm_language_pack();
-    let output = Command::cargo_bin("hitagi")
-        .unwrap()
-        .env("HITAGI_CACHE_DIR", cache_dir)
-        .arg("--repo")
-        .arg(repo)
-        .arg("--json")
-        .args(args)
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    serde_json::from_slice(&output).unwrap_or_else(|e| {
-        panic!(
-            "stdout is not valid JSON ({e}): {}",
-            String::from_utf8_lossy(&output)
-        )
-    })
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+    let old = std::env::var_os("HITAGI_CACHE_DIR");
+    std::env::set_var("HITAGI_CACHE_DIR", cache_dir);
+    let value = run_diff_structured(repo, args);
+    match old {
+        Some(old) => std::env::set_var("HITAGI_CACHE_DIR", old),
+        None => std::env::remove_var("HITAGI_CACHE_DIR"),
+    }
+    value
+}
+
+fn run_diff_structured(repo: &Path, args: &[&str]) -> Value {
+    assert_eq!(args[0], "diff");
+    let repo = RepoRoot::new(std::fs::canonicalize(repo).unwrap());
+    let parsed = ParsedDiffArgs::parse(&args[1..]);
+    let opts = DiffOptions {
+        scope: parsed.scope,
+        against: parsed.against,
+        excludes: parsed.excludes,
+    };
+    if parsed.paths_only {
+        return to_value(app_commands::diff_paths(&repo, &parsed.paths, opts).unwrap());
+    }
+    if parsed.commit {
+        return to_value(
+            app_commands::diff_summary(
+                &repo,
+                &parsed.paths,
+                opts,
+                DiffSummaryOptions {
+                    symbols: true,
+                    commit: true,
+                    group_by_state: true,
+                },
+            )
+            .unwrap(),
+        );
+    }
+    if parsed.summary {
+        return to_value(
+            app_commands::diff_summary(
+                &repo,
+                &parsed.paths,
+                opts,
+                DiffSummaryOptions {
+                    symbols: parsed.symbols,
+                    commit: false,
+                    group_by_state: false,
+                },
+            )
+            .unwrap(),
+        );
+    }
+    let drill = DiffFileOptions {
+        symbol: parsed.symbol,
+        raw: parsed.raw,
+        body: parsed.body,
+        snippet: parsed.snippet,
+    };
+    if parsed.paths.is_empty() {
+        return to_value(app_commands::diff_overview(&repo, opts).unwrap());
+    }
+    let no_drill_flags =
+        !drill.raw && drill.symbol.is_none() && drill.body == DiffBodyMode::Full && !drill.snippet;
+    if no_drill_flags
+        && app_commands::diff_paths_are_all_directories(&repo, &parsed.paths, opts.clone()).unwrap()
+    {
+        return to_value(
+            app_commands::diff_summary(&repo, &parsed.paths, opts, DiffSummaryOptions::default())
+                .unwrap(),
+        );
+    }
+    if parsed.paths.len() == 1 {
+        to_value(app_commands::diff_file(&repo, &parsed.paths[0], opts, drill).unwrap())
+    } else {
+        let drill = DiffFileOptions {
+            symbol: None,
+            raw: drill.raw,
+            body: drill.body,
+            snippet: drill.snippet,
+        };
+        to_value(app_commands::diff_files(&repo, &parsed.paths, opts, drill).unwrap())
+    }
+}
+
+struct ParsedDiffArgs {
+    paths: Vec<String>,
+    symbol: Option<String>,
+    raw: bool,
+    summary: bool,
+    commit: bool,
+    symbols: bool,
+    paths_only: bool,
+    body: DiffBodyMode,
+    snippet: bool,
+    scope: DiffScope,
+    against: String,
+    excludes: Vec<String>,
+}
+
+impl Default for ParsedDiffArgs {
+    fn default() -> Self {
+        Self {
+            paths: Vec::new(),
+            symbol: None,
+            raw: false,
+            summary: false,
+            commit: false,
+            symbols: false,
+            paths_only: false,
+            body: DiffBodyMode::Full,
+            snippet: false,
+            scope: DiffScope::All,
+            against: "HEAD".to_string(),
+            excludes: Vec::new(),
+        }
+    }
+}
+
+impl ParsedDiffArgs {
+    fn parse(args: &[&str]) -> Self {
+        let mut parsed = Self::default();
+        let mut i = 0;
+        while i < args.len() {
+            match args[i] {
+                "--symbol" => {
+                    parsed.symbol = Some(args[i + 1].to_string());
+                    i += 2;
+                }
+                "--raw" => {
+                    parsed.raw = true;
+                    i += 1;
+                }
+                "--summary" => {
+                    parsed.summary = true;
+                    i += 1;
+                }
+                "--commit" => {
+                    parsed.commit = true;
+                    i += 1;
+                }
+                "--symbols" => {
+                    parsed.symbols = true;
+                    i += 1;
+                }
+                "--paths" | "--names-only" => {
+                    parsed.paths_only = true;
+                    i += 1;
+                }
+                "--body" => {
+                    parsed.body = parse_body(args[i + 1]);
+                    i += 2;
+                }
+                "--snippet" => {
+                    parsed.snippet = true;
+                    i += 1;
+                }
+                "--staged" => {
+                    parsed.scope = DiffScope::Staged;
+                    i += 1;
+                }
+                "--unstaged" => {
+                    parsed.scope = DiffScope::Unstaged;
+                    i += 1;
+                }
+                "--untracked" => {
+                    parsed.scope = DiffScope::Untracked;
+                    i += 1;
+                }
+                "--against" => {
+                    parsed.against = args[i + 1].to_string();
+                    i += 2;
+                }
+                "--exclude" => {
+                    parsed.excludes.push(args[i + 1].to_string());
+                    i += 2;
+                }
+                path if path.starts_with('-') => panic!("unsupported diff arg {path}"),
+                path => {
+                    parsed.paths.push(path.to_string());
+                    i += 1;
+                }
+            }
+        }
+        parsed
+    }
+}
+
+fn parse_body(value: &str) -> DiffBodyMode {
+    match value {
+        "full" => DiffBodyMode::Full,
+        "changed-lines" => DiffBodyMode::ChangedLines,
+        "added-only" => DiffBodyMode::AddedOnly,
+        "none" => DiffBodyMode::None,
+        other => panic!("unsupported body mode {other}"),
+    }
+}
+
+fn to_value<T: Serialize>(value: T) -> Value {
+    serde_json::to_value(value).expect("response serializes for assertions")
 }
 
 fn prewarm_language_pack() {
@@ -1132,22 +1322,33 @@ fn default_diff_output_is_concise_text() {
 }
 
 #[test]
-fn default_diff_text_groups_combined_scope_by_change_state() {
+fn default_diff_text_groups_combined_scope_by_folder() {
     let r = DiffRepo::new("text-groups");
-    r.write("a.rs", "pub fn a() {}\n");
-    r.write("b.rs", "pub fn b() {}\n");
+    r.write("src/a.rs", "pub fn a() {}\n");
+    r.write("src/search/c.rs", "pub fn c() {}\n");
+    r.write("tests/b.rs", "pub fn b() {}\n");
     r.commit("base");
 
-    r.write("a.rs", "pub fn aa() {}\n");
-    r.add("a.rs");
-    r.write("a.rs", "pub fn aaa() {}\n");
-    r.write("b.rs", "pub fn bb() {}\n");
+    r.write("src/a.rs", "pub fn aa() {}\n");
+    r.add("src/a.rs");
+    r.write("src/a.rs", "pub fn aaa() {}\n");
+    r.write("src/search/c.rs", "pub fn cc() {}\n");
+    r.write("tests/b.rs", "pub fn bb() {}\n");
     r.write("new.rs", "pub fn fresh() {}\n");
 
     let text = r.run_text(&["diff"]);
-    assert!(text.contains("staged+unstaged\n"), "{text}");
-    assert!(text.contains("unstaged\n"), "{text}");
-    assert!(text.contains("untracked\n"), "{text}");
+    assert!(text.contains("▾ ./ • 1 file"), "{text}");
+    assert!(text.contains("└─ ? new.rs"), "{text}");
+    assert!(text.contains("▾ src/ • 2 files"), "{text}");
+    assert!(text.contains("├─ M src/a.rs"), "{text}");
+    assert!(text.contains("└─ M src/search/c.rs"), "{text}");
+    assert!(!text.contains("▾ src/search/"), "{text}");
+    assert!(text.contains("▾ tests/ • 1 file"), "{text}");
+    assert!(text.contains("└─ M tests/b.rs"), "{text}");
+    assert!(text.contains("• staged"), "{text}");
+    assert!(text.contains("• unstaged"), "{text}");
+    assert!(!text.contains("staged+unstaged\n"), "{text}");
+    assert!(!text.contains("untracked\n"), "{text}");
 }
 
 #[test]

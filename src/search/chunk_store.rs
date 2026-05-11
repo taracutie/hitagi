@@ -20,8 +20,19 @@
 //! `load_sparse`, which was empirically slower than the in-place vector
 //! approach it was meant to replace. The flat format here decodes via a
 //! handful of `memcpy`-shaped reads.
+//!
+//! The warm-cache load path goes one step further: instead of reading the
+//! entire ~42 MB blob into a `Vec<u8>` and then `to_vec()`-ing the content
+//! body into another owned buffer, `decode_from_mmap` keeps the file
+//! mmap'd and references content slices directly into the mapping. Top-K
+//! ranking only touches a few hundred chunk bodies, so the OS pages in
+//! exactly what we need on demand instead of memcpy-ing the whole corpus.
 
 use std::collections::HashMap;
+use std::fmt;
+use std::ops::Range;
+
+use memmap2::Mmap;
 
 use super::types::IndexedChunk;
 
@@ -48,7 +59,6 @@ pub struct ChunkRecord {
 }
 
 /// Columnar storage for an indexed chunk corpus.
-#[derive(Clone, Debug, Default)]
 pub struct ChunkStore {
     records: Vec<ChunkRecord>,
     paths: Vec<Box<str>>,
@@ -58,7 +68,61 @@ pub struct ChunkStore {
     /// guaranteed at build time (every byte comes from a `String` field
     /// of an `IndexedChunk`), so accessors return `&str` via
     /// `from_utf8_unchecked` to skip a per-read validation pass.
-    content_bytes: Vec<u8>,
+    content: ContentBuf,
+}
+
+/// Backing storage for the concatenated chunk content. The build path
+/// (`from_indexed`) owns the bytes in a `Vec`; the warm-load path
+/// (`decode_from_mmap`) keeps the chunks file mapped and references the
+/// content section directly, skipping the multi-MB memcpy that
+/// `content_slice.to_vec()` used to dominate `load_sparse` with.
+enum ContentBuf {
+    Owned(Vec<u8>),
+    Mapped { mmap: Mmap, body: Range<usize> },
+}
+
+impl ContentBuf {
+    #[inline]
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            ContentBuf::Owned(v) => v.as_slice(),
+            ContentBuf::Mapped { mmap, body } => &mmap[body.start..body.end],
+        }
+    }
+}
+
+impl fmt::Debug for ContentBuf {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ContentBuf::Owned(v) => f.debug_tuple("Owned").field(&v.len()).finish(),
+            ContentBuf::Mapped { body, .. } => f
+                .debug_struct("Mapped")
+                .field("len", &(body.end - body.start))
+                .finish(),
+        }
+    }
+}
+
+impl fmt::Debug for ChunkStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ChunkStore")
+            .field("records", &self.records.len())
+            .field("paths", &self.paths.len())
+            .field("languages", &self.languages.len())
+            .field("content", &self.content)
+            .finish()
+    }
+}
+
+impl Default for ChunkStore {
+    fn default() -> Self {
+        Self {
+            records: Vec::new(),
+            paths: Vec::new(),
+            languages: Vec::new(),
+            content: ContentBuf::Owned(Vec::new()),
+        }
+    }
 }
 
 impl ChunkStore {
@@ -77,11 +141,13 @@ impl ChunkStore {
             let content_start = content_bytes.len() as u32;
             content_bytes.extend_from_slice(chunk.content.as_bytes());
             let content_end = content_bytes.len() as u32;
-            let path_idx = *path_index.entry(chunk.file_path.clone()).or_insert_with(|| {
-                let idx = paths.len() as u32;
-                paths.push(chunk.file_path.clone().into_boxed_str());
-                idx
-            });
+            let path_idx = *path_index
+                .entry(chunk.file_path.clone())
+                .or_insert_with(|| {
+                    let idx = paths.len() as u32;
+                    paths.push(chunk.file_path.clone().into_boxed_str());
+                    idx
+                });
             let lang_idx = match chunk.language {
                 Some(lang) => *lang_index.entry(lang.clone()).or_insert_with(|| {
                     let idx = languages.len() as i32;
@@ -103,7 +169,7 @@ impl ChunkStore {
             records,
             paths,
             languages,
-            content_bytes,
+            content: ContentBuf::Owned(content_bytes),
         }
     }
 
@@ -125,7 +191,7 @@ impl ChunkStore {
     #[inline]
     pub fn content(&self, id: usize) -> &str {
         let r = &self.records[id];
-        let bytes = &self.content_bytes[r.content_start as usize..r.content_end as usize];
+        let bytes = &self.content.as_slice()[r.content_start as usize..r.content_end as usize];
         // Safety: every byte sequence originated from a `String` field of an
         // `IndexedChunk`, so the buffer is well-formed UTF-8 by construction.
         unsafe { std::str::from_utf8_unchecked(bytes) }
@@ -185,10 +251,11 @@ impl ChunkStore {
         let records_bytes = self.records.len() * CHUNK_RECORD_BYTES;
         let paths_bytes: usize = self.paths.iter().map(|p| 4 + p.len()).sum();
         let langs_bytes: usize = self.languages.iter().map(|l| 4 + l.len()).sum();
+        let content_slice = self.content.as_slice();
         // header: 4 (tag) + 4 (records.len) + 4 (paths.len) + 4 (langs.len)
         //         + records_bytes + paths_bytes + langs_bytes
         //         + 4 (content_bytes.len) + content_bytes
-        let cap = 4 + 4 * 3 + records_bytes + paths_bytes + langs_bytes + 4 + self.content_bytes.len();
+        let cap = 4 + 4 * 3 + records_bytes + paths_bytes + langs_bytes + 4 + content_slice.len();
         let mut out = Vec::with_capacity(cap);
         out.extend_from_slice(&STORE_FORMAT_TAG.to_le_bytes());
         out.extend_from_slice(&(self.records.len() as u32).to_le_bytes());
@@ -209,8 +276,8 @@ impl ChunkStore {
             out.extend_from_slice(&(lang.len() as u32).to_le_bytes());
             out.extend_from_slice(lang.as_bytes());
         }
-        out.extend_from_slice(&(self.content_bytes.len() as u32).to_le_bytes());
-        out.extend_from_slice(&self.content_bytes);
+        out.extend_from_slice(&(content_slice.len() as u32).to_le_bytes());
+        out.extend_from_slice(content_slice);
         out
     }
 
@@ -218,67 +285,115 @@ impl ChunkStore {
     /// strings so they thread cleanly into `AppError::internal` at the
     /// caller without dragging the `AppError` enum down into this module.
     pub fn decode_from_bytes(bytes: &[u8]) -> Result<Self, String> {
-        let mut cursor = ByteReader::new(bytes);
-        let tag = cursor.read_u32()?;
-        if tag != STORE_FORMAT_TAG {
-            return Err(format!(
-                "chunk store tag mismatch: got {tag:#x}, expected {STORE_FORMAT_TAG:#x}",
-            ));
+        let parts = parse_header(bytes)?;
+        let content_slice = &bytes[parts.content_body.clone()];
+        if content_slice.len() != parts.content_body.len() {
+            return Err("chunk store: content slice length mismatch".to_string());
         }
-        let record_count = cursor.read_u32()? as usize;
-        let path_count = cursor.read_u32()? as usize;
-        let lang_count = cursor.read_u32()? as usize;
-
-        let record_bytes_total = record_count
-            .checked_mul(CHUNK_RECORD_BYTES)
-            .ok_or_else(|| "chunk record count overflow".to_string())?;
-        let record_slice = cursor.read_slice(record_bytes_total)?;
-        // Safety: the slice length is `record_count * size_of::<ChunkRecord>()`
-        // and `ChunkRecord` is `#[repr(C)]` over six `u32`/`i32` words, which
-        // are 4-byte aligned. SQLite blobs are 8-byte aligned on platforms
-        // we ship; copy via `to_vec` rather than pointer-cast to keep the
-        // safety story aligned-independent.
-        let mut records: Vec<ChunkRecord> = Vec::with_capacity(record_count);
-        unsafe {
-            records.set_len(record_count);
-            let dst =
-                std::slice::from_raw_parts_mut(records.as_mut_ptr() as *mut u8, record_bytes_total);
-            dst.copy_from_slice(record_slice);
-        }
-
-        let mut paths: Vec<Box<str>> = Vec::with_capacity(path_count);
-        for _ in 0..path_count {
-            let len = cursor.read_u32()? as usize;
-            let slice = cursor.read_slice(len)?;
-            let s = std::str::from_utf8(slice).map_err(|e| format!("path utf8: {e}"))?;
-            paths.push(s.to_owned().into_boxed_str());
-        }
-
-        let mut languages: Vec<Box<str>> = Vec::with_capacity(lang_count);
-        for _ in 0..lang_count {
-            let len = cursor.read_u32()? as usize;
-            let slice = cursor.read_slice(len)?;
-            let s = std::str::from_utf8(slice).map_err(|e| format!("language utf8: {e}"))?;
-            languages.push(s.to_owned().into_boxed_str());
-        }
-
-        let content_len = cursor.read_u32()? as usize;
-        let content_slice = cursor.read_slice(content_len)?;
         let content_bytes = content_slice.to_vec();
-
-        if cursor.remaining() != 0 {
-            return Err(format!(
-                "chunk store trailing bytes: {} unread",
-                cursor.remaining()
-            ));
-        }
         Ok(Self {
-            records,
-            paths,
-            languages,
-            content_bytes,
+            records: parts.records,
+            paths: parts.paths,
+            languages: parts.languages,
+            content: ContentBuf::Owned(content_bytes),
         })
     }
+
+    /// Decode an mmap-backed chunks blob. The records, paths, and language
+    /// tables come out as owned `Vec`s (small, eagerly populated for hot-path
+    /// indexing), while the multi-MB content body is referenced directly into
+    /// the mapping. The OS pages content in on demand the first time a top-K
+    /// hit's body is touched, which is typically only a few hundred chunks
+    /// per search instead of the ~63 k chunks in the full corpus.
+    pub fn decode_from_mmap(mmap: Mmap) -> Result<Self, String> {
+        let parts = parse_header(&mmap[..])?;
+        Ok(Self {
+            records: parts.records,
+            paths: parts.paths,
+            languages: parts.languages,
+            content: ContentBuf::Mapped {
+                mmap,
+                body: parts.content_body,
+            },
+        })
+    }
+}
+
+struct ParsedHeader {
+    records: Vec<ChunkRecord>,
+    paths: Vec<Box<str>>,
+    languages: Vec<Box<str>>,
+    content_body: Range<usize>,
+}
+
+fn parse_header(bytes: &[u8]) -> Result<ParsedHeader, String> {
+    let mut cursor = ByteReader::new(bytes);
+    let tag = cursor.read_u32()?;
+    if tag != STORE_FORMAT_TAG {
+        return Err(format!(
+            "chunk store tag mismatch: got {tag:#x}, expected {STORE_FORMAT_TAG:#x}",
+        ));
+    }
+    let record_count = cursor.read_u32()? as usize;
+    let path_count = cursor.read_u32()? as usize;
+    let lang_count = cursor.read_u32()? as usize;
+
+    let record_bytes_total = record_count
+        .checked_mul(CHUNK_RECORD_BYTES)
+        .ok_or_else(|| "chunk record count overflow".to_string())?;
+    let record_slice = cursor.read_slice(record_bytes_total)?;
+    // Safety: the slice length is `record_count * size_of::<ChunkRecord>()`
+    // and `ChunkRecord` is `#[repr(C)]` over six `u32`/`i32` words, which
+    // are 4-byte aligned. SQLite blobs are 8-byte aligned on platforms
+    // we ship; copy via `to_vec` rather than pointer-cast to keep the
+    // safety story aligned-independent.
+    let mut records: Vec<ChunkRecord> = Vec::with_capacity(record_count);
+    unsafe {
+        records.set_len(record_count);
+        let dst =
+            std::slice::from_raw_parts_mut(records.as_mut_ptr() as *mut u8, record_bytes_total);
+        dst.copy_from_slice(record_slice);
+    }
+
+    let mut paths: Vec<Box<str>> = Vec::with_capacity(path_count);
+    for _ in 0..path_count {
+        let len = cursor.read_u32()? as usize;
+        let slice = cursor.read_slice(len)?;
+        let s = std::str::from_utf8(slice).map_err(|e| format!("path utf8: {e}"))?;
+        paths.push(s.to_owned().into_boxed_str());
+    }
+
+    let mut languages: Vec<Box<str>> = Vec::with_capacity(lang_count);
+    for _ in 0..lang_count {
+        let len = cursor.read_u32()? as usize;
+        let slice = cursor.read_slice(len)?;
+        let s = std::str::from_utf8(slice).map_err(|e| format!("language utf8: {e}"))?;
+        languages.push(s.to_owned().into_boxed_str());
+    }
+
+    let content_len = cursor.read_u32()? as usize;
+    let content_start = cursor.position();
+    let content_end = content_start
+        .checked_add(content_len)
+        .ok_or_else(|| "chunk store content overflow".to_string())?;
+    if content_end > bytes.len() {
+        return Err(format!(
+            "chunk store truncated: content needs {content_end} bytes, have {}",
+            bytes.len()
+        ));
+    }
+    if content_end != bytes.len() {
+        return Err(format!(
+            "chunk store trailing bytes: {} unread",
+            bytes.len() - content_end
+        ));
+    }
+    Ok(ParsedHeader {
+        records,
+        paths,
+        languages,
+        content_body: content_start..content_end,
+    })
 }
 
 /// Hand-rolled reader; reaching for `byteorder` for three integer types
@@ -316,11 +431,15 @@ impl<'a> ByteReader<'a> {
         Ok(slice)
     }
 
+    #[allow(dead_code)]
     fn remaining(&self) -> usize {
         self.bytes.len() - self.pos
     }
-}
 
+    fn position(&self) -> usize {
+        self.pos
+    }
+}
 
 /// Borrowed view of one chunk; no allocations. Used by hot paths in
 /// ranking that previously did `&chunks[id]` against `Vec<IndexedChunk>`.

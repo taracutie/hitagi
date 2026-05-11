@@ -33,6 +33,23 @@ use crate::{
 pub const MAX_FILE_BYTES: usize = 1024 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 
+/// "Drop" `value` by leaking it. Used at the tail of one-shot CLI
+/// commands that own multi-MB caches/indexes (`ChunkStore` content mmap,
+/// dense `Array2<f32>`, BM25 postings, embedding matrix,
+/// `tokenizers::Tokenizer`, ...) ~ sequential `drop` otherwise sits
+/// between the search result and the text output the caller is
+/// waiting on, adding 20-30 ms of latency per command for free() work
+/// that the OS will redo on `exit(2)` anyway.
+///
+/// This is only safe because the binary is a short-lived CLI: `main` is
+/// about to return and the OS will reclaim all memory and unmap all
+/// mappings. Library consumers that need clean teardown should call into
+/// `commands::*` and `Drop` the response themselves; only the CLI
+/// wrapper exercises this path.
+fn defer_drop<T: 'static>(value: T) {
+    std::mem::forget(value);
+}
+
 /// When `outline` is called without --depth, --kind, or --bytes and the file
 /// has more symbols than this, auto-collapse to --depth 1 and emit a note. A
 /// 2,500-symbol Prisma schema produces a ~240 KB response without this; the
@@ -376,36 +393,40 @@ pub fn search(repo: &RepoRoot, query: &str, opts: SearchOptions) -> AppResult<Se
     let exclude_set = build_exclude_set(&opts.excludes)?;
     let mode_label = opts.mode.as_str().to_string();
 
-    let sparse;
     let output = match opts.mode {
         SearchModeArg::Bm25 => {
             let mut cache = ParseCache::open(repo.root());
-            sparse = search::engine::ensure_sparse(repo, &mut cache)?;
+            let sparse = search::engine::ensure_sparse(repo, &mut cache)?;
             if sparse.chunks.is_empty() {
                 warnings.push("repo has no indexable files".to_string());
             }
-            search::engine::run_bm25(
+            let r = search::engine::run_bm25(
                 &sparse,
                 query,
                 opts.limit,
                 &opts.languages,
                 &opts.paths,
                 exclude_set.as_ref(),
-            )
+            );
+            // Punt the heavy drops (BM25 index + mmap-backed ChunkStore +
+            // SQLite connection) to a detached worker so the CLI can
+            // render the response in parallel. The process exits shortly
+            // after; the OS reclaims everything either way.
+            defer_drop((sparse, cache));
+            r
         }
         SearchModeArg::Hybrid | SearchModeArg::Semantic => {
             // Three independent IO chunks dominate the warm-search wall:
-            //   sparse-index load    (~75 ms: walk + SQLite + BM25/chunk decode)
-            //   encoder load         (~85 ms: tokenizer + safetensors)
-            //   dense-matrix file IO (~30 ms: mmap + memcpy of 30+ MB f32)
-            // The dense matrix is just bytes ~ we don't need the encoder or
-            // the SQLite metadata to read it. So we mmap+memcpy it
-            // speculatively on a third rayon worker and adopt it in
-            // `ensure_dense_with_hint` once the cached fingerprint check
-            // confirms the bytes match this encoder. On a mismatch (rare:
-            // model swap / corruption) the hint is dropped and the regular
-            // load_dense → build_dense path takes over, so the slow lane is
-            // unchanged.
+            //   sparse-index load    (walk + SQLite + BM25/chunk decode)
+            //   encoder load         (fast WordPiece + safetensors mmap)
+            //   dense-matrix mapping (zero-copy mmap-view, prefaulted)
+            // None depend on the others' results, so we fan them out via
+            // nested `rayon::join`s. The dense matrix is just bytes ~ we
+            // open the mmap speculatively on a third worker and adopt it
+            // in `ensure_dense_with_hint` once the cached fingerprint check
+            // confirms the bytes match this encoder. A mismatch (rare:
+            // model swap / corruption) drops the hint and falls back to
+            // `load_dense → build_dense`, leaving the slow lane unchanged.
             let prepared = prepare_encoder_load(
                 opts.hashing,
                 opts.no_download,
@@ -414,7 +435,7 @@ pub fn search(repo: &RepoRoot, query: &str, opts: SearchOptions) -> AppResult<Se
             )?;
             let repo_ref = repo;
             let dense_path =
-                ParseCache::cache_dir_for(repo_ref.root()).map(|d| d.join("dense.v12.bin"));
+                ParseCache::cache_dir_for(repo_ref.root()).map(|d| d.join("dense.v13.bin"));
             let (sparse_result, (encoder_result, dense_hint)) = rayon::join(
                 || -> AppResult<(ParseCache, search::persist::SparsePayload)> {
                     let mut cache_inner = ParseCache::open(repo_ref.root());
@@ -424,7 +445,7 @@ pub fn search(repo: &RepoRoot, query: &str, opts: SearchOptions) -> AppResult<Se
                 || {
                     rayon::join(
                         || load_encoder_files(&prepared),
-                        || -> Option<ndarray::Array2<f32>> {
+                        || -> Option<search::dense::MappedDense> {
                             dense_path
                                 .as_ref()
                                 .and_then(|p| search::persist::load_dense_vectors_speculative(p))
@@ -432,8 +453,7 @@ pub fn search(repo: &RepoRoot, query: &str, opts: SearchOptions) -> AppResult<Se
                     )
                 },
             );
-            let (mut cache, sparse_payload) = sparse_result?;
-            sparse = sparse_payload;
+            let (mut cache, sparse) = sparse_result?;
             if sparse.chunks.is_empty() {
                 warnings.push("repo has no indexable files".to_string());
             }
@@ -453,7 +473,7 @@ pub fn search(repo: &RepoRoot, query: &str, opts: SearchOptions) -> AppResult<Se
                 &files_meta,
                 dense_hint,
             )?;
-            match opts.mode {
+            let r = match opts.mode {
                 SearchModeArg::Semantic => search::engine::run_semantic(
                     &sparse,
                     encoder_load.encoder.as_ref(),
@@ -476,7 +496,15 @@ pub fn search(repo: &RepoRoot, query: &str, opts: SearchOptions) -> AppResult<Se
                     exclude_set.as_ref(),
                 )?,
                 SearchModeArg::Bm25 => unreachable!("bm25 handled above"),
-            }
+            };
+            // Heavy locals (sparse BM25 + chunks mmap, dense 60 MB matrix,
+            // encoder embedding table + tokenizer, ParseCache SQLite handle)
+            // would otherwise add ~15-25 ms of sequential Drop work right
+            // before this function returns the SearchResponse to the CLI.
+            // Punt them to a detached worker so the caller can render the
+            // response in parallel.
+            defer_drop((sparse, dense, encoder_load, cache, prepared));
+            r
         }
     };
 
@@ -537,8 +565,7 @@ pub fn find_related(
         opts.model.as_deref(),
     )?;
     let repo_ref = repo;
-    let dense_path =
-        ParseCache::cache_dir_for(repo_ref.root()).map(|d| d.join("dense.v11.bin"));
+    let dense_path = ParseCache::cache_dir_for(repo_ref.root()).map(|d| d.join("dense.v13.bin"));
     let (sparse_result, (encoder_result, dense_hint)) = rayon::join(
         || -> AppResult<(ParseCache, search::persist::SparsePayload)> {
             let mut cache_inner = ParseCache::open(repo_ref.root());
@@ -548,7 +575,7 @@ pub fn find_related(
         || {
             rayon::join(
                 || load_encoder_files(&prepared),
-                || -> Option<ndarray::Array2<f32>> {
+                || -> Option<search::dense::MappedDense> {
                     let path = dense_path.as_ref()?;
                     search::persist::load_dense_vectors_speculative(path)
                 },
@@ -614,13 +641,20 @@ pub fn find_related(
         snippet: None,
     };
 
+    let indexed_files = sparse.file_mapping.len();
+    let indexed_chunks = sparse.chunks.len();
+    // Skip sequential drop of the multi-MB sparse / dense / encoder
+    // payloads; same rationale as the `search` command. The CLI exits
+    // shortly and the OS reclaims everything.
+    defer_drop((sparse, dense, encoder_load, cache, prepared));
+
     Ok(FindRelatedResponse {
         path: resolved.relative_path,
         line,
         limit: opts.limit,
         elapsed_ms,
-        indexed_files: sparse.file_mapping.len(),
-        indexed_chunks: sparse.chunks.len(),
+        indexed_files,
+        indexed_chunks,
         source_chunk: source_hit,
         warnings,
         results,
@@ -701,8 +735,10 @@ fn load_encoder_files(req: &EncoderRequest) -> AppResult<EncoderLoad> {
         .expect("non-hashing request always carries ModelOptions");
     search::model_cache::ensure_hf_home();
     let model_status = search::model2vec::model_status(Some(&options.model));
-    if matches!(options.policy, search::model2vec::ModelLoadPolicy::AllowDownload)
-        && !model_status.available()
+    if matches!(
+        options.policy,
+        search::model2vec::ModelLoadPolicy::AllowDownload
+    ) && !model_status.available()
     {
         eprintln!(
             "hitagi: index: downloading embedding model {} (first run may take a while)",
@@ -724,8 +760,7 @@ fn load_encoder_files(req: &EncoderRequest) -> AppResult<EncoderLoad> {
             })
         }
         Err(err) if req.offline || req.no_download => {
-            let encoder =
-                search::model2vec::HashingEncoder::new(search::model2vec::DEFAULT_DIM);
+            let encoder = search::model2vec::HashingEncoder::new(search::model2vec::DEFAULT_DIM);
             Ok(EncoderLoad {
                 encoder: Box::new(encoder),
                 kind: "hashing".to_string(),

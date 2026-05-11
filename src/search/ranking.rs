@@ -10,6 +10,7 @@ use std::hash::BuildHasher;
 use std::path::Path;
 
 use once_cell::sync::Lazy;
+use rayon::prelude::*;
 use regex::Regex;
 
 use super::chunk_store::ChunkStore;
@@ -246,10 +247,17 @@ impl QueryIntent {
         }
     }
 
-    fn has_path_intent(&self) -> bool {
+    pub fn has_path_intent(&self) -> bool {
         !self.identifiers.is_empty()
             || (1..=4).contains(&self.keywords.len())
-            || self.wants_test
+            || self.has_wants_flag()
+    }
+
+    /// Any of the lexical-path "wants" flags set. Used by `path_intent_score`
+    /// to skip the fresh lowercase allocation per file when none of the
+    /// downstream checks would consult the result.
+    fn has_wants_flag(&self) -> bool {
+        self.wants_test
             || self.wants_docs
             || self.wants_vendor
             || self.wants_generated
@@ -312,12 +320,47 @@ pub fn boost_multi_chunk_files<S: BuildHasher>(
 }
 
 pub fn apply_query_boost_in_place<S: BuildHasher>(
+    boosted: HashMap<usize, f32, S>,
+    intent: &QueryIntent,
+    query: &str,
+    chunks: &ChunkStore,
+    file_mapping: Option<&BTreeMap<String, Vec<usize>>>,
+    selector: Option<&[usize]>,
+) -> HashMap<usize, f32, S> {
+    // Convenience wrapper for call sites that don't have a precomputed
+    // path-words cache. Hybrid search now folds the cache build into the
+    // matvec rayon::join, but BM25-only and other callers still use this
+    // shape; we build the cache inline when needed and dispatch through
+    // the shared `with_cache` core.
+    let path_cache: Option<PathWordsCache<'_>> =
+        if intent.has_path_intent() && file_mapping.is_some() {
+            file_mapping.map(|m| PathWordsCache::new(m.keys().map(String::as_str)))
+        } else {
+            None
+        };
+    apply_query_boost_in_place_with_cache(
+        boosted,
+        intent,
+        query,
+        chunks,
+        file_mapping,
+        selector,
+        path_cache.as_ref(),
+    )
+}
+
+/// Cache-aware variant. Hybrid search precomputes the path-words cache
+/// in parallel with the dense matvec and the BM25 posting walk, then
+/// hands the cache to this function so the boost pass doesn't pay the
+/// build cost serially.
+pub fn apply_query_boost_in_place_with_cache<S: BuildHasher>(
     mut boosted: HashMap<usize, f32, S>,
     intent: &QueryIntent,
     query: &str,
     chunks: &ChunkStore,
     file_mapping: Option<&BTreeMap<String, Vec<usize>>>,
     selector: Option<&[usize]>,
+    path_cache: Option<&PathWordsCache<'_>>,
 ) -> HashMap<usize, f32, S> {
     if boosted.is_empty() {
         return boosted;
@@ -329,13 +372,13 @@ pub fn apply_query_boost_in_place<S: BuildHasher>(
         boost_symbol_definitions(&mut boosted, query, max_score, chunks, allowed);
     } else {
         if stem_boost_query(query) {
-            boost_stem_matches(&mut boosted, query, max_score, chunks);
+            boost_stem_matches(&mut boosted, query, max_score, chunks, path_cache);
         }
         if may_contain_embedded_symbol(query) {
             boost_embedded_symbols(&mut boosted, query, max_score, chunks, allowed);
         }
     }
-    boost_path_intent(&mut boosted, intent, max_score, chunks);
+    boost_path_intent(&mut boosted, intent, max_score, chunks, path_cache);
     boost_named_non_candidates(
         &mut boosted,
         intent,
@@ -343,6 +386,7 @@ pub fn apply_query_boost_in_place<S: BuildHasher>(
         chunks,
         file_mapping,
         allowed,
+        path_cache,
     );
     boosted
 }
@@ -493,6 +537,7 @@ fn boost_stem_matches<S: BuildHasher>(
     query: &str,
     max_score: f32,
     chunks: &ChunkStore,
+    path_cache: Option<&PathWordsCache<'_>>,
 ) {
     let query_words: Vec<String> = super::tokens::tokenize(query)
         .into_iter()
@@ -508,7 +553,7 @@ fn boost_stem_matches<S: BuildHasher>(
         let file_path = chunks.file_path(*chunk_id);
         let entry = path_matches.entry(file_path.to_owned()).or_insert_with(|| {
             (
-                count_keyword_path_matches(&keywords, file_path),
+                count_keyword_path_matches(&keywords, file_path, path_cache),
                 public_api_file(file_path),
             )
         });
@@ -527,12 +572,13 @@ fn boost_path_intent<S: BuildHasher>(
     intent: &QueryIntent,
     max_score: f32,
     chunks: &ChunkStore,
+    path_cache: Option<&PathWordsCache<'_>>,
 ) {
     if !intent.has_path_intent() {
         return;
     }
     for (chunk_id, score) in boosted.iter_mut() {
-        let path_score = path_intent_score(intent, chunks.file_path(*chunk_id));
+        let path_score = path_intent_score(intent, chunks.file_path(*chunk_id), path_cache);
         if path_score > 0.0 {
             *score += max_score * path_score.min(2.5) * 0.45;
         }
@@ -546,6 +592,7 @@ fn boost_named_non_candidates<S: BuildHasher>(
     chunks: &ChunkStore,
     file_mapping: Option<&BTreeMap<String, Vec<usize>>>,
     allowed: Option<&HashSet<usize>>,
+    path_cache: Option<&PathWordsCache<'_>>,
 ) {
     if !intent.has_path_intent() {
         return;
@@ -567,7 +614,7 @@ fn boost_named_non_candidates<S: BuildHasher>(
         if chunk_ids.iter().any(|id| boosted.contains_key(id)) {
             continue;
         }
-        let path_score = path_intent_score(intent, path);
+        let path_score = path_intent_score(intent, path, path_cache);
         if path_score < 0.9 {
             continue;
         }
@@ -586,12 +633,11 @@ fn boost_named_non_candidates<S: BuildHasher>(
                 definition_matchers(&names)
             }
         });
-        let source_boost =
-            if chunk_defines_any_identifier(chunks.content(chunk_id), matchers) {
-                1.35
-            } else {
-                0.85
-            };
+        let source_boost = if chunk_defines_any_identifier(chunks.content(chunk_id), matchers) {
+            1.35
+        } else {
+            0.85
+        };
         boosted.insert(chunk_id, max_score * source_boost * path_score.min(2.0));
         inserted += 1;
     }
@@ -608,20 +654,86 @@ fn selector_allows(allowed: Option<&HashSet<usize>>, chunk_id: usize) -> bool {
     allowed.is_none_or(|ids| ids.contains(&chunk_id))
 }
 
-fn path_intent_score(intent: &QueryIntent, file_path: &str) -> f32 {
-    let normalized = file_path.replace('\\', "/").to_lowercase();
+/// Lazily-built cache of `path_words(p)` for every path the boost pass
+/// expects to visit. The bare `path_intent_score` API used to call
+/// `path_words` per-file-mapping-entry on every search ~ 2.6 k regex+
+/// `split_identifier` allocations on the web repo. Building this once and
+/// looking up by path string flips the cost from per-call (~3 µs) to
+/// per-load (~1 ms parallel), and the lookup itself is a HashMap probe.
+pub struct PathWordsCache<'a> {
+    map: HashMap<&'a str, Vec<Box<str>>>,
+}
+
+impl<'a> PathWordsCache<'a> {
+    /// Build by precomputing tokens for every supplied path. We collect via
+    /// a parallel `Vec` first and then materialize the `HashMap`
+    /// sequentially ~ rayon's `collect::<HashMap>` merges shards
+    /// sequentially anyway, and the per-shard merge dominates the wall on
+    /// a 2 k-key map. Shaped this way, tokenization rides the rayon pool
+    /// (the only expensive step per entry) while hash insertion stays on
+    /// the calling thread with no shard-merge overhead. Larger
+    /// `par_chunks` keep rayon scheduling overhead amortized across many
+    /// small allocations.
+    pub fn new<I>(paths: I) -> Self
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let paths: Vec<&'a str> = paths.into_iter().collect();
+        let pairs: Vec<(&'a str, Vec<Box<str>>)> = paths
+            .par_chunks(256)
+            .flat_map(|chunk| {
+                chunk
+                    .iter()
+                    .map(|&p| (p, path_words_owned(p)))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let mut map: HashMap<&'a str, Vec<Box<str>>> = HashMap::with_capacity(pairs.len());
+        for (path, words) in pairs {
+            map.insert(path, words);
+        }
+        Self { map }
+    }
+
+    /// Falls back to `path_words_owned` for paths we didn't preload ~
+    /// returns an owned vector wrapped in `Cow` so the call site can
+    /// uniformly borrow the slice. The boost pass only hits this branch
+    /// when a chunk's path isn't in `file_mapping`, which shouldn't
+    /// happen in practice but is handled defensively.
+    fn get<'b>(&'b self, path: &'b str) -> std::borrow::Cow<'b, [Box<str>]> {
+        if let Some(words) = self.map.get(path) {
+            std::borrow::Cow::Borrowed(words.as_slice())
+        } else {
+            std::borrow::Cow::Owned(path_words_owned(path))
+        }
+    }
+}
+
+fn path_intent_score(
+    intent: &QueryIntent,
+    file_path: &str,
+    cache: Option<&PathWordsCache<'_>>,
+) -> f32 {
     let mut score = 0.0f32;
     if !intent.keywords.is_empty() {
-        let matches = count_keyword_path_matches(&intent.keywords, file_path);
+        let matches = count_keyword_path_matches(&intent.keywords, file_path, cache);
         score += matches as f32 / intent.keywords.len() as f32;
     }
     for identifier in &intent.identifiers {
         let identifier_parts = split_identifier(identifier);
-        let matches = count_keyword_path_matches(&identifier_parts, file_path);
+        let matches = count_keyword_path_matches(&identifier_parts, file_path, cache);
         if matches > 0 {
             score += 0.9 + matches as f32 / identifier_parts.len().max(1) as f32;
         }
     }
+    // The `wants_*` group costs a fresh lowercase allocation per call. On a
+    // ~2k-file corpus that's the dominant cost of `boost_named_non_candidates`
+    // for the most common warm queries (which have no `wants_*` flag set).
+    // Short-circuit when nothing downstream looks at `normalized`.
+    if !intent.has_wants_flag() {
+        return score;
+    }
+    let normalized = file_path.replace('\\', "/").to_lowercase();
     if intent.wants_component && normalized.contains("/components/") {
         score += 0.9;
     }
@@ -679,29 +791,43 @@ fn unique_words(words: Vec<String>) -> Vec<String> {
     unique
 }
 
-fn count_keyword_path_matches(keywords: &[String], file_path: &str) -> usize {
-    let parts = path_words(file_path);
+fn count_keyword_path_matches(
+    keywords: &[String],
+    file_path: &str,
+    cache: Option<&PathWordsCache<'_>>,
+) -> usize {
+    let parts_cow: std::borrow::Cow<'_, [Box<str>]> = match cache {
+        Some(c) => c.get(file_path),
+        None => std::borrow::Cow::Owned(path_words_owned(file_path)),
+    };
+    let parts: &[Box<str>] = parts_cow.as_ref();
     let mut matches = 0;
     for keyword in keywords {
-        if parts.iter().any(|part| path_word_matches(keyword, part)) {
+        if parts
+            .iter()
+            .any(|part| path_word_matches(keyword, part.as_ref()))
+        {
             matches += 1;
         }
     }
     matches
 }
 
-fn path_words(file_path: &str) -> Vec<String> {
+/// Owning variant of `path_words`. The cache stores `Box<str>` so the
+/// lookup result borrows from the cache directly; the legacy `String`
+/// shape isn't needed once boost callers route through the cache.
+fn path_words_owned(file_path: &str) -> Vec<Box<str>> {
     let mut words = super::tokens::tokenize(file_path);
     let path = Path::new(file_path);
     if let Some(stem) = path.file_stem() {
         words.extend(split_identifier(&stem.to_string_lossy().to_lowercase()));
     }
-    unique_words(
-        words
-            .into_iter()
-            .filter(|word| word.len() > 1 && !STOPWORDS.contains(word.as_str()))
-            .collect(),
-    )
+    let filtered: Vec<String> = words
+        .into_iter()
+        .filter(|word| word.len() > 1 && !STOPWORDS.contains(word.as_str()))
+        .collect();
+    let unique = unique_words(filtered);
+    unique.into_iter().map(String::into_boxed_str).collect()
 }
 
 fn path_word_matches(keyword: &str, path_word: &str) -> bool {

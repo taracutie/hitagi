@@ -1,9 +1,9 @@
 use std::fmt::Write as _;
-
-use serde::Serialize;
+use std::io::IsTerminal;
+use std::sync::OnceLock;
 
 use crate::{
-    error::{AppError, AppResult},
+    error::AppResult,
     models::{
         AgentPromptResponse, CacheClearResponse, CachePathResponse, CacheStatusResponse,
         DiffFileResponse, DiffFileSummary, DiffHunk, DiffMultiFileResponse, DiffOverviewResponse,
@@ -17,145 +17,116 @@ use crate::{
     },
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OutputMode {
-    Text,
-    Json,
+pub fn print_outline(path: &str, value: &OutlineResponse) -> AppResult<()> {
+    emit(render_outline(path, value))
 }
 
-pub fn print_outline(path: &str, value: &OutlineResponse, mode: OutputMode) -> AppResult<()> {
-    emit(value, mode, || render_outline(path, value))
+pub fn print_symbol(path: &str, value: &SymbolResponse) -> AppResult<()> {
+    emit(render_symbol(path, value))
 }
 
-pub fn print_symbol(path: &str, value: &SymbolResponse, mode: OutputMode) -> AppResult<()> {
-    emit(value, mode, || render_symbol(path, value))
+pub fn print_search(value: &SearchResponse) -> AppResult<()> {
+    emit(render_search(value))
 }
 
-pub fn print_search(value: &SearchResponse, mode: OutputMode) -> AppResult<()> {
-    emit(value, mode, || render_search(value))
+pub fn print_find_related(value: &FindRelatedResponse) -> AppResult<()> {
+    emit(render_find_related(value))
 }
 
-pub fn print_find_related(value: &FindRelatedResponse, mode: OutputMode) -> AppResult<()> {
-    emit(value, mode, || render_find_related(value))
+pub fn print_index_status(value: &IndexStatusResponse) -> AppResult<()> {
+    emit(render_index_status(value))
 }
 
-pub fn print_index_status(value: &IndexStatusResponse, mode: OutputMode) -> AppResult<()> {
-    emit(value, mode, || render_index_status(value))
+pub fn print_index_build(value: &IndexBuildResponse) -> AppResult<()> {
+    emit(render_index_build(value))
 }
 
-pub fn print_index_build(value: &IndexBuildResponse, mode: OutputMode) -> AppResult<()> {
-    emit(value, mode, || render_index_build(value))
+pub fn print_index_clean(value: &IndexCleanResponse) -> AppResult<()> {
+    emit(render_index_clean(value))
 }
 
-pub fn print_index_clean(value: &IndexCleanResponse, mode: OutputMode) -> AppResult<()> {
-    emit(value, mode, || render_index_clean(value))
+pub fn print_read(path: &str, value: &ReadFileResponse) -> AppResult<()> {
+    emit(render_read(path, value))
 }
 
-pub fn print_read(path: &str, value: &ReadFileResponse, mode: OutputMode) -> AppResult<()> {
-    emit(value, mode, || render_read(path, value))
+pub fn print_read_summary(path: &str, value: &ReadSummaryResponse) -> AppResult<()> {
+    emit(render_read_summary(path, value))
 }
 
-pub fn print_read_summary(
-    path: &str,
-    value: &ReadSummaryResponse,
-    mode: OutputMode,
-) -> AppResult<()> {
-    emit(value, mode, || render_read_summary(path, value))
+pub fn print_find(query: &str, value: &FindResponse) -> AppResult<()> {
+    emit(render_find(query, value))
 }
 
-pub fn print_find(query: &str, value: &FindResponse, mode: OutputMode) -> AppResult<()> {
-    emit(value, mode, || render_find(query, value))
+pub fn print_files(value: &FilesResponse) -> AppResult<()> {
+    emit(render_files(value))
 }
 
-pub fn print_files(value: &FilesResponse, mode: OutputMode) -> AppResult<()> {
-    emit(value, mode, || render_files(value))
+pub fn print_loc_symbols(value: &LocSymbolsResponse) -> AppResult<()> {
+    emit(render_loc_symbols(value))
 }
 
-pub fn print_loc_symbols(value: &LocSymbolsResponse, mode: OutputMode) -> AppResult<()> {
-    emit(value, mode, || render_loc_symbols(value))
+pub fn print_loc_files(value: &LocFilesResponse) -> AppResult<()> {
+    emit(render_loc_files(value))
 }
 
-pub fn print_loc_files(value: &LocFilesResponse, mode: OutputMode) -> AppResult<()> {
-    emit(value, mode, || render_loc_files(value))
+pub fn print_langs(value: &LangsResponse) -> AppResult<()> {
+    emit(render_langs(value))
 }
 
-pub fn print_langs(value: &LangsResponse, mode: OutputMode) -> AppResult<()> {
-    emit(value, mode, || render_langs(value))
+pub fn print_next_info(value: &NextInfoResponse) -> AppResult<()> {
+    emit(render_next_info(value))
 }
 
-pub fn print_next_info(value: &NextInfoResponse, mode: OutputMode) -> AppResult<()> {
-    emit(value, mode, || render_next_info(value))
+pub fn print_next_routes(value: &NextRoutesResponse) -> AppResult<()> {
+    emit(render_next_routes(value))
 }
 
-pub fn print_next_routes(value: &NextRoutesResponse, mode: OutputMode) -> AppResult<()> {
-    emit(value, mode, || render_next_routes(value))
+pub fn print_next_layouts(value: &NextLayoutsResponse) -> AppResult<()> {
+    emit(render_next_layouts(value))
 }
 
-pub fn print_next_layouts(value: &NextLayoutsResponse, mode: OutputMode) -> AppResult<()> {
-    emit(value, mode, || render_next_layouts(value))
+pub fn print_next_server_actions(value: &NextServerActionsResponse) -> AppResult<()> {
+    emit(render_next_server_actions(value))
 }
 
-pub fn print_next_server_actions(
-    value: &NextServerActionsResponse,
-    mode: OutputMode,
-) -> AppResult<()> {
-    emit(value, mode, || render_next_server_actions(value))
+pub fn print_agent_prompt(value: &AgentPromptResponse) -> AppResult<()> {
+    emit(render_agent_prompt(value))
 }
 
-pub fn print_agent_prompt(value: &AgentPromptResponse, mode: OutputMode) -> AppResult<()> {
-    emit(value, mode, || render_agent_prompt(value))
+pub fn print_cache_status(value: &CacheStatusResponse) -> AppResult<()> {
+    emit(render_cache_status(value))
 }
 
-pub fn print_cache_status(value: &CacheStatusResponse, mode: OutputMode) -> AppResult<()> {
-    emit(value, mode, || render_cache_status(value))
+pub fn print_cache_path(value: &CachePathResponse) -> AppResult<()> {
+    emit(render_cache_path(value))
 }
 
-pub fn print_cache_path(value: &CachePathResponse, mode: OutputMode) -> AppResult<()> {
-    emit(value, mode, || render_cache_path(value))
+pub fn print_cache_clear(value: &CacheClearResponse) -> AppResult<()> {
+    emit(render_cache_clear(value))
 }
 
-pub fn print_cache_clear(value: &CacheClearResponse, mode: OutputMode) -> AppResult<()> {
-    emit(value, mode, || render_cache_clear(value))
+pub fn print_diff_overview(value: &DiffOverviewResponse) -> AppResult<()> {
+    emit(render_diff_overview(value))
 }
 
-pub fn print_diff_overview(value: &DiffOverviewResponse, mode: OutputMode) -> AppResult<()> {
-    emit(value, mode, || render_diff_overview(value))
+pub fn print_diff_file(path: &str, value: &DiffFileResponse) -> AppResult<()> {
+    emit(render_diff_file(path, value))
 }
 
-pub fn print_diff_file(path: &str, value: &DiffFileResponse, mode: OutputMode) -> AppResult<()> {
-    emit(value, mode, || render_diff_file(path, value))
+pub fn print_diff_files(value: &DiffMultiFileResponse) -> AppResult<()> {
+    emit(render_diff_files(value))
 }
 
-pub fn print_diff_files(value: &DiffMultiFileResponse, mode: OutputMode) -> AppResult<()> {
-    emit(value, mode, || render_diff_files(value))
+pub fn print_diff_summary(value: &DiffSummaryResponse) -> AppResult<()> {
+    emit(render_diff_summary(value))
 }
 
-pub fn print_diff_summary(value: &DiffSummaryResponse, mode: OutputMode) -> AppResult<()> {
-    emit(value, mode, || render_diff_summary(value))
+pub fn print_diff_paths(value: &DiffPathsResponse) -> AppResult<()> {
+    emit(render_diff_paths(value))
 }
 
-pub fn print_diff_paths(value: &DiffPathsResponse, mode: OutputMode) -> AppResult<()> {
-    emit(value, mode, || render_diff_paths(value))
-}
-
-fn emit<T, F>(value: &T, mode: OutputMode, render_text: F) -> AppResult<()>
-where
-    T: Serialize,
-    F: FnOnce() -> String,
-{
-    match mode {
-        OutputMode::Json => print_json(value),
-        OutputMode::Text => {
-            print_text(&render_text());
-            Ok(())
-        }
-    }
-}
-
-fn print_json<T: Serialize>(value: &T) -> AppResult<()> {
-    let serialized = serde_json::to_string(value)
-        .map_err(|error| AppError::internal(format!("failed to serialize response: {error}")))?;
-    println!("{serialized}");
+fn emit(text: String) -> AppResult<()> {
+    print_text(&text);
     Ok(())
 }
 
@@ -185,9 +156,9 @@ fn render_outline(path: &str, value: &OutlineResponse) -> String {
         }
         out.push('\n');
     }
-    // available_kinds JSON field is preserved for programmatic consumers; the
-    // text rendering would just duplicate the `file kinds` line above (same
-    // info, less detail), so we skip it.
+    // The structured response keeps available_kinds for callers; the text
+    // rendering would just duplicate the `file kinds` line above (same info,
+    // less detail), so we skip it.
     if let Some(note) = &value.note {
         let _ = writeln!(out, "note • {note}");
     }
@@ -451,9 +422,9 @@ fn render_find(query: &str, value: &FindResponse) -> String {
     if !value.unsampled_dirs.is_empty() {
         let _ = writeln!(out, "unsampled • {}", value.unsampled_dirs.join(", "));
     }
-    // available_kinds is kept on the JSON shape (programmatic consumers test
-    // it) but suppressed in text ~ the per-match `kind` already conveys what
-    // kinds were searched, and the empty-result case is obvious from "0 matches".
+    // The structured response keeps available_kinds for callers, but text
+    // suppresses it: per-match `kind` already conveys what kinds were searched,
+    // and the empty-result case is obvious from "0 matches".
     if let Some(note) = &value.note {
         let _ = writeln!(out, "note • {note}");
     }
@@ -855,6 +826,56 @@ fn render_cache_clear(value: &CacheClearResponse) -> String {
     out
 }
 
+fn use_color() -> bool {
+    static USE: OnceLock<bool> = OnceLock::new();
+    *USE.get_or_init(|| {
+        std::env::var_os("NO_COLOR").is_none()
+            && !matches!(std::env::var("TERM").as_deref(), Ok("dumb"))
+            && std::io::stdout().is_terminal()
+    })
+}
+
+const ANSI_RESET: &str = "\x1b[0m";
+const ANSI_BOLD: &str = "\x1b[1m";
+const ANSI_DIM: &str = "\x1b[2m";
+const ANSI_RED: &str = "\x1b[31m";
+const ANSI_GREEN: &str = "\x1b[32m";
+const ANSI_YELLOW: &str = "\x1b[33m";
+const ANSI_CYAN: &str = "\x1b[36m";
+
+fn paint(code: &str, body: &str) -> String {
+    if use_color() {
+        format!("{code}{body}{ANSI_RESET}")
+    } else {
+        body.to_string()
+    }
+}
+
+fn fmt_added(n: usize) -> String {
+    paint(ANSI_GREEN, &format!("+{n}"))
+}
+
+fn fmt_removed(n: usize) -> String {
+    paint(ANSI_RED, &format!("-{n}"))
+}
+
+fn fmt_status(code: &str) -> String {
+    let ansi = match code {
+        "M" => ANSI_YELLOW,
+        "A" => ANSI_GREEN,
+        "D" => ANSI_RED,
+        "R" | "C" => ANSI_CYAN,
+        _ => ANSI_DIM,
+    };
+    paint(ansi, code)
+}
+
+fn fmt_section(label: &str) -> String {
+    let bar = paint(ANSI_DIM, "▌");
+    let body = paint(ANSI_BOLD, label);
+    format!("{bar} {body}")
+}
+
 fn render_diff_overview(value: &DiffOverviewResponse) -> String {
     let mut out = String::new();
     let mut header = "diff".to_string();
@@ -874,55 +895,98 @@ fn render_diff_overview(value: &DiffOverviewResponse) -> String {
         let _ = writeln!(out, "note • {note}");
     }
 
-    let grouped = value.scope.is_empty()
-        && value
-            .files
-            .iter()
-            .any(|file| file.staged || file.unstaged || file.status == "?");
-    if grouped {
-        for (label, predicate) in [
-            ("staged+unstaged", 0u8),
-            ("staged", 1),
-            ("unstaged", 2),
-            ("untracked", 3),
-            ("other", 4),
-        ] {
-            let bucket: Vec<_> = value
-                .files
-                .iter()
-                .filter(|file| match predicate {
-                    0 => file.staged && file.unstaged,
-                    1 => file.staged && !file.unstaged,
-                    2 => file.unstaged && !file.staged,
-                    3 => file.status == "?",
-                    _ => !file.staged && !file.unstaged && file.status != "?",
-                })
-                .collect();
-            if bucket.is_empty() {
-                continue;
-            }
-            let _ = writeln!(out, "{label}");
-            for file in bucket {
-                render_diff_overview_file(&mut out, value, file);
-            }
+    for (group_index, group) in diff_overview_folder_groups(value).iter().enumerate() {
+        if group_index > 0 {
+            out.push('\n');
         }
-    } else {
-        for file in &value.files {
-            render_diff_overview_file(&mut out, value, file);
-        }
+        render_diff_overview_folder(&mut out, value, group);
     }
     out
+}
+
+struct DiffOverviewFolderGroup<'a> {
+    folder: String,
+    files: Vec<&'a DiffFileSummary>,
+}
+
+fn diff_overview_folder_groups(value: &DiffOverviewResponse) -> Vec<DiffOverviewFolderGroup<'_>> {
+    let mut groups: Vec<DiffOverviewFolderGroup<'_>> = Vec::new();
+    for file in &value.files {
+        let path = format!("{}{}", value.prefix, file.path);
+        let folder = diff_overview_folder(&path);
+        if let Some(group) = groups.last_mut().filter(|group| group.folder == folder) {
+            group.files.push(file);
+        } else {
+            groups.push(DiffOverviewFolderGroup {
+                folder,
+                files: vec![file],
+            });
+        }
+    }
+    groups
+}
+
+fn diff_overview_folder(path: &str) -> String {
+    match path.find('/') {
+        Some(index) => path[..=index].to_string(),
+        None => "./".to_string(),
+    }
+}
+
+fn render_diff_overview_folder(
+    out: &mut String,
+    value: &DiffOverviewResponse,
+    group: &DiffOverviewFolderGroup<'_>,
+) {
+    let added: usize = group.files.iter().filter_map(|file| file.added).sum();
+    let removed: usize = group.files.iter().filter_map(|file| file.removed).sum();
+    let has_line_counts = group
+        .files
+        .iter()
+        .any(|file| file.added.is_some() && file.removed.is_some());
+    let file_label = if group.files.len() == 1 {
+        "file"
+    } else {
+        "files"
+    };
+    let _ = write!(
+        out,
+        "{} {} • {} {}",
+        paint(ANSI_DIM, "▾"),
+        paint(ANSI_BOLD, &group.folder),
+        group.files.len(),
+        file_label,
+    );
+    if has_line_counts {
+        let _ = write!(out, " • {} {}", fmt_added(added), fmt_removed(removed));
+    }
+    out.push('\n');
+
+    for (index, file) in group.files.iter().enumerate() {
+        let branch = if index + 1 == group.files.len() {
+            "└─"
+        } else {
+            "├─"
+        };
+        render_diff_overview_file(out, value, file, branch);
+    }
 }
 
 fn render_diff_overview_file(
     out: &mut String,
     value: &DiffOverviewResponse,
     file: &DiffFileSummary,
+    branch: &str,
 ) {
     let path = format!("{}{}", value.prefix, file.path);
-    let _ = write!(out, "{} {path}", file.status);
+    let _ = write!(
+        out,
+        "  {} {} {path}",
+        paint(ANSI_DIM, branch),
+        fmt_status(&file.status)
+    );
     if let (Some(added), Some(removed)) = (file.added, file.removed) {
-        let _ = write!(out, " +{added} -{removed}");
+        let _ = write!(out, " {} {}", fmt_added(added), fmt_removed(removed));
     }
     if let Some(old_path) = &file.old_path {
         if file.old_path_needs_prefix {
@@ -948,9 +1012,14 @@ fn render_diff_overview_file(
 
 fn render_diff_file(path: &str, value: &DiffFileResponse) -> String {
     let mut out = String::new();
-    let _ = write!(out, "diff {path}\n{} {}", value.status, value.path);
+    let _ = write!(
+        out,
+        "diff {path}\n{} {}",
+        fmt_status(&value.status),
+        value.path
+    );
     if let (Some(added), Some(removed)) = (value.added, value.removed) {
-        let _ = write!(out, " +{added} -{removed}");
+        let _ = write!(out, " {} {}", fmt_added(added), fmt_removed(removed));
     }
     if let Some(language) = &value.language {
         let _ = write!(out, " • {language}");
@@ -1028,8 +1097,11 @@ fn render_diff_summary(value: &DiffSummaryResponse) -> String {
 fn render_diff_summary_group(out: &mut String, group: &DiffSummaryGroup) {
     let _ = writeln!(
         out,
-        "{} • {} files • +{} -{}",
-        group.path, group.file_count, group.added, group.removed
+        "{} • {} files • {} {}",
+        group.path,
+        group.file_count,
+        fmt_added(group.added),
+        fmt_removed(group.removed),
     );
     for file in &group.files {
         render_diff_summary_file(out, file);
@@ -1037,6 +1109,7 @@ fn render_diff_summary_group(out: &mut String, group: &DiffSummaryGroup) {
 }
 
 fn render_diff_summary_state_groups(out: &mut String, files: &[DiffSummaryFile]) {
+    let mut first = true;
     for (label, predicate) in [
         ("staged+unstaged", 0u8),
         ("staged", 1),
@@ -1057,7 +1130,11 @@ fn render_diff_summary_state_groups(out: &mut String, files: &[DiffSummaryFile])
         if bucket.is_empty() {
             continue;
         }
-        let _ = writeln!(out, "{label}");
+        if !first {
+            out.push('\n');
+        }
+        first = false;
+        let _ = writeln!(out, "{}", fmt_section(label));
         for file in bucket {
             render_diff_summary_file(out, file);
         }
@@ -1065,9 +1142,9 @@ fn render_diff_summary_state_groups(out: &mut String, files: &[DiffSummaryFile])
 }
 
 fn render_diff_summary_file(out: &mut String, file: &DiffSummaryFile) {
-    let _ = write!(out, "{} {}", file.status, file.path);
+    let _ = write!(out, "{} {}", fmt_status(&file.status), file.path);
     if let (Some(added), Some(removed)) = (file.added, file.removed) {
-        let _ = write!(out, " +{added} -{removed}");
+        let _ = write!(out, " {} {}", fmt_added(added), fmt_removed(removed));
     }
     if let Some(old_path) = &file.old_path {
         let _ = write!(out, " ← {old_path}");
@@ -1107,13 +1184,13 @@ fn render_diff_paths(value: &DiffPathsResponse) -> String {
 fn render_diff_hunk(out: &mut String, hunk: &DiffHunk) {
     let _ = write!(
         out,
-        "@@ -{}-{} +{}-{} • +{} -{}",
+        "@@ -{}-{} +{}-{} • {} {}",
         hunk.old_lines[0],
         hunk.old_lines[1],
         hunk.new_lines[0],
         hunk.new_lines[1],
-        hunk.added,
-        hunk.removed
+        fmt_added(hunk.added),
+        fmt_removed(hunk.removed),
     );
     if let Some(symbol) = &hunk.symbol {
         let _ = write!(out, " • {symbol}");

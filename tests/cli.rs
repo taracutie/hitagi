@@ -1,7 +1,18 @@
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use assert_cmd::Command;
+use hitagi::{
+    agent_prompt::{self, AgentKind},
+    commands::{
+        self as app_commands, FilesOptions, FindOptions, FindRelatedOptions, IndexBuildOptions,
+        LocFilesOptions, LocSort, LocSymbolsOptions, OutlineOptions, ReadOptions, SearchModeArg,
+        SearchOptions, SymbolOptions,
+    },
+    repo::RepoRoot,
+};
+use serde::Serialize;
 use serde_json::Value;
 
 const HITAGI_PROMPT_BEGIN: &str = "<!-- BEGIN HITAGI MANAGED PROMPT -->";
@@ -50,19 +61,12 @@ fn run(args: &[&str]) -> Value {
 
 fn run_in(repo: &Path, cache_dir: &Path, args: &[&str]) -> Value {
     prewarm_language_pack();
-    let output = Command::cargo_bin("hitagi")
-        .unwrap()
-        .env("HITAGI_CACHE_DIR", cache_dir)
-        .arg("--repo")
-        .arg(repo)
-        .arg("--json")
-        .args(args)
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    serde_json::from_slice(&output).expect("stdout is valid JSON")
+    run_with_env(
+        repo,
+        &[("HITAGI_CACHE_DIR", Some(cache_dir.as_os_str()))],
+        None,
+        args,
+    )
 }
 
 fn run_failure(args: &[&str]) -> String {
@@ -125,34 +129,540 @@ impl Drop for ScratchHome {
     }
 }
 
-fn run_global_json(home: &Path, args: &[&str]) -> Value {
-    let output = Command::cargo_bin("hitagi")
-        .unwrap()
-        .env("HOME", home)
-        .env_remove("CODEX_HOME")
-        .arg("--json")
-        .args(args)
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    serde_json::from_slice(&output).expect("stdout is valid JSON")
+fn run_global_structured(home: &Path, args: &[&str]) -> Value {
+    with_process_env(
+        &[("HOME", Some(home.as_os_str())), ("CODEX_HOME", None)],
+        None,
+        || run_agent_prompt(args),
+    )
 }
 
-fn run_global_json_with_codex_home(home: &Path, codex_home: &Path, args: &[&str]) -> Value {
-    let output = Command::cargo_bin("hitagi")
-        .unwrap()
-        .env("HOME", home)
-        .env("CODEX_HOME", codex_home)
-        .arg("--json")
-        .args(args)
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    serde_json::from_slice(&output).expect("stdout is valid JSON")
+fn run_global_structured_with_codex_home(home: &Path, codex_home: &Path, args: &[&str]) -> Value {
+    with_process_env(
+        &[
+            ("HOME", Some(home.as_os_str())),
+            ("CODEX_HOME", Some(codex_home.as_os_str())),
+        ],
+        None,
+        || run_agent_prompt(args),
+    )
+}
+
+fn run_with_env(
+    repo: &Path,
+    vars: &[(&str, Option<&OsStr>)],
+    cwd: Option<&Path>,
+    args: &[&str],
+) -> Value {
+    with_process_env(vars, cwd, || run_structured(repo, args))
+}
+
+fn with_process_env<T>(
+    vars: &[(&str, Option<&OsStr>)],
+    cwd: Option<&Path>,
+    f: impl FnOnce() -> T,
+) -> T {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let _guard = LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+    let saved_vars: Vec<(&str, Option<std::ffi::OsString>)> = vars
+        .iter()
+        .map(|(key, _)| (*key, std::env::var_os(key)))
+        .collect();
+    let saved_cwd = cwd.map(|_| std::env::current_dir().unwrap());
+
+    if let Some(path) = cwd {
+        std::env::set_current_dir(path).unwrap();
+    }
+    for (key, value) in vars {
+        match value {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    let result = f();
+
+    for (key, value) in saved_vars {
+        match value {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+    }
+    if let Some(path) = saved_cwd {
+        std::env::set_current_dir(path).unwrap();
+    }
+    result
+}
+
+fn to_value<T: Serialize>(value: T) -> Value {
+    serde_json::to_value(value).expect("response serializes for assertions")
+}
+
+fn repo_root(repo: &Path) -> RepoRoot {
+    RepoRoot::new(std::fs::canonicalize(repo).unwrap())
+}
+
+fn run_structured(repo: &Path, args: &[&str]) -> Value {
+    let repo = repo_root(repo);
+    match args.first().copied().expect("command") {
+        "outline" => {
+            let path = args[1];
+            let mut opts = OutlineOptions::default();
+            let mut i = 2;
+            while i < args.len() {
+                match args[i] {
+                    "--bytes" => {
+                        opts.bytes = true;
+                        i += 1;
+                    }
+                    "--kind" => {
+                        opts.kinds.extend(split_values(args[i + 1]));
+                        i += 2;
+                    }
+                    "--depth" => {
+                        opts.depth = Some(args[i + 1].parse().unwrap());
+                        i += 2;
+                    }
+                    other => panic!("unsupported outline arg {other}"),
+                }
+            }
+            to_value(app_commands::outline(&repo, path, opts).unwrap())
+        }
+        "symbol" => {
+            let mut opts = SymbolOptions::default();
+            for arg in &args[3..] {
+                match *arg {
+                    "--bytes" => opts.bytes = true,
+                    other => panic!("unsupported symbol arg {other}"),
+                }
+            }
+            to_value(app_commands::symbol(&repo, args[1], args[2], opts).unwrap())
+        }
+        "search" => {
+            let mut opts = SearchOptions {
+                paths: Vec::new(),
+                excludes: Vec::new(),
+                limit: 10,
+                mode: SearchModeArg::Hybrid,
+                languages: Vec::new(),
+                alpha: None,
+                snippet: false,
+                hashing: false,
+                no_download: false,
+                offline: false,
+                model: None,
+            };
+            let query = args[1];
+            let mut i = 2;
+            while i < args.len() {
+                match args[i] {
+                    "-k" | "--limit" => {
+                        opts.limit = args[i + 1].parse().unwrap();
+                        i += 2;
+                    }
+                    "-m" | "--mode" => {
+                        opts.mode = parse_search_mode(args[i + 1]);
+                        i += 2;
+                    }
+                    "--language" => {
+                        opts.languages.push(args[i + 1].to_string());
+                        i += 2;
+                    }
+                    "--exclude" => {
+                        opts.excludes.push(args[i + 1].to_string());
+                        i += 2;
+                    }
+                    "--alpha" => {
+                        opts.alpha = Some(args[i + 1].parse().unwrap());
+                        i += 2;
+                    }
+                    "--snippet" => {
+                        opts.snippet = true;
+                        i += 1;
+                    }
+                    "--hashing" => {
+                        opts.hashing = true;
+                        i += 1;
+                    }
+                    "--no-download" => {
+                        opts.no_download = true;
+                        i += 1;
+                    }
+                    "--offline" => {
+                        opts.offline = true;
+                        i += 1;
+                    }
+                    "--model" => {
+                        opts.model = Some(args[i + 1].to_string());
+                        i += 2;
+                    }
+                    path if path.starts_with('-') => panic!("unsupported search arg {path}"),
+                    path => {
+                        opts.paths.push(path.to_string());
+                        i += 1;
+                    }
+                }
+            }
+            to_value(app_commands::search(&repo, query, opts).unwrap())
+        }
+        "find-related" => {
+            let mut opts = FindRelatedOptions {
+                limit: 10,
+                hashing: false,
+                no_download: false,
+                offline: false,
+                model: None,
+            };
+            let mut i = 4;
+            while i < args.len() {
+                match args[i] {
+                    "-k" | "--limit" => {
+                        opts.limit = args[i + 1].parse().unwrap();
+                        i += 2;
+                    }
+                    "--hashing" => {
+                        opts.hashing = true;
+                        i += 1;
+                    }
+                    "--no-download" => {
+                        opts.no_download = true;
+                        i += 1;
+                    }
+                    "--offline" => {
+                        opts.offline = true;
+                        i += 1;
+                    }
+                    "--model" => {
+                        opts.model = Some(args[i + 1].to_string());
+                        i += 2;
+                    }
+                    other => panic!("unsupported find-related arg {other}"),
+                }
+            }
+            to_value(
+                app_commands::find_related(&repo, args[1], args[2].parse().unwrap(), opts).unwrap(),
+            )
+        }
+        "index" => run_index(&repo, &args[1..]),
+        "read" => {
+            let path = args[1];
+            let mut opts = ReadOptions::default();
+            let mut i = 2;
+            while i < args.len() {
+                match args[i] {
+                    "--summary" => {
+                        opts.summary = true;
+                        i += 1;
+                    }
+                    "--lines" => {
+                        opts.lines = Some(parse_lines(args[i + 1]));
+                        i += 2;
+                    }
+                    other => panic!("unsupported read arg {other}"),
+                }
+            }
+            if opts.summary {
+                to_value(app_commands::read_summary(&repo, path).unwrap())
+            } else {
+                to_value(app_commands::read_file(&repo, path, opts).unwrap())
+            }
+        }
+        "find" => {
+            let query = args[1];
+            let mut opts = FindOptions {
+                paths: Vec::new(),
+                excludes: Vec::new(),
+                kinds: Vec::new(),
+                limit: 50,
+                bytes: false,
+                snippet: false,
+                terse: false,
+                per_file: 5,
+            };
+            let mut i = 2;
+            while i < args.len() {
+                match args[i] {
+                    "--kind" => {
+                        opts.kinds.extend(split_values(args[i + 1]));
+                        i += 2;
+                    }
+                    "--limit" => {
+                        opts.limit = args[i + 1].parse().unwrap();
+                        i += 2;
+                    }
+                    "--bytes" => {
+                        opts.bytes = true;
+                        i += 1;
+                    }
+                    "--snippet" => {
+                        opts.snippet = true;
+                        i += 1;
+                    }
+                    "--terse" => {
+                        opts.terse = true;
+                        i += 1;
+                    }
+                    "--per-file" => {
+                        opts.per_file = args[i + 1].parse().unwrap();
+                        i += 2;
+                    }
+                    "--exclude" => {
+                        opts.excludes.push(args[i + 1].to_string());
+                        i += 2;
+                    }
+                    path if path.starts_with('-') => panic!("unsupported find arg {path}"),
+                    path => {
+                        opts.paths.push(path.to_string());
+                        i += 1;
+                    }
+                }
+            }
+            to_value(app_commands::find(&repo, query, opts).unwrap())
+        }
+        "files" => {
+            let mut opts = FilesOptions {
+                globs: Vec::new(),
+                excludes: Vec::new(),
+                limit: 2000,
+            };
+            let mut i = 1;
+            while i < args.len() {
+                match args[i] {
+                    "--limit" => {
+                        opts.limit = args[i + 1].parse().unwrap();
+                        i += 2;
+                    }
+                    "--exclude" => {
+                        opts.excludes.push(args[i + 1].to_string());
+                        i += 2;
+                    }
+                    glob if glob.starts_with('-') => panic!("unsupported files arg {glob}"),
+                    glob => {
+                        opts.globs.push(glob.to_string());
+                        i += 1;
+                    }
+                }
+            }
+            to_value(app_commands::files(&repo, opts).unwrap())
+        }
+        "loc" => run_loc(&repo, &args[1..]),
+        "langs" => to_value(app_commands::langs(&repo).unwrap()),
+        "cache" => run_cache(&repo, &args[1..]),
+        other => panic!("unsupported command {other}"),
+    }
+}
+
+fn run_index(repo: &RepoRoot, args: &[&str]) -> Value {
+    match args.first().copied().unwrap_or("status") {
+        "status" => to_value(app_commands::index_status(repo)),
+        "clean" => to_value(app_commands::index_clean(repo).unwrap()),
+        "build" => {
+            let mut opts = IndexBuildOptions {
+                mode: SearchModeArg::Hybrid,
+                hashing: false,
+                no_download: false,
+                offline: false,
+                model: None,
+            };
+            let mut i = 1;
+            while i < args.len() {
+                match args[i] {
+                    "--mode" | "-m" => {
+                        opts.mode = parse_search_mode(args[i + 1]);
+                        i += 2;
+                    }
+                    "--hashing" => {
+                        opts.hashing = true;
+                        i += 1;
+                    }
+                    "--no-download" => {
+                        opts.no_download = true;
+                        i += 1;
+                    }
+                    "--offline" => {
+                        opts.offline = true;
+                        i += 1;
+                    }
+                    "--model" => {
+                        opts.model = Some(args[i + 1].to_string());
+                        i += 2;
+                    }
+                    other => panic!("unsupported index build arg {other}"),
+                }
+            }
+            to_value(app_commands::index_build(repo, opts).unwrap())
+        }
+        other => panic!("unsupported index action {other}"),
+    }
+}
+
+fn run_loc(repo: &RepoRoot, args: &[&str]) -> Value {
+    match args[0] {
+        "symbols" => {
+            let mut opts = LocSymbolsOptions {
+                paths: Vec::new(),
+                excludes: Vec::new(),
+                kinds: Vec::new(),
+                languages: Vec::new(),
+                min_lines: None,
+                max_lines: None,
+                limit: 50,
+                sort: LocSort::CodeDesc,
+                bytes: false,
+                snippet: false,
+            };
+            let mut i = 1;
+            while i < args.len() {
+                match args[i] {
+                    "--min-lines" => {
+                        opts.min_lines = Some(args[i + 1].parse().unwrap());
+                        i += 2;
+                    }
+                    "--max-lines" => {
+                        opts.max_lines = Some(args[i + 1].parse().unwrap());
+                        i += 2;
+                    }
+                    "--limit" => {
+                        opts.limit = args[i + 1].parse().unwrap();
+                        i += 2;
+                    }
+                    "--sort" => {
+                        opts.sort = parse_loc_sort(args[i + 1]);
+                        i += 2;
+                    }
+                    "--kind" => {
+                        opts.kinds.extend(split_values(args[i + 1]));
+                        i += 2;
+                    }
+                    "--language" => {
+                        opts.languages.push(args[i + 1].to_string());
+                        i += 2;
+                    }
+                    "--bytes" => {
+                        opts.bytes = true;
+                        i += 1;
+                    }
+                    "--snippet" => {
+                        opts.snippet = true;
+                        i += 1;
+                    }
+                    "--exclude" => {
+                        opts.excludes.push(args[i + 1].to_string());
+                        i += 2;
+                    }
+                    path if path.starts_with('-') => panic!("unsupported loc symbols arg {path}"),
+                    path => {
+                        opts.paths.push(path.to_string());
+                        i += 1;
+                    }
+                }
+            }
+            to_value(app_commands::loc_symbols(repo, opts).unwrap())
+        }
+        "files" => {
+            let mut opts = LocFilesOptions {
+                globs: Vec::new(),
+                excludes: Vec::new(),
+                languages: Vec::new(),
+                min_lines: None,
+                max_lines: None,
+                limit: 50,
+                sort: LocSort::CodeDesc,
+            };
+            let mut i = 1;
+            while i < args.len() {
+                match args[i] {
+                    "--min-lines" => {
+                        opts.min_lines = Some(args[i + 1].parse().unwrap());
+                        i += 2;
+                    }
+                    "--max-lines" => {
+                        opts.max_lines = Some(args[i + 1].parse().unwrap());
+                        i += 2;
+                    }
+                    "--limit" => {
+                        opts.limit = args[i + 1].parse().unwrap();
+                        i += 2;
+                    }
+                    "--sort" => {
+                        opts.sort = parse_loc_sort(args[i + 1]);
+                        i += 2;
+                    }
+                    "--language" => {
+                        opts.languages.push(args[i + 1].to_string());
+                        i += 2;
+                    }
+                    "--exclude" => {
+                        opts.excludes.push(args[i + 1].to_string());
+                        i += 2;
+                    }
+                    glob if glob.starts_with('-') => panic!("unsupported loc files arg {glob}"),
+                    glob => {
+                        opts.globs.push(glob.to_string());
+                        i += 1;
+                    }
+                }
+            }
+            to_value(app_commands::loc_files(repo, opts).unwrap())
+        }
+        other => panic!("unsupported loc action {other}"),
+    }
+}
+
+fn run_cache(repo: &RepoRoot, args: &[&str]) -> Value {
+    match args.first().copied().unwrap_or("status") {
+        "status" => to_value(app_commands::cache_status(repo)),
+        "path" => to_value(app_commands::cache_path(repo)),
+        "clear" => {
+            let all = args[1..].iter().any(|arg| *arg == "--all");
+            to_value(app_commands::cache_clear(repo, all).unwrap())
+        }
+        other => panic!("unsupported cache action {other}"),
+    }
+}
+
+fn run_agent_prompt(args: &[&str]) -> Value {
+    let agent = match args[1] {
+        "claude" => AgentKind::Claude,
+        "codex" => AgentKind::Codex,
+        other => panic!("unsupported agent {other}"),
+    };
+    match args[0] {
+        "install" => to_value(agent_prompt::install(agent).unwrap()),
+        "uninstall" => to_value(agent_prompt::uninstall(agent).unwrap()),
+        other => panic!("unsupported global command {other}"),
+    }
+}
+
+fn split_values(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .filter(|item| !item.is_empty())
+        .map(|item| item.to_string())
+        .collect()
+}
+
+fn parse_search_mode(value: &str) -> SearchModeArg {
+    match value {
+        "hybrid" => SearchModeArg::Hybrid,
+        "bm25" => SearchModeArg::Bm25,
+        "semantic" => SearchModeArg::Semantic,
+        other => panic!("unsupported search mode {other}"),
+    }
+}
+
+fn parse_loc_sort(value: &str) -> LocSort {
+    match value {
+        "code-desc" => LocSort::CodeDesc,
+        "code-asc" => LocSort::CodeAsc,
+        "path" => LocSort::Path,
+        other => panic!("unsupported loc sort {other}"),
+    }
+}
+
+fn parse_lines(spec: &str) -> (usize, usize) {
+    let (start, end) = spec.split_once('-').expect("line range");
+    (start.parse().unwrap(), end.parse().unwrap())
 }
 
 /// Collect all `matches` entries from a find response, flat or grouped. The
@@ -1313,8 +1823,8 @@ fn default_langs_output_is_text_table() {
 }
 
 #[test]
-fn json_flag_emits_compact_json() {
-    let stdout = Command::cargo_bin("hitagi")
+fn json_flag_is_removed() {
+    let stderr = Command::cargo_bin("hitagi")
         .unwrap()
         .env("HITAGI_CACHE_DIR", shared_cache_dir())
         .arg("--repo")
@@ -1322,17 +1832,12 @@ fn json_flag_emits_compact_json() {
         .arg("--json")
         .args(["outline", "src/auth.ts"])
         .assert()
-        .success()
+        .failure()
         .get_output()
-        .stdout
+        .stderr
         .clone();
-    let text = String::from_utf8(stdout).unwrap();
-    let value: Value = serde_json::from_str(&text).expect("--json stdout should parse");
-    assert_eq!(value["language"], "typescript");
-    assert!(
-        !text.contains("\n  "),
-        "--json should stay compact rather than pretty-printed"
-    );
+    let text = String::from_utf8(stderr).unwrap();
+    assert!(text.contains("unexpected argument '--json'") || text.contains("unknown argument"));
 }
 
 #[test]
@@ -1376,8 +1881,6 @@ fn long_help_includes_llm_prompt_sections() {
         "TIPS",
         "COMMON PATTERNS",
         "ANTI-PATTERNS",
-        "JSON OUTPUT SHAPES",
-        "--json",
         "--summary",
         "--symbols",
         "--untracked",
@@ -1389,13 +1892,18 @@ fn long_help_includes_llm_prompt_sections() {
         "loc symbols",
         "--min-lines",
         "Directory diff summary",
-        "multi-drilldown",
+        "Framework-aware queries (`framework`)",
+        "hitagi framework next info",
+        "hitagi framework next list-routes",
+        "Find Next.js server actions",
     ] {
         assert!(
             text.contains(needle),
             "long help should contain `{needle}` section"
         );
     }
+    assert!(!text.contains("--json"));
+    assert!(!text.contains("JSON OUTPUT SHAPES"));
 }
 
 #[test]
@@ -1409,29 +1917,22 @@ fn install_claude_creates_global_prompt_without_repo_resolution() {
         .env_remove("CODEX_HOME")
         .arg("--repo")
         .arg(&missing_repo)
-        .arg("--json")
         .args(["install", "claude"])
         .assert()
         .success()
         .get_output()
         .stdout
         .clone();
-    let value: Value = serde_json::from_slice(&output).unwrap();
+    let text = String::from_utf8(output).unwrap();
 
     let path = scratch.home.join(".claude").join("CLAUDE.md");
     let content = std::fs::read_to_string(&path).unwrap();
-    assert_eq!(value["action"], "install");
-    assert_eq!(value["agent"], "claude");
-    assert_eq!(value["changed"], true);
-    assert_eq!(value["status"], "installed");
-    assert_eq!(value["paths"][0], path.display().to_string());
+    assert!(text.contains("install claude"));
+    assert!(text.contains("installed • changed true"));
+    assert!(text.contains(&format!("path • {}", path.display())));
     assert!(content.contains(HITAGI_PROMPT_BEGIN));
     assert!(content.contains("hitagi --help"));
     assert!(content.contains("Always use `hitagi` instead of preferred search/read tools"));
-    assert!(
-        !String::from_utf8(output).unwrap().contains("\n  "),
-        "--json should stay compact"
-    );
 }
 
 #[test]
@@ -1441,8 +1942,8 @@ fn install_claude_is_idempotent_and_preserves_existing_content() {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, "Existing instructions\n").unwrap();
 
-    let first = run_global_json(&scratch.home, &["install", "claude"]);
-    let second = run_global_json(&scratch.home, &["install", "claude"]);
+    let first = run_global_structured(&scratch.home, &["install", "claude"]);
+    let second = run_global_structured(&scratch.home, &["install", "claude"]);
     let content = std::fs::read_to_string(&path).unwrap();
 
     assert_eq!(first["changed"], true);
@@ -1458,10 +1959,10 @@ fn uninstall_claude_removes_only_managed_block() {
     let path = scratch.home.join(".claude").join("CLAUDE.md");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, "Existing instructions\n").unwrap();
-    run_global_json(&scratch.home, &["install", "claude"]);
+    run_global_structured(&scratch.home, &["install", "claude"]);
 
-    let removed = run_global_json(&scratch.home, &["uninstall", "claude"]);
-    let removed_again = run_global_json(&scratch.home, &["uninstall", "claude"]);
+    let removed = run_global_structured(&scratch.home, &["uninstall", "claude"]);
+    let removed_again = run_global_structured(&scratch.home, &["uninstall", "claude"]);
     let content = std::fs::read_to_string(&path).unwrap();
 
     assert_eq!(removed["changed"], true);
@@ -1474,7 +1975,7 @@ fn uninstall_claude_removes_only_managed_block() {
 #[test]
 fn install_codex_defaults_to_home_agents_md() {
     let scratch = ScratchHome::new("codex-default");
-    let value = run_global_json(&scratch.home, &["install", "codex"]);
+    let value = run_global_structured(&scratch.home, &["install", "codex"]);
 
     let path = scratch.home.join(".codex").join("AGENTS.md");
     let content = std::fs::read_to_string(&path).unwrap();
@@ -1490,7 +1991,7 @@ fn codex_uses_codex_home_override_and_uninstall_removes_both_files() {
     let codex_home = scratch.root.join("codex-home");
     std::fs::create_dir_all(&codex_home).unwrap();
 
-    run_global_json_with_codex_home(&scratch.home, &codex_home, &["install", "codex"]);
+    run_global_structured_with_codex_home(&scratch.home, &codex_home, &["install", "codex"]);
     let agents = codex_home.join("AGENTS.md");
     assert!(std::fs::read_to_string(&agents)
         .unwrap()
@@ -1499,7 +2000,7 @@ fn codex_uses_codex_home_override_and_uninstall_removes_both_files() {
     let override_path = codex_home.join("AGENTS.override.md");
     std::fs::write(&override_path, "Override instructions\n").unwrap();
     let override_install =
-        run_global_json_with_codex_home(&scratch.home, &codex_home, &["install", "codex"]);
+        run_global_structured_with_codex_home(&scratch.home, &codex_home, &["install", "codex"]);
     assert_eq!(
         override_install["paths"][0],
         override_path.display().to_string()
@@ -1509,7 +2010,7 @@ fn codex_uses_codex_home_override_and_uninstall_removes_both_files() {
         .contains(HITAGI_PROMPT_BEGIN));
 
     let removed =
-        run_global_json_with_codex_home(&scratch.home, &codex_home, &["uninstall", "codex"]);
+        run_global_structured_with_codex_home(&scratch.home, &codex_home, &["uninstall", "codex"]);
     assert_eq!(removed["changed"], true);
     assert_eq!(removed["paths"].as_array().unwrap().len(), 2);
     assert!(!std::fs::read_to_string(&agents)
@@ -1712,22 +2213,17 @@ fn cache_status_when_empty_shows_no_file() {
 #[test]
 fn cache_status_reports_disabled_when_no_cache_root_can_be_resolved() {
     let scratch = ScratchRepo::new("status-no-root");
-    let output = Command::cargo_bin("hitagi")
-        .unwrap()
-        .env_remove("HITAGI_CACHE_DIR")
-        .env_remove("XDG_CACHE_HOME")
-        .env_remove("HOME")
-        .env_remove("HITAGI_NO_CACHE")
-        .arg("--repo")
-        .arg(&scratch.repo)
-        .arg("--json")
-        .args(["cache", "status"])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let value: Value = serde_json::from_slice(&output).unwrap();
+    let value = run_with_env(
+        &scratch.repo,
+        &[
+            ("HITAGI_CACHE_DIR", None),
+            ("XDG_CACHE_HOME", None),
+            ("HOME", None),
+            ("HITAGI_NO_CACHE", None),
+        ],
+        None,
+        &["cache", "status"],
+    );
 
     assert_eq!(value["enabled"], false);
     assert_eq!(value["disabled_via_env"], false);
@@ -1741,22 +2237,17 @@ fn cache_ignores_empty_xdg_cache_home_and_falls_back_to_home() {
     let home = scratch.repo.parent().unwrap().join("home");
     std::fs::create_dir_all(&home).unwrap();
 
-    let output = Command::cargo_bin("hitagi")
-        .unwrap()
-        .env_remove("HITAGI_CACHE_DIR")
-        .env("XDG_CACHE_HOME", "")
-        .env("HOME", &home)
-        .env_remove("HITAGI_NO_CACHE")
-        .arg("--repo")
-        .arg(&scratch.repo)
-        .arg("--json")
-        .args(["cache", "path"])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let value: Value = serde_json::from_slice(&output).unwrap();
+    let value = run_with_env(
+        &scratch.repo,
+        &[
+            ("HITAGI_CACHE_DIR", None),
+            ("XDG_CACHE_HOME", Some(OsStr::new(""))),
+            ("HOME", Some(home.as_os_str())),
+            ("HITAGI_NO_CACHE", None),
+        ],
+        None,
+        &["cache", "path"],
+    );
     let path = value["path"].as_str().unwrap();
     let expected_prefix = home.join(".cache").join("hitagi");
 
@@ -1776,23 +2267,17 @@ fn cache_clear_all_ignores_relative_xdg_cache_home() {
     std::fs::create_dir_all(&home).unwrap();
     std::fs::write(dangerous.join("sentinel.txt"), "do not delete").unwrap();
 
-    let output = Command::cargo_bin("hitagi")
-        .unwrap()
-        .current_dir(&cwd)
-        .env_remove("HITAGI_CACHE_DIR")
-        .env("XDG_CACHE_HOME", "hitagi")
-        .env("HOME", &home)
-        .env_remove("HITAGI_NO_CACHE")
-        .arg("--repo")
-        .arg(&scratch.repo)
-        .arg("--json")
-        .args(["cache", "clear", "--all"])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let value: Value = serde_json::from_slice(&output).unwrap();
+    let value = run_with_env(
+        &scratch.repo,
+        &[
+            ("HITAGI_CACHE_DIR", None),
+            ("XDG_CACHE_HOME", Some(OsStr::new("hitagi"))),
+            ("HOME", Some(home.as_os_str())),
+            ("HITAGI_NO_CACHE", None),
+        ],
+        Some(&cwd),
+        &["cache", "clear", "--all"],
+    );
 
     assert_eq!(value["scope"], "all");
     assert_eq!(value["cleared"], false);
@@ -1812,23 +2297,18 @@ fn relative_hitagi_cache_dir_disables_cache_resolution() {
     std::fs::create_dir_all(&home).unwrap();
     std::fs::write(dangerous.join("sentinel.txt"), "do not delete").unwrap();
 
-    let output = Command::cargo_bin("hitagi")
-        .unwrap()
-        .current_dir(&cwd)
-        .env("HITAGI_CACHE_DIR", "hitagi")
-        .env("XDG_CACHE_HOME", home.join(".xdg-cache"))
-        .env("HOME", &home)
-        .env_remove("HITAGI_NO_CACHE")
-        .arg("--repo")
-        .arg(&scratch.repo)
-        .arg("--json")
-        .args(["cache", "clear", "--all"])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let value: Value = serde_json::from_slice(&output).unwrap();
+    let xdg_cache = home.join(".xdg-cache");
+    let value = run_with_env(
+        &scratch.repo,
+        &[
+            ("HITAGI_CACHE_DIR", Some(OsStr::new("hitagi"))),
+            ("XDG_CACHE_HOME", Some(xdg_cache.as_os_str())),
+            ("HOME", Some(home.as_os_str())),
+            ("HITAGI_NO_CACHE", None),
+        ],
+        Some(&cwd),
+        &["cache", "clear", "--all"],
+    );
 
     assert_eq!(value["scope"], "all");
     assert_eq!(value["cleared"], false);
@@ -1952,20 +2432,15 @@ fn no_cache_env_disables_persistence() {
     scratch.write("a.rs", "pub fn keep_me() {}\n");
 
     // First run with cache disabled.
-    let value = Command::cargo_bin("hitagi")
-        .unwrap()
-        .env("HITAGI_CACHE_DIR", &scratch.cache_dir)
-        .env("HITAGI_NO_CACHE", "1")
-        .arg("--repo")
-        .arg(&scratch.repo)
-        .arg("--json")
-        .args(["find", "keep_me"])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let parsed: Value = serde_json::from_slice(&value).unwrap();
+    let parsed = run_with_env(
+        &scratch.repo,
+        &[
+            ("HITAGI_CACHE_DIR", Some(scratch.cache_dir.as_os_str())),
+            ("HITAGI_NO_CACHE", Some(OsStr::new("1"))),
+        ],
+        None,
+        &["find", "keep_me"],
+    );
     assert_eq!(parsed["matches"].as_array().unwrap().len(), 1);
 
     // Cache file must not have been written.

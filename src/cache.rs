@@ -47,13 +47,22 @@ use crate::{
 // blob spent ~95 ms on a 32 MB matrix; the mmap + `copy_from_slice` load
 // path replaces that with one memcpy. v10 caches are dropped on first use.
 // v12 moves the BM25 postings blob (5+ MB on a 30k-chunk repo) out of
-// SQLite into a sibling `bm25.v12.bin` file. SQLite was serializing the
+// SQLite into a sibling `bm25.v13.bin` file. SQLite was serializing the
 // BLOB read against the small metadata BLOBs in `lookup_search_sparse`;
 // splitting it lets a worker thread read bm25 + chunks files in parallel
 // with the SQLite SELECT, dropping the warm-cache load_sparse wall by
 // ~15-20 ms on the web repo. v11 caches are dropped on first use.
-const CACHE_VERSION_KEY: &str = concat!("v12-", env!("CARGO_PKG_VERSION"));
-const CACHE_FILE_NAME: &str = "index.v12.sqlite";
+// v13 swaps two warm-load hot paths:
+//   - the bm25 sibling file moves from bincode (~30 ms of varint decode
+//     on the web repo) to a flat little-endian layout that decodes via
+//     one `copy_from_slice` per `Vec<u32>` (~2-4 ms),
+//   - the chunks sibling file is now mmap-backed in
+//     `ChunkStore::decode_from_mmap` ~ the multi-MB content body is
+//     referenced directly into the OS-managed pages instead of
+//     `fs::read` + `to_vec` paying for two ~42 MB memcpys.
+// v12 caches are dropped on first use.
+const CACHE_VERSION_KEY: &str = concat!("v13-", env!("CARGO_PKG_VERSION"));
+const CACHE_FILE_NAME: &str = "index.v13.sqlite";
 
 #[derive(Clone)]
 struct FileEntry {
@@ -453,59 +462,80 @@ impl ParseCache {
     /// hasn't been written yet. Bytes are bincoded by the caller; this
     /// layer doesn't care about the encoding.
     ///
-    /// `chunks_blob` lives on disk as a sibling file rather than a SQLite
-    /// column: BLOBs > 1-2 MB pay per-page overflow overhead and walking the
-    /// pages dominates warm `load_sparse` time. A flat file read is faster
-    /// (single read + memcpy via `std::fs::read`).
+    /// The sibling blobs (`chunks.v13.bin` and `bm25.v13.bin`) are NOT
+    /// loaded here ~ they live as separate mmap'd files (see
+    /// `open_chunks_mmap` and `open_bm25_mmap`). For chunks the mapping
+    /// is held by `ChunkStore` so the multi-MB content body is referenced
+    /// directly into the OS-managed pages; for BM25 the mapping is read
+    /// via flat `copy_from_slice` once at decode time. Either way the
+    /// previous `fs::read` + `to_vec` pair-copies are gone.
     pub fn lookup_search_sparse(&mut self) -> Option<SearchSparseRow> {
         if !self.enabled {
             return None;
         }
-        let chunks_path = self.chunks_blob_path();
-        let bm25_path = self.bm25_blob_path();
-        // Kick off both sibling-file reads in threads BEFORE the SQLite
-        // query so the ~18 MB chunks.v12.bin and ~5 MB bm25.v12.bin reads
-        // overlap with the small-BLOB SELECT instead of paying serially.
-        // `Connection` is `!Sync`, so it can't ride into a rayon worker;
-        // std::thread::spawn sidesteps the Send-of-reference issue by
-        // reading from moved owned PathBufs.
-        let chunks_handle = std::thread::spawn(move || std::fs::read(&chunks_path).ok());
-        let bm25_handle = std::thread::spawn(move || std::fs::read(&bm25_path).ok());
         let conn = self.ensure_read_conn()?;
-        let mut row: SearchSparseRow = conn
-            .query_row(
-                "SELECT signatures_blob, file_mapping_blob,
-                    language_mapping_blob, built_at_unix_secs,
-                    indexed_files, indexed_chunks, language_counts_blob
-             FROM search_sparse WHERE rowid = 1",
-                [],
-                |row| {
-                    Ok(SearchSparseRow {
-                        bm25_blob: Vec::new(),
-                        signatures_blob: row.get(0)?,
-                        chunks_blob: Vec::new(),
-                        file_mapping_blob: row.get(1)?,
-                        language_mapping_blob: row.get(2)?,
-                        built_at_unix_secs: row.get(3)?,
-                        indexed_files: row.get::<_, i64>(4)? as usize,
-                        indexed_chunks: row.get::<_, i64>(5)? as usize,
-                        language_counts_blob: row.get(6)?,
-                    })
-                },
-            )
-            .optional()
-            .ok()
-            .flatten()?;
-        row.chunks_blob = chunks_handle.join().ok().flatten()?;
-        row.bm25_blob = bm25_handle.join().ok().flatten()?;
-        Some(row)
+        conn.query_row(
+            "SELECT signatures_blob, file_mapping_blob,
+                language_mapping_blob, built_at_unix_secs,
+                indexed_files, indexed_chunks, language_counts_blob
+         FROM search_sparse WHERE rowid = 1",
+            [],
+            |row| {
+                Ok(SearchSparseRow {
+                    bm25_blob: Vec::new(),
+                    signatures_blob: row.get(0)?,
+                    chunks_blob: Vec::new(),
+                    file_mapping_blob: row.get(1)?,
+                    language_mapping_blob: row.get(2)?,
+                    built_at_unix_secs: row.get(3)?,
+                    indexed_files: row.get::<_, i64>(4)? as usize,
+                    indexed_chunks: row.get::<_, i64>(5)? as usize,
+                    language_counts_blob: row.get(6)?,
+                })
+            },
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    /// Memory-map the sibling chunks blob. `None` when the cache is
+    /// disabled or the file is missing/unreadable. The mapping is owned by
+    /// the caller (it survives this `&self` borrow), which is what
+    /// `ChunkStore::decode_from_mmap` needs so content slices can be
+    /// referenced directly into the OS-managed pages instead of memcpy'd
+    /// into an owned `Vec<u8>`.
+    pub fn open_chunks_mmap(&self) -> Option<memmap2::Mmap> {
+        if !self.enabled {
+            return None;
+        }
+        let path = self.chunks_blob_path();
+        let file = std::fs::File::open(&path).ok()?;
+        // Safety: the mapped file lives in our cache directory and is only
+        // overwritten via atomic rename (`store_search_sparse`), so the
+        // mapping never sees a partial write of a different chunks blob.
+        unsafe { memmap2::Mmap::map(&file) }.ok()
+    }
+
+    /// Memory-map the sibling BM25 blob. Same safety guarantees as
+    /// `open_chunks_mmap`. The mapping is short-lived (released after
+    /// `Bm25Index::decode_from_bytes` has copied its fixed-width sections
+    /// into owned `Vec`s) but skipping the `fs::read` save the 22 MB
+    /// userspace copy that the previous warm-load path paid for.
+    pub fn open_bm25_mmap(&self) -> Option<memmap2::Mmap> {
+        if !self.enabled {
+            return None;
+        }
+        let path = self.bm25_blob_path();
+        let file = std::fs::File::open(&path).ok()?;
+        unsafe { memmap2::Mmap::map(&file) }.ok()
     }
 
     /// Where the sibling chunks blob file lives. Always under the same
     /// cache_dir as the SQLite file, versioned via the file name so a
     /// schema bump invalidates both at once.
     pub(crate) fn chunks_blob_path(&self) -> PathBuf {
-        self.cache_dir.join("chunks.v12.bin")
+        self.cache_dir.join("chunks.v13.bin")
     }
 
     /// Where the sibling dense vector blob file lives. Same versioning
@@ -513,14 +543,15 @@ impl ParseCache {
     /// hot load path can `mmap` + `copy_from_slice` instead of paying for a
     /// bincode pass over ~8M floats. See `read_dense_vectors_file`.
     pub(crate) fn dense_blob_path(&self) -> PathBuf {
-        self.cache_dir.join("dense.v12.bin")
+        self.cache_dir.join("dense.v13.bin")
     }
 
-    /// Where the sibling BM25 postings blob file lives. Moved out of
-    /// SQLite in v12 so a worker thread can stream this multi-MB file in
-    /// parallel with the small-BLOB SELECT and the chunks file read.
+    /// Where the sibling BM25 postings blob file lives. Stored in a flat
+    /// little-endian layout (see `Bm25Index::encode_to_bytes`) so the
+    /// hot load path is `mmap` + one `copy_from_slice` per `Vec<u32>`
+    /// rather than the per-byte varint decode bincode used to pay for.
     pub(crate) fn bm25_blob_path(&self) -> PathBuf {
-        self.cache_dir.join("bm25.v12.bin")
+        self.cache_dir.join("bm25.v13.bin")
     }
 
     /// Look up the persisted dense-index payload for this repo. Returns
@@ -649,8 +680,7 @@ impl ParseCache {
         let chunks_path = self.chunks_blob_path();
         let dense_path = self.dense_blob_path();
         let bm25_path = self.bm25_blob_path();
-        let sibling_existed =
-            chunks_path.exists() || dense_path.exists() || bm25_path.exists();
+        let sibling_existed = chunks_path.exists() || dense_path.exists() || bm25_path.exists();
         let _ = std::fs::remove_file(&chunks_path);
         let _ = std::fs::remove_file(&dense_path);
         let _ = std::fs::remove_file(&bm25_path);
@@ -669,8 +699,8 @@ impl ParseCache {
         let repo_root_str = repo_root.to_string_lossy().into_owned();
         let cache_dir = resolve_cache_dir(&repo_root_str);
         let cache_file = cache_dir.as_ref().map(|d| d.join(CACHE_FILE_NAME));
-        let chunks_file = cache_dir.as_ref().map(|d| d.join("chunks.v12.bin"));
-        let dense_file = cache_dir.as_ref().map(|d| d.join("dense.v12.bin"));
+        let chunks_file = cache_dir.as_ref().map(|d| d.join("chunks.v13.bin"));
+        let dense_file = cache_dir.as_ref().map(|d| d.join("dense.v13.bin"));
         let mut inspection = SearchIndexInspection::default();
         let Some(file) = cache_file else {
             return inspection;
@@ -1114,7 +1144,6 @@ fn resolve_cache_dir(repo_root: &str) -> Option<PathBuf> {
     cache_root().map(|base| base.join(repo_hash(repo_root)))
 }
 
-
 /// Tune the connection for our access pattern: one short-lived process per
 /// command, reading a handful of multi-MB BLOBs. Mmap'ing the file lets the
 /// OS page in only the overflow pages the SELECT actually touches and skips
@@ -1254,7 +1283,7 @@ fn write_search_sparse_row(conn: &Connection, row: &SearchSparseRow) -> rusqlite
             // bm25_blob and chunks_blob columns are kept in the schema for
             // back-compat with any v11 row that still has them inline; new
             // (v12+) writes only store an empty marker because the real
-            // bytes live in bm25.v12.bin / chunks.v12.bin alongside.
+            // bytes live in bm25.v13.bin / chunks.v13.bin alongside.
             Vec::<u8>::new(),
             row.signatures_blob,
             Vec::<u8>::new(),

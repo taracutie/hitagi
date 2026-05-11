@@ -12,9 +12,7 @@ use rustc_hash::FxHashMap;
 
 use super::chunk_store::ChunkStore;
 use super::dense::DenseIndex;
-use super::ranking::{
-    apply_query_boost_in_place, boost_multi_chunk_files, rerank_topk, resolve_alpha, QueryIntent,
-};
+use super::ranking::{boost_multi_chunk_files, rerank_topk, resolve_alpha, QueryIntent};
 use super::sparse::Bm25Index;
 use super::types::{RankedHit, SearchMode};
 
@@ -81,24 +79,48 @@ pub fn search_hybrid<E: QueryEncoder + ?Sized>(
 
     let encoded = encoder.encode_query(query);
     let vector = normalize_in_place(encoded.row(0).to_owned());
+    let intent = QueryIntent::new(query);
 
-    let semantic_scores = semantic_index.query(&vector, candidate_count, selector);
-    let bm25_scores = bm25_index.search(query, candidate_count, selector);
+    // Three independent fan-outs: the dense matvec, the BM25 posting walk,
+    // and the path-words cache build (skipped when the query has no path
+    // intent). None depend on the others' results, and the boost pass
+    // downstream consumes all three. Folding the cache build into the
+    // join with the dense matvec hides its ~1-3 ms parallel cost behind
+    // the matvec wall.
+    let need_path_cache = intent.has_path_intent();
+    let (semantic_scores, (bm25_scores, path_cache)) = rayon::join(
+        || semantic_index.query(&vector, candidate_count, selector),
+        || {
+            rayon::join(
+                || bm25_index.search(query, candidate_count, selector),
+                || -> Option<crate::search::ranking::PathWordsCache<'_>> {
+                    if !need_path_cache {
+                        return None;
+                    }
+                    Some(crate::search::ranking::PathWordsCache::new(
+                        file_mapping.keys().map(String::as_str),
+                    ))
+                },
+            )
+        },
+    );
 
-    let mut combined: FxHashMap<usize, f32> =
-        FxHashMap::with_capacity_and_hasher(semantic_scores.len() + bm25_scores.len(), Default::default());
+    let mut combined: FxHashMap<usize, f32> = FxHashMap::with_capacity_and_hasher(
+        semantic_scores.len() + bm25_scores.len(),
+        Default::default(),
+    );
     add_rrf_scores(&mut combined, semantic_scores, alpha_weight);
     add_rrf_scores(&mut combined, bm25_scores, 1.0 - alpha_weight);
 
     boost_multi_chunk_files(&mut combined, chunks);
-    let intent = QueryIntent::new(query);
-    let boosted = apply_query_boost_in_place(
+    let boosted = crate::search::ranking::apply_query_boost_in_place_with_cache(
         combined,
         &intent,
         query,
         chunks,
         Some(file_mapping),
         selector,
+        path_cache.as_ref(),
     );
     let ranked = rerank_topk(&boosted, chunks, top_k, &intent, alpha_weight < 1.0);
 

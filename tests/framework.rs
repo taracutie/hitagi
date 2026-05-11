@@ -2,6 +2,8 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use assert_cmd::Command;
+use hitagi::{commands as app_commands, repo::RepoRoot};
+use serde::Serialize;
 use serde_json::Value;
 
 const TEST_PACK_LANGUAGES: &[&str] = &["typescript", "tsx", "javascript", "json"];
@@ -31,21 +33,40 @@ fn prewarm() {
     });
 }
 
-fn run_json(repo: &Path, args: &[&str]) -> Value {
+fn run_structured(repo: &Path, args: &[&str]) -> Value {
     prewarm();
-    let output = Command::cargo_bin("hitagi")
-        .unwrap()
-        .env("HITAGI_CACHE_DIR", shared_cache_dir())
-        .arg("--repo")
-        .arg(repo)
-        .arg("--json")
-        .args(args)
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    serde_json::from_slice(&output).expect("stdout is valid JSON")
+    let repo = RepoRoot::new(std::fs::canonicalize(repo).unwrap());
+    assert_eq!(args[0], "framework");
+    assert_eq!(args[1], "next");
+    let root = parse_root(&args[3..]);
+    match args[2] {
+        "info" => to_value(app_commands::framework_next_info(&repo, root).unwrap()),
+        "list-routes" => to_value(app_commands::framework_next_list_routes(&repo, root).unwrap()),
+        "list-layouts" => to_value(app_commands::framework_next_list_layouts(&repo, root).unwrap()),
+        "list-server-actions" => {
+            to_value(app_commands::framework_next_list_server_actions(&repo, root).unwrap())
+        }
+        other => panic!("unsupported next action {other}"),
+    }
+}
+
+fn parse_root<'a>(args: &'a [&'a str]) -> Option<&'a str> {
+    let mut root = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i] {
+            "--root" => {
+                root = Some(args[i + 1]);
+                i += 2;
+            }
+            other => panic!("unsupported framework arg {other}"),
+        }
+    }
+    root
+}
+
+fn to_value<T: Serialize>(value: T) -> Value {
+    serde_json::to_value(value).expect("response serializes for assertions")
 }
 
 fn run_text(repo: &Path, args: &[&str]) -> String {
@@ -80,7 +101,7 @@ fn run_failure(repo: &Path, args: &[&str]) -> String {
 #[test]
 fn next_info_detects_app_router() {
     let repo = fixture_path("next_app");
-    let value = run_json(&repo, &["framework", "next", "info"]);
+    let value = run_structured(&repo, &["framework", "next", "info"]);
     assert_eq!(value["framework"], "next");
     assert_eq!(value["detected"], true);
     assert_eq!(value["version"], "15.0.0");
@@ -95,12 +116,12 @@ fn next_root_flag_accepts_explicit_repo_root() {
     let repo = fixture_path("next_app");
 
     for root in [".", "./"] {
-        let value = run_json(&repo, &["framework", "next", "info", "--root", root]);
+        let value = run_structured(&repo, &["framework", "next", "info", "--root", root]);
         assert_eq!(value["detected"], true, "root={root}");
         assert_eq!(value["router"], "app", "root={root}");
         assert_eq!(value["root"], ".", "root={root}");
 
-        let value = run_json(&repo, &["framework", "next", "list-routes", "--root", root]);
+        let value = run_structured(&repo, &["framework", "next", "list-routes", "--root", root]);
         assert_eq!(value["root"], ".", "root={root}");
         let routes = value["routes"].as_array().expect("routes array");
         let home = routes
@@ -114,7 +135,7 @@ fn next_root_flag_accepts_explicit_repo_root() {
 #[test]
 fn next_info_detects_pages_router() {
     let repo = fixture_path("next_pages");
-    let value = run_json(&repo, &["framework", "next", "info"]);
+    let value = run_structured(&repo, &["framework", "next", "info"]);
     assert_eq!(value["framework"], "next");
     assert_eq!(value["router"], "pages");
     assert_eq!(value["version"], "14.2.0");
@@ -143,7 +164,7 @@ fn next_info_text_output_summarises_detection() {
 #[test]
 fn next_list_routes_app_router_includes_pages_and_api() {
     let repo = fixture_path("next_app");
-    let value = run_json(&repo, &["framework", "next", "list-routes"]);
+    let value = run_structured(&repo, &["framework", "next", "list-routes"]);
     let routes = value["routes"].as_array().expect("routes array");
     let by_pattern: std::collections::HashMap<String, &Value> = routes
         .iter()
@@ -189,7 +210,7 @@ fn next_list_routes_app_router_includes_pages_and_api() {
 #[test]
 fn next_list_routes_excludes_layouts_and_private_folders() {
     let repo = fixture_path("next_app");
-    let value = run_json(&repo, &["framework", "next", "list-routes"]);
+    let value = run_structured(&repo, &["framework", "next", "list-routes"]);
     let routes = value["routes"].as_array().unwrap();
     for route in routes {
         let file = route["file"].as_str().unwrap();
@@ -223,7 +244,7 @@ fn next_list_routes_excludes_layouts_and_private_folders() {
 #[test]
 fn next_list_routes_pages_router_drops_special_files_and_index() {
     let repo = fixture_path("next_pages");
-    let value = run_json(&repo, &["framework", "next", "list-routes"]);
+    let value = run_structured(&repo, &["framework", "next", "list-routes"]);
     let routes = value["routes"].as_array().unwrap();
     let patterns: Vec<&str> = routes
         .iter()
@@ -260,7 +281,7 @@ fn next_list_routes_pages_router_drops_special_files_and_index() {
 #[test]
 fn next_list_layouts_finds_root_layout_and_error() {
     let repo = fixture_path("next_app");
-    let value = run_json(&repo, &["framework", "next", "list-layouts"]);
+    let value = run_structured(&repo, &["framework", "next", "list-layouts"]);
     let layouts = value["layouts"].as_array().unwrap();
     let kinds: Vec<&str> = layouts
         .iter()
@@ -277,7 +298,7 @@ fn next_list_layouts_finds_root_layout_and_error() {
 #[test]
 fn next_list_server_actions_picks_up_file_and_function_directives() {
     let repo = fixture_path("next_app");
-    let value = run_json(&repo, &["framework", "next", "list-server-actions"]);
+    let value = run_structured(&repo, &["framework", "next", "list-server-actions"]);
     let actions = value["actions"].as_array().unwrap();
 
     let names: Vec<(String, String, String)> = actions
@@ -370,7 +391,7 @@ fn next_list_server_actions_picks_up_file_and_function_directives() {
 #[test]
 fn next_list_server_actions_returns_empty_for_pages_only_fixture() {
     let repo = fixture_path("next_pages");
-    let value = run_json(&repo, &["framework", "next", "list-server-actions"]);
+    let value = run_structured(&repo, &["framework", "next", "list-server-actions"]);
     assert_eq!(
         value["actions"].as_array().unwrap().len(),
         0,
@@ -412,11 +433,11 @@ fn next_info_root_flag_scopes_to_subdirectory() {
         "expected error at repo root, got: {stderr}"
     );
 
-    let value = run_json(&repo, &["framework", "next", "info", "--root", "apps/web"]);
+    let value = run_structured(&repo, &["framework", "next", "info", "--root", "apps/web"]);
     assert_eq!(value["detected"], true);
     assert_eq!(value["router"], "app");
 
-    let value = run_json(
+    let value = run_structured(
         &repo,
         &["framework", "next", "list-routes", "--root", "apps/web"],
     );
@@ -425,7 +446,7 @@ fn next_info_root_flag_scopes_to_subdirectory() {
     let home = routes.iter().find(|r| r["pattern"] == "/").unwrap();
     assert_eq!(home["file"], "apps/web/app/page.tsx");
 
-    let value = run_json(
+    let value = run_structured(
         &repo,
         &["framework", "next", "list-layouts", "--root", "apps/web"],
     );
@@ -433,7 +454,7 @@ fn next_info_root_flag_scopes_to_subdirectory() {
     let layout = layouts.iter().find(|l| l["kind"] == "layout").unwrap();
     assert_eq!(layout["file"], "apps/web/app/layout.tsx");
 
-    let value = run_json(
+    let value = run_structured(
         &repo,
         &[
             "framework",
@@ -492,7 +513,7 @@ fn next_info_detects_src_layout() {
     std::fs::write(app_dir.join("page.tsx"), "export default function P(){}\n").unwrap();
 
     let repo = std::fs::canonicalize(&scratch).unwrap();
-    let value = run_json(&repo, &["framework", "next", "info"]);
+    let value = run_structured(&repo, &["framework", "next", "info"]);
     assert_eq!(value["detected"], true);
     assert_eq!(value["router"], "app");
     assert_eq!(value["src_layout"], true);

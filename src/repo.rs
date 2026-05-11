@@ -213,6 +213,105 @@ impl RepoRoot {
         self.resolve_path(relative_path, PathKind::FileOrDir)
     }
 
+    /// Like `collect_search_files` but also captures the entry's `Metadata`
+    /// in the same walk-worker callback. Callers that need both the path
+    /// list and per-file size/mtime (the `search` index walk) save a full
+    /// second pass of stat syscalls ~ on the web repo that's ~5 ms shaved
+    /// off the warm `walk_for_index` head, where the stat phase used to
+    /// be a separate rayon par-iter immediately after the walk completed.
+    pub fn collect_search_files_with_metadata(
+        &self,
+        paths: &[String],
+    ) -> AppResult<Vec<(ResolvedPath, std::fs::Metadata)>> {
+        let start_paths: Vec<PathBuf> = if paths.is_empty() {
+            vec![self.root.clone()]
+        } else {
+            paths
+                .iter()
+                .map(|p| self.resolve_search_path(p).map(|r| r.full_path))
+                .collect::<AppResult<Vec<_>>>()?
+        };
+
+        let buckets: Mutex<Vec<(ResolvedPath, std::fs::Metadata)>> = Mutex::new(Vec::new());
+
+        struct WorkerSink<'a> {
+            local: Vec<(ResolvedPath, std::fs::Metadata)>,
+            shared: &'a Mutex<Vec<(ResolvedPath, std::fs::Metadata)>>,
+        }
+        impl<'a> WorkerSink<'a> {
+            fn flush(&mut self) {
+                if self.local.is_empty() {
+                    return;
+                }
+                if let Ok(mut shared) = self.shared.lock() {
+                    if shared.is_empty() {
+                        std::mem::swap(&mut self.local, &mut *shared);
+                    } else {
+                        shared.append(&mut self.local);
+                    }
+                }
+            }
+        }
+        impl<'a> Drop for WorkerSink<'a> {
+            fn drop(&mut self) {
+                self.flush();
+            }
+        }
+
+        for start in &start_paths {
+            let mut builder = WalkBuilder::new(start);
+            builder
+                .hidden(true)
+                .git_ignore(true)
+                .git_global(false)
+                .git_exclude(true)
+                .follow_links(false);
+            let walker = builder.build_parallel();
+            walker.run(|| {
+                let root = self.root.clone();
+                let mut sink = WorkerSink {
+                    local: Vec::new(),
+                    shared: &buckets,
+                };
+                Box::new(move |entry| {
+                    if let Ok(entry) = entry {
+                        if entry.file_type().is_some_and(|ft| ft.is_file()) {
+                            // `entry.metadata()` on the `ignore` crate's
+                            // `DirEntry` issues a single stat (the dirent's
+                            // d_type covers is_file but not size/mtime, so
+                            // a stat is unavoidable; doing it here folds
+                            // into the walk-worker pool instead of paying
+                            // for a rayon-par fan-out afterward).
+                            if let Ok(metadata) = entry.metadata() {
+                                let path = entry.into_path();
+                                if let Ok(relative_path) = relative_path_string(&root, &path) {
+                                    sink.local.push((
+                                        ResolvedPath {
+                                            relative_path,
+                                            full_path: path,
+                                        },
+                                        metadata,
+                                    ));
+                                    if sink.local.len() >= 256 {
+                                        sink.flush();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    WalkState::Continue
+                })
+            });
+        }
+
+        let mut files = buckets.into_inner().unwrap_or_default();
+        if start_paths.len() > 1 {
+            let mut seen: HashSet<String> = HashSet::with_capacity(files.len());
+            files.retain(|(rp, _)| seen.insert(rp.relative_path.clone()));
+        }
+        Ok(files)
+    }
+
     pub fn collect_search_files(&self, paths: &[String]) -> AppResult<Vec<ResolvedPath>> {
         let start_paths: Vec<PathBuf> = if paths.is_empty() {
             vec![self.root.clone()]
@@ -293,9 +392,14 @@ impl RepoRoot {
         let mut files = buckets.into_inner().unwrap_or_default();
 
         // Multiple start paths can yield duplicates (overlapping subtrees);
-        // dedup while preserving discovery order.
-        let mut seen: HashSet<String> = HashSet::with_capacity(files.len());
-        files.retain(|rp| seen.insert(rp.relative_path.clone()));
+        // dedup while preserving discovery order. A single start path
+        // (the no-`paths` default for `search` / `find` / `langs`) can't
+        // emit duplicates from one walk, so skip the 2.5k-clone HashSet
+        // populate in that case.
+        if start_paths.len() > 1 {
+            let mut seen: HashSet<String> = HashSet::with_capacity(files.len());
+            files.retain(|rp| seen.insert(rp.relative_path.clone()));
+        }
         Ok(files)
     }
 }

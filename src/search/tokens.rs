@@ -12,7 +12,18 @@ use regex::Regex;
 static TOKEN_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[a-zA-Z_][a-zA-Z0-9_]*").unwrap());
 
 pub fn split_identifier(token: &str) -> Vec<String> {
-    let lower = token.to_lowercase();
+    // ASCII fast path: ~99% of source-code identifiers are ASCII, and the
+    // generic Unicode-aware `to_lowercase` allocates+walks per char which
+    // costs ~3x the byte-level `make_ascii_lowercase`. The `is_ascii()`
+    // check is one branch on the byte mask, well below the noise of the
+    // allocation it gates.
+    let lower = if token.is_ascii() {
+        let mut s = token.to_owned();
+        s.make_ascii_lowercase();
+        s
+    } else {
+        token.to_lowercase()
+    };
     let parts: Vec<String> = if token.contains('_') {
         lower
             .split('_')
@@ -58,7 +69,20 @@ fn split_camel(token: &str) -> Vec<String> {
         .windows(2)
         .filter_map(|w| {
             let part = &token[w[0]..w[1]];
-            (!part.is_empty()).then(|| part.to_lowercase())
+            if part.is_empty() {
+                return None;
+            }
+            // ASCII fast path mirrors `split_identifier` ~ the parts coming
+            // out of `split_camel` are nearly always ASCII subwords of an
+            // identifier, and the Unicode-aware `to_lowercase` allocator
+            // is 2-3x slower than `to_ascii_lowercase` for them.
+            Some(if part.is_ascii() {
+                let mut s = part.to_owned();
+                s.make_ascii_lowercase();
+                s
+            } else {
+                part.to_lowercase()
+            })
         })
         .collect()
 }

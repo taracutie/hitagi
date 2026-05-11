@@ -36,36 +36,50 @@ pub fn walk_for_index(
     opts: &WalkOptions,
     exclude_set: Option<&GlobSet>,
 ) -> AppResult<Vec<WalkedFile>> {
-    let raw = repo.collect_search_files(&opts.paths)?;
-    let filtered = match exclude_set {
-        Some(set) => raw
-            .into_iter()
-            .filter(|file| !set.is_match(&file.relative_path))
-            .collect::<Vec<_>>(),
-        None => raw,
-    };
-
-    // Parallel stat: the walk used to do ~2500 sequential stat() calls (one
-    // per candidate path) right after the gitignore walk already returned all
-    // of them. Fanning out via rayon shrinks the warm `ensure_sparse` head
-    // from ~40 ms to ~15 ms on the web repo without changing any semantics.
-    let walked: Vec<WalkedFile> = filtered
-        .into_par_iter()
-        .filter_map(|resolved| {
-            let metadata = std::fs::metadata(&resolved.full_path).ok()?;
+    // Single-pass: the walk worker captures metadata alongside the
+    // resolved path so we don't fan out a second rayon par-iter just to
+    // re-stat each entry. The previous double-stat path is preserved on
+    // `collect_search_files` for callers that don't need metadata
+    // (`find`, `langs`).
+    //
+    // Language detection is deferred ~ the warm-cache hit path
+    // (signatures match, return persisted payload) never consults
+    // `WalkedFile.language`, so the per-file extension lookup is pure
+    // waste there. The rebuild path materializes them on demand via
+    // `ensure_languages_resolved` before it actually chunks.
+    let raw = repo.collect_search_files_with_metadata(&opts.paths)?;
+    let walked: Vec<WalkedFile> = raw
+        .into_iter()
+        .filter_map(|(resolved, metadata)| {
+            if let Some(set) = exclude_set {
+                if set.is_match(&resolved.relative_path) {
+                    return None;
+                }
+            }
             if !metadata.is_file() {
                 return None;
             }
             if metadata.len() > MAX_INDEX_FILE_BYTES {
                 return None;
             }
-            let language = Language::detect(&resolved.full_path).ok();
             Some(WalkedFile {
                 resolved,
                 metadata,
-                language,
+                language: None,
             })
         })
         .collect();
     Ok(walked)
+}
+
+/// Fill in `WalkedFile.language` for every file in-place. Used by the
+/// rebuild path right before chunking ~ runs the same extension+filename
+/// match the walker used to do, but only when we actually need it. The
+/// warm-cache hit path skips this entirely.
+pub fn ensure_languages_resolved(files: &mut [WalkedFile]) {
+    files.par_iter_mut().for_each(|file| {
+        if file.language.is_none() {
+            file.language = Language::detect(&file.resolved.full_path).ok();
+        }
+    });
 }

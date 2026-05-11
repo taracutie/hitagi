@@ -90,8 +90,17 @@ pub struct CachedTokenizer {
 /// the caller falls through to the slow JSON path.
 pub fn try_load(tokenizer_path: &Path) -> Option<CachedTokenizer> {
     let cache_path = cache_path_for(tokenizer_path)?;
-    let cache_bytes = fs::read(&cache_path).ok()?;
-    decode(&cache_bytes, tokenizer_path).ok()
+    // mmap rather than `fs::read` ~ we walk the 1 MB blob exactly once
+    // (the decoder iterates the vocab into an owned `AHashMap`), so
+    // borrowing the OS page cache via `&[u8]` skips the userspace
+    // memcpy that `fs::read` allocates a fresh `Vec<u8>` for. The
+    // mapping doesn't need to outlive this call ~ all owned data lives
+    // in the rebuilt `Tokenizer`.
+    let file = fs::File::open(&cache_path).ok()?;
+    // Safety: the cache file is written via atomic temp+rename in
+    // `write()` so the mapping never observes a partial write.
+    let mmap = unsafe { memmap2::Mmap::map(&file) }.ok()?;
+    decode(&mmap[..], tokenizer_path).ok()
 }
 
 /// Serialize `tokenizer` into the cache file for `tokenizer_path`. Best
@@ -296,7 +305,12 @@ fn bert_normalizer_flags(tokenizer: &Tokenizer) -> (bool, bool, Option<bool>, bo
         return (false, false, None, false);
     };
     if let NormalizerWrapper::BertNormalizer(b) = n {
-        return (b.clean_text, b.handle_chinese_chars, b.strip_accents, b.lowercase);
+        return (
+            b.clean_text,
+            b.handle_chinese_chars,
+            b.strip_accents,
+            b.lowercase,
+        );
     }
     (false, false, None, false)
 }
@@ -317,12 +331,26 @@ fn added_tokens_meta(tokenizer: &Tokenizer) -> Vec<AddedTokenMeta> {
     // the load side.
     for (id, token) in added.get_added_tokens_decoder() {
         let mut flags = 0u8;
-        if token.single_word { flags |= FLAG_SINGLE_WORD; }
-        if token.lstrip { flags |= FLAG_LSTRIP; }
-        if token.rstrip { flags |= FLAG_RSTRIP; }
-        if token.normalized { flags |= FLAG_NORMALIZED; }
-        if token.special { flags |= FLAG_SPECIAL; }
-        out.push(AddedTokenMeta { id: *id, content: token.content.clone(), flags });
+        if token.single_word {
+            flags |= FLAG_SINGLE_WORD;
+        }
+        if token.lstrip {
+            flags |= FLAG_LSTRIP;
+        }
+        if token.rstrip {
+            flags |= FLAG_RSTRIP;
+        }
+        if token.normalized {
+            flags |= FLAG_NORMALIZED;
+        }
+        if token.special {
+            flags |= FLAG_SPECIAL;
+        }
+        out.push(AddedTokenMeta {
+            id: *id,
+            content: token.content.clone(),
+            flags,
+        });
     }
     // Sort by id so the cache layout is deterministic across runs even
     // though the source map is hash-ordered.
@@ -347,7 +375,10 @@ impl<'a> ByteReader<'a> {
     }
 
     fn read_slice(&mut self, n: usize) -> Result<&'a [u8], &'static str> {
-        let end = self.pos.checked_add(n).ok_or("tokenizer cache: read overflow")?;
+        let end = self
+            .pos
+            .checked_add(n)
+            .ok_or("tokenizer cache: read overflow")?;
         if end > self.bytes.len() {
             return Err("tokenizer cache: truncated");
         }
@@ -381,4 +412,3 @@ impl<'a> ByteReader<'a> {
         std::str::from_utf8(bytes).map_err(|_| "tokenizer cache: bad utf8")
     }
 }
-

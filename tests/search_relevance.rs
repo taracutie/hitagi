@@ -1,8 +1,12 @@
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
-use assert_cmd::Command;
+use hitagi::{
+    commands::{self as app_commands, SearchModeArg, SearchOptions},
+    repo::RepoRoot,
+};
 use serde::Deserialize;
+use serde::Serialize;
 use serde_json::Value;
 
 const TEST_PACK_LANGUAGES: &[&str] = &[
@@ -50,24 +54,46 @@ fn prewarm_language_pack() {
 
 fn search(repo: &Path, query: &str, extra_args: &[&str]) -> Value {
     prewarm_language_pack();
-    let output = Command::cargo_bin("hitagi")
-        .unwrap()
-        .env("HITAGI_CACHE_DIR", shared_cache_dir())
-        .arg("--repo")
-        .arg(repo)
-        .arg("--json")
-        .arg("search")
-        .arg(query)
-        .arg("--hashing")
-        .arg("-k")
-        .arg("10")
-        .args(extra_args)
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    serde_json::from_slice(&output).expect("stdout is valid JSON")
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+    let old = std::env::var_os("HITAGI_CACHE_DIR");
+    std::env::set_var("HITAGI_CACHE_DIR", shared_cache_dir());
+
+    let mut options = SearchOptions {
+        paths: Vec::new(),
+        excludes: Vec::new(),
+        limit: 10,
+        mode: SearchModeArg::Hybrid,
+        languages: Vec::new(),
+        alpha: None,
+        snippet: false,
+        hashing: true,
+        no_download: false,
+        offline: false,
+        model: None,
+    };
+    let mut i = 0;
+    while i < extra_args.len() {
+        match extra_args[i] {
+            "--exclude" => {
+                options.excludes.push(extra_args[i + 1].to_string());
+                i += 2;
+            }
+            other => panic!("unsupported search arg {other}"),
+        }
+    }
+    let repo = RepoRoot::new(std::fs::canonicalize(repo).unwrap());
+    let response = app_commands::search(&repo, query, options).unwrap();
+
+    match old {
+        Some(old) => std::env::set_var("HITAGI_CACHE_DIR", old),
+        None => std::env::remove_var("HITAGI_CACHE_DIR"),
+    }
+    to_value(response)
+}
+
+fn to_value<T: Serialize>(value: T) -> Value {
+    serde_json::to_value(value).expect("response serializes for assertions")
 }
 
 #[test]

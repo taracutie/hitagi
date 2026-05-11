@@ -15,16 +15,21 @@ use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use ndarray::Array2;
 use rayon::prelude::*;
 use safetensors::tensor::Dtype;
 use safetensors::SafeTensors;
 use serde::Deserialize;
-use tokenizers::Tokenizer;
+use tokenizers::models::ModelWrapper;
+use tokenizers::normalizers::NormalizerWrapper;
+use tokenizers::pre_tokenizers::PreTokenizerWrapper;
+use tokenizers::{Model, Tokenizer};
 
 use crate::error::{AppError, AppResult};
 
+use super::fast_wp::{self, FastBertWordPiece, FastWriteInput};
 use super::fuse::QueryEncoder;
 use super::tokens::tokenize as bm25_tokenize;
 
@@ -139,8 +144,29 @@ pub fn model_files_meta(options: &ModelOptions) -> AppResult<String> {
 }
 
 pub struct Model2VecEncoder {
-    tokenizer: Tokenizer,
-    embeddings: Array2<f32>,
+    /// Fast WordPiece path for query encoding. Present on every warm load:
+    /// either restored from the `fast_wp` cache or freshly built alongside
+    /// the slow tokenizer after a cache miss. The query (single-text)
+    /// encode path uses this exclusively ~ no allocation-heavy WordPiece
+    /// build per warm search.
+    fast: Option<FastBertWordPiece>,
+    /// Slow `tokenizers::Tokenizer` for batch encoding (the index-build
+    /// hot path, where the rayon-parallel `encode_batch_fast` is well
+    /// optimized). Built lazily: on a fast-cache hit, we never call
+    /// `Tokenizer::from_file` unless the caller actually invokes
+    /// `encode`. Stored behind `OnceLock` so concurrent encoders share
+    /// the same instance after a single resolution.
+    slow: OnceLock<Tokenizer>,
+    /// Path to the on-disk `tokenizer.json` for the lazy slow load. Kept
+    /// even on fast-only paths so we can produce a Tokenizer when
+    /// `encode_batch_fast` is finally needed.
+    tokenizer_path: PathBuf,
+    /// Token embeddings. Either an owned `Array2` (rebuild path) or a
+    /// zero-copy view over the safetensors mmap. The warm path picks the
+    /// mapped variant so the 60+ MB embeddings matrix is never memcpy'd
+    /// out of the page cache ~ rows are read on demand by `encode_query`,
+    /// which touches a handful of pages per call.
+    embeddings: EmbeddingsMatrix,
     weights: Option<Vec<f32>>,
     token_mapping: Option<Vec<usize>>,
     normalize: bool,
@@ -148,32 +174,114 @@ pub struct Model2VecEncoder {
     unk_token_id: Option<u32>,
 }
 
+/// Storage for the model's embedding matrix. The owned variant is used
+/// after a rebuild or for non-f32 dtypes; the mapped variant points an
+/// `ArrayView2` at the safetensors `embeddings` tensor's bytes inside
+/// the mmap'd model file. Both share the same f32 layout so callers
+/// access rows via the same `ArrayView1` regardless of provenance.
+#[derive(Debug)]
+enum EmbeddingsMatrix {
+    Owned(Array2<f32>),
+    /// `safetensors_mmap[body_offset..body_offset + rows*cols*4]` is the
+    /// row-major f32 LE body. The `Arc<Mmap>` keeps the mapping alive for
+    /// as long as the encoder ~ dropping it would unmap the rows.
+    Mapped {
+        mmap: std::sync::Arc<memmap2::Mmap>,
+        body_offset: usize,
+        rows: usize,
+        cols: usize,
+    },
+}
+
+impl EmbeddingsMatrix {
+    fn view(&self) -> ndarray::ArrayView2<'_, f32> {
+        match self {
+            EmbeddingsMatrix::Owned(arr) => arr.view(),
+            EmbeddingsMatrix::Mapped {
+                mmap,
+                body_offset,
+                rows,
+                cols,
+            } => {
+                let len = *rows * *cols;
+                // Safety: `Self::try_map` validated the byte range and
+                // alignment (mmap is page-aligned, body_offset is a
+                // multiple of 4). f32 has 4-byte alignment; LE bytes on
+                // x86_64 / aarch64 LE platforms match the in-memory
+                // layout the writer produced via `to_le_bytes`.
+                let floats = unsafe {
+                    std::slice::from_raw_parts(mmap.as_ptr().add(*body_offset) as *const f32, len)
+                };
+                ndarray::ArrayView2::from_shape((*rows, *cols), floats)
+                    .expect("validated shape in try_map")
+            }
+        }
+    }
+
+    fn ncols(&self) -> usize {
+        match self {
+            EmbeddingsMatrix::Owned(arr) => arr.ncols(),
+            EmbeddingsMatrix::Mapped { cols, .. } => *cols,
+        }
+    }
+
+    /// Try to wrap the f32 LE bytes inside an mmap as a zero-copy view.
+    /// Returns `None` if shape or alignment invariants aren't met; the
+    /// caller falls back to the owned `Array2` constructed by
+    /// `read_f32_matrix_parallel`.
+    fn try_map(
+        mmap: std::sync::Arc<memmap2::Mmap>,
+        body_offset: usize,
+        rows: usize,
+        cols: usize,
+    ) -> Option<Self> {
+        let bytes = rows.checked_mul(cols).and_then(|n| n.checked_mul(4))?;
+        if body_offset.checked_add(bytes)? > mmap.len() {
+            return None;
+        }
+        if (mmap.as_ptr() as usize + body_offset) % std::mem::align_of::<f32>() != 0 {
+            return None;
+        }
+        Some(EmbeddingsMatrix::Mapped {
+            mmap,
+            body_offset,
+            rows,
+            cols,
+        })
+    }
+}
+
 impl Model2VecEncoder {
     pub fn from_options(options: &ModelOptions) -> AppResult<Self> {
         let (tokenizer_path, model_path, config_path) = model_files(options)?;
-        // Tokenizer parsing (~85 ms on a 1 MB tokenizer.json) is the long
-        // pole. The embeddings table load (~55 ms paging 30 MB of f32 from
-        // disk) and the side-channel JSON reads (config + unk_token) are
-        // independent; we run all three on rayon workers alongside the
-        // tokenizer so only the tokenizer parse remains on the wall, with
-        // everything else folded under it. `unk_token_id`'s final hashmap
-        // lookup is the only step that has to wait for both branches.
-        // Returns `(Tokenizer, optional_precomputed_median, optional_unk_id)`
-        // so the warm cache path can skip the second pass over the 60 k
-        // vocab to derive those numbers when they were already stamped at
-        // write time.
-        let load_tokenizer = || -> AppResult<(Tokenizer, Option<usize>, Option<Option<u32>>)> {
-            // Try the binary fast path first ~ rebuilding via
-            // `WordPiece::builder() + BertNormalizer + BertPreTokenizer` from
-            // a cached vocab + flag blob is ~15-25 ms vs ~75-85 ms for the
-            // full JSON parse. The cache is invalidated on tokenizer.json
-            // (mtime, size) change so a model swap re-parses the source.
-            if let Some(cached) = super::tokenizer_cache::try_load(&tokenizer_path) {
-                return Ok((
-                    cached.tokenizer,
-                    Some(cached.median_token_length),
-                    Some(cached.unk_token_id),
-                ));
+        // Two warm-path tokenizer formats sit on disk:
+        //   1. `fast_wp.v1/<hash>.bin` ~ sorted-byte WordPiece vocab + flags,
+        //      decoded via three `copy_from_slice` calls. Powers
+        //      `FastBertWordPiece::dim_independent_encode` on warm queries.
+        //   2. The full `Tokenizer` (no on-disk cache by design ~ the slow
+        //      JSON parse is paid on cache (1) miss). Lazy-loaded later if
+        //      `encode_batch_fast` is ever called (index rebuild path).
+        //
+        // The tokenizer parse + WordPiece HashMap build that the previous
+        // `tokenizer_cache` paid (~40 ms warm) is gone from the search wall
+        // entirely on cache (1) hits: `fast_wp::try_load` finishes in a
+        // couple ms and the matching `BertNormalizer` flags ride alongside.
+        //
+        // We probe the fast cache synchronously up-front (the probe is a
+        // sub-5ms mmap + flat-table memcpy on warm OS page cache). On a
+        // hit, the `unk_token` + `config.json` sidecar reads disappear
+        // entirely: both values come back stamped in the cache. On a
+        // miss, the sidecar reads ride parallel with the slow tokenizer
+        // parse (their old layout).
+        let preloaded_fast = fast_wp::try_load(&tokenizer_path);
+        let fast_cache_hit = preloaded_fast.is_some();
+        // Capture for use inside parallel closures (the closures only run
+        // when this branch is taken, so taking a copy here is fine).
+        let need_sidecar = !fast_cache_hit;
+        let need_slow_tokenizer = !fast_cache_hit;
+        let load_tokenizer = || -> AppResult<Option<Tokenizer>> {
+            if !need_slow_tokenizer {
+                return Ok(None);
             }
             let tk = Tokenizer::from_file(&tokenizer_path).map_err(|err| {
                 AppError::internal(format!(
@@ -181,56 +289,93 @@ impl Model2VecEncoder {
                     tokenizer_path.display()
                 ))
             })?;
-            // Cache write happens after the caller computes median +
-            // unk_token_id ~ we plumb them through so the next warm load
-            // can skip recomputing.
-            Ok((tk, None, None))
+            Ok(Some(tk))
         };
-        let load_tensors = || -> AppResult<(Array2<f32>, Option<Vec<f32>>, Option<Vec<usize>>)> {
-            // mmap the safetensors file ~ on warm cache the bytes are
-            // already in the OS page cache and the embedding matrix copy
-            // hits memory bandwidth (not disk).
-            let model_file = fs::File::open(&model_path).map_err(AppError::from)?;
-            let mmap = unsafe { memmap2::Mmap::map(&model_file) }
-                .map_err(|err| AppError::internal(format!("mmap safetensors: {err}")))?;
-            let tensors = SafeTensors::deserialize(&mmap)
-                .map_err(|err| AppError::internal(format!("failed to read safetensors: {err}")))?;
-            // The 63 MB embeddings memcpy dominates the load. Split it into
-            // strided chunks so the writes happen in parallel ~ on 8+ cores
-            // we move from a single-thread 5-6 GB/s pipe to whatever the
-            // memory bus can sustain across rayon workers (~2x on the WSL2
-            // box this is tuned against). Weights + mapping are tiny and
-            // ride on the calling thread alongside the parallel fanout.
-            let embeddings_tensor = tensors
-                .tensor("embeddings")
-                .map_err(|err| AppError::internal(format!("missing embeddings tensor: {err}")))?;
-            let shape = embeddings_tensor.shape();
-            let [rows, cols]: [usize; 2] = shape
-                .try_into()
-                .map_err(|_| AppError::internal("embeddings is not 2D".to_string()))?;
-            let data = embeddings_tensor.data();
-            let weights = tensors
-                .tensor("weights")
-                .ok()
-                .map(|t| read_f32_data(t.dtype(), t.data()))
-                .transpose()?;
-            let token_mapping = tensors
-                .tensor("mapping")
-                .ok()
-                .map(|t| read_usize_data(t.dtype(), t.data()))
-                .transpose()?;
-            let embeddings = read_f32_matrix_parallel(data, rows, cols, embeddings_tensor.dtype())?;
-            drop(tensors);
-            drop(mmap);
-            Ok((embeddings, weights, token_mapping))
-        };
+        let load_tensors =
+            || -> AppResult<(EmbeddingsMatrix, Option<Vec<f32>>, Option<Vec<usize>>)> {
+                // mmap the safetensors file ~ on warm cache the bytes are
+                // already in the OS page cache. For the f32 embedding matrix
+                // we keep the mmap alive in the encoder and point an
+                // `ArrayView2` at the body bytes directly, so the 60+ MB
+                // memcpy `read_f32_matrix_parallel` used to do is gone from
+                // the warm wall entirely. Non-f32 tensors fall back to the
+                // owned-Vec path.
+                let model_file = fs::File::open(&model_path).map_err(AppError::from)?;
+                let mmap = unsafe { memmap2::Mmap::map(&model_file) }
+                    .map_err(|err| AppError::internal(format!("mmap safetensors: {err}")))?;
+                let tensors = SafeTensors::deserialize(&mmap).map_err(|err| {
+                    AppError::internal(format!("failed to read safetensors: {err}"))
+                })?;
+                // The 63 MB embeddings memcpy dominates the load. Split it into
+                // strided chunks so the writes happen in parallel ~ on 8+ cores
+                // we move from a single-thread 5-6 GB/s pipe to whatever the
+                // memory bus can sustain across rayon workers (~2x on the WSL2
+                // box this is tuned against). Weights + mapping are tiny and
+                // ride on the calling thread alongside the parallel fanout.
+                let embeddings_tensor = tensors.tensor("embeddings").map_err(|err| {
+                    AppError::internal(format!("missing embeddings tensor: {err}"))
+                })?;
+                let shape = embeddings_tensor.shape();
+                let [rows, cols]: [usize; 2] = shape
+                    .try_into()
+                    .map_err(|_| AppError::internal("embeddings is not 2D".to_string()))?;
+                let data = embeddings_tensor.data();
+                let weights = tensors
+                    .tensor("weights")
+                    .ok()
+                    .map(|t| read_f32_data(t.dtype(), t.data()))
+                    .transpose()?;
+                let token_mapping = tensors
+                    .tensor("mapping")
+                    .ok()
+                    .map(|t| read_usize_data(t.dtype(), t.data()))
+                    .transpose()?;
+                let embeddings = if embeddings_tensor.dtype() == Dtype::F32 {
+                    // Body offset is the byte distance from the mmap's start to
+                    // the tensor's first byte. SafeTensors hands us a `&[u8]`
+                    // borrowed from the mmap, so pointer subtraction recovers
+                    // the absolute offset; alignment is enforced by `try_map`.
+                    let body_offset = (data.as_ptr() as usize).wrapping_sub(mmap.as_ptr() as usize);
+                    // Drop the SafeTensors header parser first so its borrow on
+                    // `mmap` is released before we hand `mmap` to `Arc`.
+                    drop(tensors);
+                    let mmap_arc = std::sync::Arc::new(mmap);
+                    EmbeddingsMatrix::try_map(mmap_arc, body_offset, rows, cols).ok_or_else(
+                        || {
+                            AppError::internal(
+                                "embeddings mmap could not be aligned/sized for zero-copy view"
+                                    .to_string(),
+                            )
+                        },
+                    )?
+                } else {
+                    // Non-f32 path: keep the existing memcpy + dtype conversion.
+                    let owned =
+                        read_f32_matrix_parallel(data, rows, cols, embeddings_tensor.dtype())?;
+                    drop(tensors);
+                    drop(mmap);
+                    EmbeddingsMatrix::Owned(owned)
+                };
+                Ok((embeddings, weights, token_mapping))
+            };
         // Sidecar: scan tokenizer.json for `unk_token` and load config.json.
         // Both are <20 ms in serial; running here hides them entirely behind
         // the tokenizer parse. Returns `(unk_token, normalize)`. Failures are
         // benign defaults so we never block the encoder on a missing field.
-        let load_sidecar = || -> (Option<String>, bool) {
+        //
+        // Fast-cache hits already carry `unk_token_id` and `config_normalize`
+        // in the stamped blob, so the sidecar's only role becomes a slow-path
+        // fallback. We skip it entirely when `try_load` succeeded ~ the
+        // tokenizer.json + config.json reads were the longest single chunk on
+        // the warm wall after the tokenizer build itself disappeared.
+        let load_sidecar = || -> (Option<String>, Option<bool>) {
+            // On a fast-cache hit we already carry both values; the closure
+            // returns sentinels and skips the 20+ ms of filesystem reads.
+            if !need_sidecar {
+                return (None, None);
+            }
             let unk = read_unk_token_from_file(&tokenizer_path);
-            let normalize = read_normalize_from_config(&config_path).unwrap_or(true);
+            let normalize = Some(read_normalize_from_config(&config_path).unwrap_or(true));
             (unk, normalize)
         };
         // Two-way join keeps the existing thread budget; the sidecar runs on
@@ -239,37 +384,56 @@ impl Model2VecEncoder {
         // threaded inside the tokenizers crate, so an extra worker wouldn't
         // help it).
         let tensors_then_sidecar = || -> AppResult<(
-            (Array2<f32>, Option<Vec<f32>>, Option<Vec<usize>>),
-            (Option<String>, bool),
+            (EmbeddingsMatrix, Option<Vec<f32>>, Option<Vec<usize>>),
+            (Option<String>, Option<bool>),
         )> {
             let (tensors, sidecar) = rayon::join(load_tensors, load_sidecar);
             Ok((tensors?, sidecar))
         };
         let (tokenizer_result, tensors_sidecar_result) =
             rayon::join(load_tokenizer, tensors_then_sidecar);
-        let (tokenizer, cached_median, cached_unk_id) = tokenizer_result?;
-        let ((embeddings, weights, token_mapping), (unk_token, normalize)) =
+        let slow_tokenizer_opt = tokenizer_result?;
+        let ((embeddings, weights, token_mapping), (unk_token_sidecar, normalize_sidecar)) =
             tensors_sidecar_result?;
-        // Cache hit path skips re-iterating the 60 k vocab; only the slow
-        // (JSON parse) path needs the derivations + the write-back.
-        let median_token_length = match cached_median {
-            Some(m) => m,
-            None => median_token_byte_len(&tokenizer),
-        };
-        let unk_token = unk_token.unwrap_or_else(|| "[UNK]".to_string());
-        let unk_token_id = match cached_unk_id {
-            Some(id) => id,
-            None => {
-                let id = tokenizer.token_to_id(&unk_token);
-                // We took the slow JSON path above; stamp the cache so the
-                // next warm load takes the binary path.
-                super::tokenizer_cache::write(&tokenizer_path, &tokenizer, median_token_length, id);
-                id
-            }
+        // Two flow shapes:
+        //   - Fast cache hit: `preloaded_fast` already has median + unk_id +
+        //     config_normalize stamped; no slow Tokenizer ran on this path.
+        //     The `slow` OnceLock stays empty until something calls `encode()`.
+        //   - Slow cache miss: the freshly-parsed Tokenizer is the source of
+        //     truth. We extract a `FastBertWordPiece` from it so this run
+        //     gets the fast query path too, and persist the fast cache so
+        //     next run skips the JSON parse entirely.
+        let slow_cell = OnceLock::new();
+        let (fast, median_token_length, unk_token_id, normalize) = if let Some(fast) =
+            preloaded_fast
+        {
+            let median = fast.median_token_length;
+            let unk_id = fast.unk_token_id;
+            let norm = fast.config_normalize;
+            (Some(fast), median, unk_id, norm)
+        } else {
+            let tokenizer = slow_tokenizer_opt
+                .ok_or_else(|| AppError::internal("slow tokenizer missing on miss".to_string()))?;
+            let unk_token = unk_token_sidecar.unwrap_or_else(|| "[UNK]".to_string());
+            let median = median_token_byte_len(&tokenizer);
+            let unk_id = tokenizer.token_to_id(&unk_token);
+            let norm = normalize_sidecar.unwrap_or(true);
+            let fast = build_fast_from_tokenizer(
+                &tokenizer,
+                &unk_token,
+                median,
+                unk_id,
+                norm,
+                &tokenizer_path,
+            );
+            let _ = slow_cell.set(tokenizer);
+            (fast, median, unk_id, norm)
         };
 
         Ok(Self {
-            tokenizer,
+            fast,
+            slow: slow_cell,
+            tokenizer_path,
             embeddings,
             weights,
             token_mapping,
@@ -278,6 +442,97 @@ impl Model2VecEncoder {
             unk_token_id,
         })
     }
+
+    /// Resolve (and cache) the heavy `Tokenizer` for batch encoding. Cheap
+    /// when already loaded; pays the JSON-parse cost once on the first
+    /// `encode_batch_fast` call after a fast-cache hit. Warm query encoding
+    /// never reaches this branch.
+    fn slow_tokenizer(&self) -> &Tokenizer {
+        self.slow.get_or_init(|| {
+            Tokenizer::from_file(&self.tokenizer_path)
+                .expect("tokenizer.json load failed in lazy slow path")
+        })
+    }
+}
+
+/// Build a `FastBertWordPiece` from a freshly-parsed `Tokenizer`, and
+/// persist the same data to the `fast_wp` cache so subsequent runs skip
+/// the slow JSON parse. Returns `None` only when the tokenizer doesn't
+/// match the BERT-WordPiece shape we accelerate; the caller falls back
+/// to the slow encode path in that case.
+fn build_fast_from_tokenizer(
+    tokenizer: &Tokenizer,
+    unk_token: &str,
+    median_token_length: usize,
+    unk_token_id: Option<u32>,
+    config_normalize: bool,
+    tokenizer_path: &Path,
+) -> Option<FastBertWordPiece> {
+    let (vocab, _wp_unk, continuing_subword_prefix, max_input_chars_per_word) =
+        wordpiece_state(tokenizer)?;
+    if !has_bert_pre_tokenizer(tokenizer) {
+        return None;
+    }
+    let normalizer_flags = bert_normalizer_flags(tokenizer);
+    let added_tokens = added_tokens_for_fast(tokenizer);
+    let input = FastWriteInput {
+        vocab,
+        unk_token: unk_token.to_owned(),
+        continuing_subword_prefix,
+        max_input_chars_per_word,
+        normalizer_flags,
+        median_token_length,
+        unk_token_id,
+        added_tokens,
+        config_normalize,
+    };
+    let fast = fast_wp::build_from_input(&input);
+    // Persist for next time. Failures are silently ignored ~ the next warm
+    // search will hit this same slow path again.
+    fast_wp::write(tokenizer_path, &input);
+    Some(fast)
+}
+
+fn wordpiece_state(tokenizer: &Tokenizer) -> Option<(Vec<(String, u32)>, String, String, u32)> {
+    let ModelWrapper::WordPiece(wp) = tokenizer.get_model() else {
+        return None;
+    };
+    let vocab: Vec<(String, u32)> = wp.get_vocab().into_iter().collect();
+    let unk = wp.unk_token.clone();
+    let prefix = wp.continuing_subword_prefix.clone();
+    let max_chars = wp.max_input_chars_per_word as u32;
+    Some((vocab, unk, prefix, max_chars))
+}
+
+fn bert_normalizer_flags(tokenizer: &Tokenizer) -> (bool, bool, Option<bool>, bool) {
+    let Some(NormalizerWrapper::BertNormalizer(b)) = tokenizer.get_normalizer() else {
+        return (false, false, None, false);
+    };
+    (
+        b.clean_text,
+        b.handle_chinese_chars,
+        b.strip_accents,
+        b.lowercase,
+    )
+}
+
+fn has_bert_pre_tokenizer(tokenizer: &Tokenizer) -> bool {
+    matches!(
+        tokenizer.get_pre_tokenizer(),
+        Some(PreTokenizerWrapper::BertPreTokenizer(_))
+    )
+}
+
+fn added_tokens_for_fast(tokenizer: &Tokenizer) -> Vec<(u32, String, bool)> {
+    let added = tokenizer.get_added_vocabulary();
+    let mut out: Vec<(u32, String, bool)> = added
+        .get_added_tokens_decoder()
+        .iter()
+        .map(|(id, token)| (*id, token.content.clone(), token.normalized))
+        .collect();
+    // Deterministic ordering for cache stability.
+    out.sort_by_key(|(id, _, _)| *id);
+    out
 }
 
 /// Median UTF-8 byte length of vocab tokens, computed in O(n) via
@@ -339,6 +594,10 @@ impl Encoder for Model2VecEncoder {
     }
 
     fn encode(&self, texts: &[String]) -> Array2<f32> {
+        // Batch encoding is the index-build path; reach for the
+        // (potentially lazy) slow `Tokenizer` whose `encode_batch_fast`
+        // is rayon-parallel internally. Warm hybrid/semantic search never
+        // touches this branch.
         let dim = self.dim();
         let mut output = Array2::<f32>::zeros((texts.len(), dim));
         let truncated: Vec<String> = texts
@@ -346,7 +605,7 @@ impl Encoder for Model2VecEncoder {
             .map(|text| truncate_chars(text, 512 * self.median_token_length).to_owned())
             .collect();
         let encodings = self
-            .tokenizer
+            .slow_tokenizer()
             .encode_batch_fast::<String>(truncated, false)
             .unwrap_or_default();
 
@@ -359,33 +618,7 @@ impl Encoder for Model2VecEncoder {
             if token_ids.is_empty() {
                 continue;
             }
-            let mut count = 0usize;
-            for id in token_ids {
-                let token_idx = id as usize;
-                let row = self
-                    .token_mapping
-                    .as_ref()
-                    .and_then(|mapping| mapping.get(token_idx).copied())
-                    .unwrap_or(token_idx);
-                if row >= self.embeddings.nrows() {
-                    continue;
-                }
-                let scale = self
-                    .weights
-                    .as_ref()
-                    .and_then(|weights| weights.get(token_idx).copied())
-                    .unwrap_or(1.0);
-                let source = self.embeddings.row(row);
-                for col in 0..dim {
-                    output[(row_idx, col)] += source[col] * scale;
-                }
-                count += 1;
-            }
-            if count > 0 {
-                for col in 0..dim {
-                    output[(row_idx, col)] /= count as f32;
-                }
-            }
+            self.fold_embeddings_into_row(&token_ids, &mut output, row_idx);
         }
         if self.normalize {
             for row in output.rows_mut() {
@@ -396,9 +629,78 @@ impl Encoder for Model2VecEncoder {
     }
 }
 
+impl Model2VecEncoder {
+    /// Pull each token's embedding (with optional `mapping` redirect and
+    /// `weights` scaling) into `output[row_idx]`, then normalize by the
+    /// number of contributing tokens. Shared by the slow batch path and
+    /// the fast query path so the two can never drift on the math.
+    fn fold_embeddings_into_row(
+        &self,
+        token_ids: &[u32],
+        output: &mut Array2<f32>,
+        row_idx: usize,
+    ) {
+        let embeddings = self.embeddings.view();
+        let dim = embeddings.ncols();
+        let nrows = embeddings.nrows();
+        let mut count = 0usize;
+        for &id in token_ids {
+            let token_idx = id as usize;
+            let row = self
+                .token_mapping
+                .as_ref()
+                .and_then(|mapping| mapping.get(token_idx).copied())
+                .unwrap_or(token_idx);
+            if row >= nrows {
+                continue;
+            }
+            let scale = self
+                .weights
+                .as_ref()
+                .and_then(|weights| weights.get(token_idx).copied())
+                .unwrap_or(1.0);
+            let source = embeddings.row(row);
+            for col in 0..dim {
+                output[(row_idx, col)] += source[col] * scale;
+            }
+            count += 1;
+        }
+        if count > 0 {
+            for col in 0..dim {
+                output[(row_idx, col)] /= count as f32;
+            }
+        }
+    }
+}
+
 impl QueryEncoder for Model2VecEncoder {
     fn encode_query(&self, query: &str) -> Array2<f32> {
-        self.encode(&[query.to_owned()])
+        // Fast path: a sorted-byte WordPiece + the official BertNormalizer
+        // produce an identical token-id stream to `Tokenizer::encode_batch_fast`
+        // without paying the per-warm-call HashMap rebuild. Falls through
+        // to the slow batched path only for tokenizers we couldn't recognize
+        // as BertNormalizer+BertPreTokenizer+WordPiece at load time.
+        let Some(fast) = self.fast.as_ref() else {
+            return self.encode(&[query.to_owned()]);
+        };
+        let dim = self.dim();
+        let mut output = Array2::<f32>::zeros((1, dim));
+        let truncated = truncate_chars(query, 512 * self.median_token_length);
+        let mut token_ids: Vec<u32> = Vec::new();
+        fast.dim_independent_encode(truncated, &mut token_ids);
+        if let Some(unk) = self.unk_token_id {
+            token_ids.retain(|id| *id != unk);
+        }
+        if token_ids.len() > 512 {
+            token_ids.truncate(512);
+        }
+        if !token_ids.is_empty() {
+            self.fold_embeddings_into_row(&token_ids, &mut output, 0);
+        }
+        if self.normalize {
+            normalize_row(output.row_mut(0));
+        }
+        output
     }
 }
 
@@ -506,9 +808,9 @@ fn read_f32_matrix_parallel(
         return Array2::from_shape_vec((rows, cols), values)
             .map_err(|err| AppError::internal(format!("reshape embeddings: {err}")));
     }
-    let total = rows.checked_mul(cols).ok_or_else(|| {
-        AppError::internal("embedding matrix dimensions overflow".to_string())
-    })?;
+    let total = rows
+        .checked_mul(cols)
+        .ok_or_else(|| AppError::internal("embedding matrix dimensions overflow".to_string()))?;
     let body = total
         .checked_mul(4)
         .ok_or_else(|| AppError::internal("embedding matrix bytes overflow".to_string()))?;
@@ -522,9 +824,8 @@ fn read_f32_matrix_parallel(
     // Safety: `total` matches `cols * rows`; the parallel copy below
     // initializes every element before we hand the Vec out.
     unsafe { buffer.set_len(total) };
-    let dst_bytes: &mut [u8] = unsafe {
-        std::slice::from_raw_parts_mut(buffer.as_mut_ptr() as *mut u8, body)
-    };
+    let dst_bytes: &mut [u8] =
+        unsafe { std::slice::from_raw_parts_mut(buffer.as_mut_ptr() as *mut u8, body) };
     // 1 MiB stripes keep cache pressure local on each worker while still
     // letting rayon issue several outstanding writes in parallel. Empirically
     // this hits the WSL2 memory bus's parallel-write sweet spot; coarser

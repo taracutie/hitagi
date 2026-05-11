@@ -11,6 +11,7 @@ pub mod chunk_store;
 pub mod chunker;
 pub mod dense;
 pub mod engine;
+pub mod fast_wp;
 pub mod fuse;
 pub mod model2vec;
 pub mod model_cache;
