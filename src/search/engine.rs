@@ -133,10 +133,22 @@ fn query_selector(
 /// payload (chunks + BM25 + mappings + signatures + timestamp) ready for
 /// `search_*` to use.
 pub fn ensure_sparse(repo: &RepoRoot, cache: &mut ParseCache) -> AppResult<SparsePayload> {
-    let walked = walk_for_index(repo, &WalkOptions::default(), None)?;
+    // Walk + signature snapshot (~25 ms on the web repo) and the four
+    // SQLite-blob decodes inside `load_sparse` (~30 ms via rayon::join
+    // there) are independent ~ the persisted blob doesn't depend on
+    // whether the on-disk file set has changed. Fan them out via
+    // `rayon::join` so the longer side bounds the wall instead of their
+    // sum. The mismatch case still rebuilds; on a hit (the overwhelmingly
+    // common case) we skip the wait that the sequential ordering used to
+    // impose.
+    let (walked_result, persisted_result) = rayon::join(
+        || walk_for_index(repo, &WalkOptions::default(), None),
+        || load_sparse(cache),
+    );
+    let walked = walked_result?;
     let signatures = make_signatures(&walked);
 
-    if let Some(persisted) = load_sparse(cache)? {
+    if let Some(persisted) = persisted_result? {
         if signatures_match(&persisted.signatures, &signatures) {
             return Ok(persisted);
         }
@@ -438,6 +450,57 @@ pub fn ensure_dense(
     model_fingerprint: &str,
     model_files_meta: &str,
 ) -> AppResult<DensePayload> {
+    ensure_dense_with_hint(
+        cache,
+        sparse,
+        encoder,
+        encoder_kind,
+        model_id,
+        model_fingerprint,
+        model_files_meta,
+        None,
+    )
+}
+
+/// Same as `ensure_dense`, but lets the caller hand in a `Array2<f32>` that
+/// was speculatively mmap+memcpy'd on another thread in parallel with the
+/// sparse and encoder loads. We validate the hint against the cached
+/// metadata: if encoder + fingerprint + chunk count + dim all line up, we
+/// adopt the speculative matrix and skip the sequential `load_dense` IO
+/// entirely. A failed validation (or no hint) falls through to the
+/// classic path so the slow lane stays identical to before.
+pub fn ensure_dense_with_hint(
+    cache: &mut ParseCache,
+    sparse: &SparsePayload,
+    encoder: &dyn Encoder,
+    encoder_kind: &str,
+    model_id: &str,
+    model_fingerprint: &str,
+    model_files_meta: &str,
+    hint: Option<Array2<f32>>,
+) -> AppResult<DensePayload> {
+    if let Some(hint_vectors) = hint {
+        // Speculative load only adopted when the cached metadata says the
+        // same encoder + fingerprint + shape produced it. The metadata
+        // lookup is a sub-millisecond SQLite read.
+        if let Some(meta) = cache.lookup_search_dense_metadata() {
+            let shape_ok = hint_vectors.nrows() == sparse.chunks.len()
+                && hint_vectors.ncols() == encoder.dim();
+            let meta_ok = meta.encoder_kind == encoder_kind
+                && meta.model_fingerprint == model_fingerprint
+                && meta.dim == encoder.dim();
+            if shape_ok && meta_ok {
+                return Ok(DensePayload {
+                    vectors: super::dense::DenseIndex::from_normalized(hint_vectors),
+                    encoder_kind: meta.encoder_kind,
+                    model_id: meta.model_id,
+                    model_fingerprint: meta.model_fingerprint,
+                    built_at_unix_secs: meta.built_at_unix_secs,
+                    model_files_meta: meta.model_files_meta,
+                });
+            }
+        }
+    }
     if let Some(persisted) = load_dense(cache)? {
         let fingerprint_ok = persisted.encoder_kind == encoder_kind
             && persisted.model_fingerprint == model_fingerprint

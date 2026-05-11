@@ -42,8 +42,18 @@ use crate::{
 // v10 LZ4-frames the large search blobs (bm25, chunks, file/language mapping,
 // signatures). Compression typically shrinks them ~3x, which cuts the SQLite
 // blob-fetch step on warm searches by roughly the same factor.
-const CACHE_VERSION_KEY: &str = concat!("v10-", env!("CARGO_PKG_VERSION"));
-const CACHE_FILE_NAME: &str = "index.v10.sqlite";
+// v11 splits the dense vector matrix out into a sibling `dense.v11.bin`
+// file as a raw f32 LE matrix with a 16-byte header. The previous bincoded
+// blob spent ~95 ms on a 32 MB matrix; the mmap + `copy_from_slice` load
+// path replaces that with one memcpy. v10 caches are dropped on first use.
+// v12 moves the BM25 postings blob (5+ MB on a 30k-chunk repo) out of
+// SQLite into a sibling `bm25.v12.bin` file. SQLite was serializing the
+// BLOB read against the small metadata BLOBs in `lookup_search_sparse`;
+// splitting it lets a worker thread read bm25 + chunks files in parallel
+// with the SQLite SELECT, dropping the warm-cache load_sparse wall by
+// ~15-20 ms on the web repo. v11 caches are dropped on first use.
+const CACHE_VERSION_KEY: &str = concat!("v12-", env!("CARGO_PKG_VERSION"));
+const CACHE_FILE_NAME: &str = "index.v12.sqlite";
 
 #[derive(Clone)]
 struct FileEntry {
@@ -452,32 +462,42 @@ impl ParseCache {
             return None;
         }
         let chunks_path = self.chunks_blob_path();
+        let bm25_path = self.bm25_blob_path();
+        // Kick off both sibling-file reads in threads BEFORE the SQLite
+        // query so the ~18 MB chunks.v12.bin and ~5 MB bm25.v12.bin reads
+        // overlap with the small-BLOB SELECT instead of paying serially.
+        // `Connection` is `!Sync`, so it can't ride into a rayon worker;
+        // std::thread::spawn sidesteps the Send-of-reference issue by
+        // reading from moved owned PathBufs.
+        let chunks_handle = std::thread::spawn(move || std::fs::read(&chunks_path).ok());
+        let bm25_handle = std::thread::spawn(move || std::fs::read(&bm25_path).ok());
         let conn = self.ensure_read_conn()?;
         let mut row: SearchSparseRow = conn
             .query_row(
-                "SELECT bm25_blob, signatures_blob, file_mapping_blob,
+                "SELECT signatures_blob, file_mapping_blob,
                     language_mapping_blob, built_at_unix_secs,
                     indexed_files, indexed_chunks, language_counts_blob
              FROM search_sparse WHERE rowid = 1",
                 [],
                 |row| {
                     Ok(SearchSparseRow {
-                        bm25_blob: row.get(0)?,
-                        signatures_blob: row.get(1)?,
+                        bm25_blob: Vec::new(),
+                        signatures_blob: row.get(0)?,
                         chunks_blob: Vec::new(),
-                        file_mapping_blob: row.get(2)?,
-                        language_mapping_blob: row.get(3)?,
-                        built_at_unix_secs: row.get(4)?,
-                        indexed_files: row.get::<_, i64>(5)? as usize,
-                        indexed_chunks: row.get::<_, i64>(6)? as usize,
-                        language_counts_blob: row.get(7)?,
+                        file_mapping_blob: row.get(1)?,
+                        language_mapping_blob: row.get(2)?,
+                        built_at_unix_secs: row.get(3)?,
+                        indexed_files: row.get::<_, i64>(4)? as usize,
+                        indexed_chunks: row.get::<_, i64>(5)? as usize,
+                        language_counts_blob: row.get(6)?,
                     })
                 },
             )
             .optional()
             .ok()
             .flatten()?;
-        row.chunks_blob = std::fs::read(&chunks_path).ok()?;
+        row.chunks_blob = chunks_handle.join().ok().flatten()?;
+        row.bm25_blob = bm25_handle.join().ok().flatten()?;
         Some(row)
     }
 
@@ -485,7 +505,22 @@ impl ParseCache {
     /// cache_dir as the SQLite file, versioned via the file name so a
     /// schema bump invalidates both at once.
     pub(crate) fn chunks_blob_path(&self) -> PathBuf {
-        self.cache_dir.join("chunks.v10.bin")
+        self.cache_dir.join("chunks.v12.bin")
+    }
+
+    /// Where the sibling dense vector blob file lives. Same versioning
+    /// strategy as `chunks_blob_path`. Stored as a raw f32 LE matrix so the
+    /// hot load path can `mmap` + `copy_from_slice` instead of paying for a
+    /// bincode pass over ~8M floats. See `read_dense_vectors_file`.
+    pub(crate) fn dense_blob_path(&self) -> PathBuf {
+        self.cache_dir.join("dense.v12.bin")
+    }
+
+    /// Where the sibling BM25 postings blob file lives. Moved out of
+    /// SQLite in v12 so a worker thread can stream this multi-MB file in
+    /// parallel with the small-BLOB SELECT and the chunks file read.
+    pub(crate) fn bm25_blob_path(&self) -> PathBuf {
+        self.cache_dir.join("bm25.v12.bin")
     }
 
     /// Look up the persisted dense-index payload for this repo. Returns
@@ -556,6 +591,7 @@ impl ParseCache {
             return;
         }
         let chunks_path = self.chunks_blob_path();
+        let bm25_path = self.bm25_blob_path();
         let retry = {
             let Some(conn) = self.ensure_write_conn() else {
                 return;
@@ -573,11 +609,12 @@ impl ParseCache {
                 return;
             }
         }
-        // Write chunks blob after SQLite write lands. Doing it before would
-        // race with ensure_write_conn / recreate_cache_file, which can wipe
-        // the cache_dir contents (including the chunks file we just wrote)
-        // when the SQLite tables fail their schema check.
+        // Write sibling blobs after SQLite write lands. Doing it before
+        // would race with ensure_write_conn / recreate_cache_file, which
+        // can wipe the cache_dir contents (including the files we just
+        // wrote) when the SQLite tables fail their schema check.
         let _ = atomic_write(&chunks_path, &row.chunks_blob);
+        let _ = atomic_write(&bm25_path, &row.bm25_blob);
     }
 
     /// Write the dense-index payload (overwrites any existing row). Same
@@ -610,14 +647,19 @@ impl ParseCache {
             return Ok(false);
         }
         let chunks_path = self.chunks_blob_path();
-        let chunks_existed = chunks_path.exists();
+        let dense_path = self.dense_blob_path();
+        let bm25_path = self.bm25_blob_path();
+        let sibling_existed =
+            chunks_path.exists() || dense_path.exists() || bm25_path.exists();
         let _ = std::fs::remove_file(&chunks_path);
+        let _ = std::fs::remove_file(&dense_path);
+        let _ = std::fs::remove_file(&bm25_path);
         let Some(conn) = self.ensure_write_conn() else {
-            return Ok(chunks_existed);
+            return Ok(sibling_existed);
         };
         let cleared_sparse = conn.execute("DELETE FROM search_sparse", []).unwrap_or(0);
         let cleared_dense = conn.execute("DELETE FROM search_dense", []).unwrap_or(0);
-        Ok(cleared_sparse + cleared_dense > 0 || chunks_existed)
+        Ok(cleared_sparse + cleared_dense > 0 || sibling_existed)
     }
 
     /// Inspect the on-disk presence of the search-index rows without
@@ -627,7 +669,8 @@ impl ParseCache {
         let repo_root_str = repo_root.to_string_lossy().into_owned();
         let cache_dir = resolve_cache_dir(&repo_root_str);
         let cache_file = cache_dir.as_ref().map(|d| d.join(CACHE_FILE_NAME));
-        let chunks_file = cache_dir.as_ref().map(|d| d.join("chunks.v10.bin"));
+        let chunks_file = cache_dir.as_ref().map(|d| d.join("chunks.v12.bin"));
+        let dense_file = cache_dir.as_ref().map(|d| d.join("dense.v12.bin"));
         let mut inspection = SearchIndexInspection::default();
         let Some(file) = cache_file else {
             return inspection;
@@ -673,7 +716,7 @@ impl ParseCache {
         }
         if let Ok(meta) = conn.query_row(
             "SELECT encoder_kind, model_id, model_fingerprint, dim,
-                    LENGTH(vectors_blob), built_at_unix_secs
+                    built_at_unix_secs
              FROM search_dense WHERE rowid = 1",
             [],
             |row| {
@@ -682,18 +725,22 @@ impl ParseCache {
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, i64>(3)? as usize,
-                    row.get::<_, i64>(4)? as usize,
-                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(4)?,
                 ))
             },
         ) {
-            inspection.dense_present = true;
+            let dense_bytes = dense_file
+                .as_ref()
+                .and_then(|p| std::fs::metadata(p).ok())
+                .map(|m| m.len() as usize)
+                .unwrap_or(0);
+            inspection.dense_present = dense_bytes > 0;
             inspection.dense_encoder_kind = Some(meta.0);
             inspection.dense_model_id = Some(meta.1);
             inspection.dense_model_fingerprint = Some(meta.2);
             inspection.dense_dim = Some(meta.3);
-            inspection.dense_vectors_bytes = meta.4;
-            inspection.dense_built_at_unix_secs = Some(meta.5);
+            inspection.dense_vectors_bytes = dense_bytes;
+            inspection.dense_built_at_unix_secs = Some(meta.4);
         }
         inspection
     }
@@ -843,7 +890,7 @@ impl ParseCache {
 
         match Connection::open_with_flags(&self.cache_file, OpenFlags::SQLITE_OPEN_READ_WRITE) {
             Ok(conn) if validate_db(&conn, &self.repo_root) => {
-
+                apply_read_pragmas(&conn);
                 self.conn = Some(conn);
                 self.conn.as_ref()
             }
@@ -1068,6 +1115,27 @@ fn resolve_cache_dir(repo_root: &str) -> Option<PathBuf> {
 }
 
 
+/// Tune the connection for our access pattern: one short-lived process per
+/// command, reading a handful of multi-MB BLOBs. Mmap'ing the file lets the
+/// OS page in only the overflow pages the SELECT actually touches and skips
+/// the page cache → user buffer memcpy that bundled SQLite's default
+/// `pread()` path does. Failures are silent ~ the PRAGMA returns are
+/// informational and the read path is correct without them, just slower.
+fn apply_read_pragmas(conn: &Connection) {
+    // 256 MiB ceiling. SQLite caps at the file size so this only pages in
+    // what's actually touched; matches the chunks blob's ~30 MB upper bound
+    // with headroom for larger repos.
+    let _ = conn.pragma_update(None, "mmap_size", 268435456i64);
+    // Page cache: ~16 MiB of pages (-16000 = 16000 × 1 KiB pages, with the
+    // negative-value convention SQLite uses for KiB units). Helps the BLOB
+    // SELECT keep its overflow pages in memory for the duration of the
+    // query without forcing a second pread cycle.
+    let _ = conn.pragma_update(None, "cache_size", -16000i64);
+    // Keep transient indexes / temp tables in RAM instead of spilling to
+    // /tmp; matters for the BLOB SELECT's internal sort/merge paths.
+    let _ = conn.pragma_update(None, "temp_store", "MEMORY");
+}
+
 fn init_db(conn: &Connection, repo_root: &str) -> rusqlite::Result<()> {
     conn.execute_batch(
         "
@@ -1183,11 +1251,12 @@ fn write_search_sparse_row(conn: &Connection, row: &SearchSparseRow) -> rusqlite
             indexed_chunks = excluded.indexed_chunks,
             language_counts_blob = excluded.language_counts_blob",
         params![
-            row.bm25_blob,
+            // bm25_blob and chunks_blob columns are kept in the schema for
+            // back-compat with any v11 row that still has them inline; new
+            // (v12+) writes only store an empty marker because the real
+            // bytes live in bm25.v12.bin / chunks.v12.bin alongside.
+            Vec::<u8>::new(),
             row.signatures_blob,
-            // chunks_blob column is kept in the schema for back-compat with
-            // any v10 row that still has it inline; new writes only store
-            // an empty marker because the real bytes live in chunks.v10.bin.
             Vec::<u8>::new(),
             row.file_mapping_blob,
             row.language_mapping_blob,

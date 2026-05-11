@@ -372,49 +372,91 @@ pub fn search(repo: &RepoRoot, query: &str, opts: SearchOptions) -> AppResult<Se
         return Err(AppError::bad_request("--limit must be at least 1"));
     }
 
-    let mut cache = ParseCache::open(repo.root());
-    let sparse = search::engine::ensure_sparse(repo, &mut cache)?;
     let mut warnings: Vec<String> = Vec::new();
-    if sparse.chunks.is_empty() {
-        warnings.push("repo has no indexable files".to_string());
-    }
     let exclude_set = build_exclude_set(&opts.excludes)?;
-
     let mode_label = opts.mode.as_str().to_string();
+
+    let sparse;
     let output = match opts.mode {
-        SearchModeArg::Bm25 => search::engine::run_bm25(
-            &sparse,
-            query,
-            opts.limit,
-            &opts.languages,
-            &opts.paths,
-            exclude_set.as_ref(),
-        ),
+        SearchModeArg::Bm25 => {
+            let mut cache = ParseCache::open(repo.root());
+            sparse = search::engine::ensure_sparse(repo, &mut cache)?;
+            if sparse.chunks.is_empty() {
+                warnings.push("repo has no indexable files".to_string());
+            }
+            search::engine::run_bm25(
+                &sparse,
+                query,
+                opts.limit,
+                &opts.languages,
+                &opts.paths,
+                exclude_set.as_ref(),
+            )
+        }
         SearchModeArg::Hybrid | SearchModeArg::Semantic => {
-            let (encoder, encoder_kind, model_id, fingerprint, files_meta, encoder_warning) =
-                load_encoder_with_policy(
-                    &mut cache,
-                    opts.hashing,
-                    opts.no_download,
-                    opts.offline,
-                    opts.model.as_deref(),
-                )?;
-            if let Some(w) = encoder_warning {
+            // Three independent IO chunks dominate the warm-search wall:
+            //   sparse-index load    (~75 ms: walk + SQLite + BM25/chunk decode)
+            //   encoder load         (~85 ms: tokenizer + safetensors)
+            //   dense-matrix file IO (~30 ms: mmap + memcpy of 30+ MB f32)
+            // The dense matrix is just bytes ~ we don't need the encoder or
+            // the SQLite metadata to read it. So we mmap+memcpy it
+            // speculatively on a third rayon worker and adopt it in
+            // `ensure_dense_with_hint` once the cached fingerprint check
+            // confirms the bytes match this encoder. On a mismatch (rare:
+            // model swap / corruption) the hint is dropped and the regular
+            // load_dense → build_dense path takes over, so the slow lane is
+            // unchanged.
+            let prepared = prepare_encoder_load(
+                opts.hashing,
+                opts.no_download,
+                opts.offline,
+                opts.model.as_deref(),
+            )?;
+            let repo_ref = repo;
+            let dense_path =
+                ParseCache::cache_dir_for(repo_ref.root()).map(|d| d.join("dense.v12.bin"));
+            let (sparse_result, (encoder_result, dense_hint)) = rayon::join(
+                || -> AppResult<(ParseCache, search::persist::SparsePayload)> {
+                    let mut cache_inner = ParseCache::open(repo_ref.root());
+                    let sparse = search::engine::ensure_sparse(repo_ref, &mut cache_inner)?;
+                    Ok((cache_inner, sparse))
+                },
+                || {
+                    rayon::join(
+                        || load_encoder_files(&prepared),
+                        || -> Option<ndarray::Array2<f32>> {
+                            dense_path
+                                .as_ref()
+                                .and_then(|p| search::persist::load_dense_vectors_speculative(p))
+                        },
+                    )
+                },
+            );
+            let (mut cache, sparse_payload) = sparse_result?;
+            sparse = sparse_payload;
+            if sparse.chunks.is_empty() {
+                warnings.push("repo has no indexable files".to_string());
+            }
+            let mut encoder_load = encoder_result?;
+            if let Some(w) = encoder_load.warning.take() {
                 warnings.push(w);
             }
-            let dense = search::engine::ensure_dense(
+            let (fingerprint, files_meta) =
+                reconcile_dense_fingerprint(&mut cache, &prepared, &encoder_load);
+            let dense = search::engine::ensure_dense_with_hint(
                 &mut cache,
                 &sparse,
-                encoder.as_ref(),
-                &encoder_kind,
-                &model_id,
+                encoder_load.encoder.as_ref(),
+                &encoder_load.kind,
+                &encoder_load.model_id,
                 &fingerprint,
                 &files_meta,
+                dense_hint,
             )?;
             match opts.mode {
                 SearchModeArg::Semantic => search::engine::run_semantic(
                     &sparse,
-                    encoder.as_ref(),
+                    encoder_load.encoder.as_ref(),
                     &dense.vectors,
                     query,
                     opts.limit,
@@ -424,7 +466,7 @@ pub fn search(repo: &RepoRoot, query: &str, opts: SearchOptions) -> AppResult<Se
                 )?,
                 SearchModeArg::Hybrid => search::engine::run_hybrid(
                     &sparse,
-                    encoder.as_ref(),
+                    encoder_load.encoder.as_ref(),
                     &dense.vectors,
                     query,
                     opts.limit,
@@ -481,9 +523,43 @@ pub fn find_related(
     // a subdir).
     let resolved = repo.resolve_file(path)?;
 
-    let mut cache = ParseCache::open(repo.root());
-    let sparse = search::engine::ensure_sparse(repo, &mut cache)?;
     let mut warnings: Vec<String> = Vec::new();
+    // Three-way fan-out mirrors `search()`: the sparse-index load, encoder
+    // load, and the raw dense-matrix mmap+memcpy are independent IO chunks.
+    // Speculatively load the dense file alongside the others; the cached
+    // metadata check decides whether to adopt it after we already have a
+    // ParseCache + encoder in hand. The slow path (mismatch) drops the hint
+    // and falls back to the classic `load_dense → build_dense` lane.
+    let prepared = prepare_encoder_load(
+        opts.hashing,
+        opts.no_download,
+        opts.offline,
+        opts.model.as_deref(),
+    )?;
+    let repo_ref = repo;
+    let dense_path =
+        ParseCache::cache_dir_for(repo_ref.root()).map(|d| d.join("dense.v11.bin"));
+    let (sparse_result, (encoder_result, dense_hint)) = rayon::join(
+        || -> AppResult<(ParseCache, search::persist::SparsePayload)> {
+            let mut cache_inner = ParseCache::open(repo_ref.root());
+            let sparse = search::engine::ensure_sparse(repo_ref, &mut cache_inner)?;
+            Ok((cache_inner, sparse))
+        },
+        || {
+            rayon::join(
+                || load_encoder_files(&prepared),
+                || -> Option<ndarray::Array2<f32>> {
+                    let path = dense_path.as_ref()?;
+                    search::persist::load_dense_vectors_speculative(path)
+                },
+            )
+        },
+    );
+    let (mut cache, sparse) = sparse_result?;
+    let mut encoder_load = encoder_result?;
+    if let Some(w) = encoder_load.warning.take() {
+        warnings.push(w);
+    }
 
     let chunk_id = search::engine::find_chunk_at_line(&sparse, &resolved.relative_path, line)
         .ok_or_else(|| {
@@ -494,25 +570,17 @@ pub fn find_related(
         })?;
     let source_chunk = sparse.chunks.to_indexed(chunk_id);
 
-    let (encoder, encoder_kind, model_id, fingerprint, files_meta, encoder_warning) =
-        load_encoder_with_policy(
-            &mut cache,
-            opts.hashing,
-            opts.no_download,
-            opts.offline,
-            opts.model.as_deref(),
-        )?;
-    if let Some(w) = encoder_warning {
-        warnings.push(w);
-    }
-    let dense = search::engine::ensure_dense(
+    let (fingerprint, files_meta) =
+        reconcile_dense_fingerprint(&mut cache, &prepared, &encoder_load);
+    let dense = search::engine::ensure_dense_with_hint(
         &mut cache,
         &sparse,
-        encoder.as_ref(),
-        &encoder_kind,
-        &model_id,
+        encoder_load.encoder.as_ref(),
+        &encoder_load.kind,
+        &encoder_load.model_id,
         &fingerprint,
         &files_meta,
+        dense_hint,
     )?;
 
     let started = std::time::Instant::now();
@@ -522,7 +590,7 @@ pub fn find_related(
     allowed.retain(|&id| id != chunk_id);
     let mut hits = search::fuse::search_semantic(
         &source_chunk.content,
-        encoder.as_ref(),
+        encoder_load.encoder.as_ref(),
         &dense.vectors,
         &sparse.chunks,
         opts.limit,
@@ -557,6 +625,156 @@ pub fn find_related(
         warnings,
         results,
     })
+}
+
+/// CLI-derived encoder configuration, computed once up-front so the
+/// thread-bound `load_encoder_files` can do all the IO without touching
+/// either the policy logic or the cache.
+struct EncoderRequest {
+    hashing: bool,
+    offline: bool,
+    no_download: bool,
+    /// `None` when `--hashing` is passed (we skip the model entirely).
+    options: Option<search::model2vec::ModelOptions>,
+}
+
+/// File-IO-only result of loading the encoder. The fingerprint is *not*
+/// resolved here ~ that step needs `ParseCache` and is done by
+/// `reconcile_dense_fingerprint` after the parallel join.
+struct EncoderLoad {
+    encoder: Box<dyn search::model2vec::Encoder>,
+    kind: String,
+    model_id: String,
+    warning: Option<String>,
+    /// Cheap `(mtime, len)` tuple of the model files. Set to `None` when the
+    /// encoder is the hashing fallback (no files to stat).
+    current_files_meta: Option<String>,
+    /// Empty unless `current_files_meta` was unset and we still need a
+    /// fingerprint; carries the model options used to load.
+    fingerprint_options: Option<search::model2vec::ModelOptions>,
+}
+
+fn prepare_encoder_load(
+    hashing: bool,
+    no_download: bool,
+    offline: bool,
+    model: Option<&str>,
+) -> AppResult<EncoderRequest> {
+    let options = if hashing {
+        None
+    } else {
+        let policy = if offline {
+            search::model2vec::ModelLoadPolicy::Offline
+        } else if no_download {
+            search::model2vec::ModelLoadPolicy::NoDownload
+        } else {
+            search::model2vec::ModelLoadPolicy::AllowDownload
+        };
+        Some(search::model2vec::ModelOptions::new(model, policy))
+    };
+    Ok(EncoderRequest {
+        hashing,
+        offline,
+        no_download,
+        options,
+    })
+}
+
+/// Cache-free portion of encoder loading: open the model files, build the
+/// encoder, and stat the files for `model_files_meta`. Runs on a worker
+/// thread alongside `ensure_sparse`.
+fn load_encoder_files(req: &EncoderRequest) -> AppResult<EncoderLoad> {
+    if req.hashing {
+        let encoder = search::model2vec::HashingEncoder::new(search::model2vec::DEFAULT_DIM);
+        return Ok(EncoderLoad {
+            encoder: Box::new(encoder),
+            kind: "hashing".to_string(),
+            model_id: format!("hashing-{}", search::model2vec::DEFAULT_DIM),
+            warning: None,
+            current_files_meta: Some(String::new()),
+            fingerprint_options: None,
+        });
+    }
+    let options = req
+        .options
+        .clone()
+        .expect("non-hashing request always carries ModelOptions");
+    search::model_cache::ensure_hf_home();
+    let model_status = search::model2vec::model_status(Some(&options.model));
+    if matches!(options.policy, search::model2vec::ModelLoadPolicy::AllowDownload)
+        && !model_status.available()
+    {
+        eprintln!(
+            "hitagi: index: downloading embedding model {} (first run may take a while)",
+            options.model
+        );
+    } else {
+        eprintln!("hitagi: index: loading embedding model {}", options.model);
+    }
+    match search::model2vec::load_model(&options) {
+        Ok(encoder) => {
+            let current = search::model2vec::model_files_meta(&options).ok();
+            Ok(EncoderLoad {
+                encoder,
+                kind: "model2vec".to_string(),
+                model_id: options.model.clone(),
+                warning: None,
+                current_files_meta: current,
+                fingerprint_options: Some(options),
+            })
+        }
+        Err(err) if req.offline || req.no_download => {
+            let encoder =
+                search::model2vec::HashingEncoder::new(search::model2vec::DEFAULT_DIM);
+            Ok(EncoderLoad {
+                encoder: Box::new(encoder),
+                kind: "hashing".to_string(),
+                model_id: format!("hashing-{}", search::model2vec::DEFAULT_DIM),
+                warning: Some(format!(
+                    "model unavailable ({err}); falling back to hashing encoder"
+                )),
+                current_files_meta: Some(String::new()),
+                fingerprint_options: None,
+            })
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Resolve the dense fingerprint + files_meta tuple. Uses the cached row's
+/// fast-path when the on-disk files haven't changed; otherwise rehashes the
+/// model files. Always returns a usable `(fingerprint, files_meta)` pair
+/// (hashing encoder, missing model, etc. fall back to deterministic strings).
+fn reconcile_dense_fingerprint(
+    cache: &mut ParseCache,
+    req: &EncoderRequest,
+    load: &EncoderLoad,
+) -> (String, String) {
+    if req.hashing {
+        let id = format!("hashing-{}", search::model2vec::DEFAULT_DIM);
+        return (id, String::new());
+    }
+    let Some(options) = load.fingerprint_options.as_ref() else {
+        // Hashing-fallback path: same shape as the explicit --hashing branch.
+        return (load.model_id.clone(), String::new());
+    };
+    let cached = cache.lookup_search_dense_metadata();
+    let current = load.current_files_meta.clone();
+    match (&cached, &current) {
+        (Some(row), Some(meta))
+            if row.encoder_kind == "model2vec"
+                && row.model_id == options.model
+                && !row.model_files_meta.is_empty()
+                && row.model_files_meta == *meta =>
+        {
+            (row.model_fingerprint.clone(), meta.clone())
+        }
+        _ => {
+            let fp = search::model2vec::model_fingerprint(options)
+                .unwrap_or_else(|_| options.model.clone());
+            (fp, current.unwrap_or_default())
+        }
+    }
 }
 
 /// Resolve the encoder requested by the CLI flags, applying the

@@ -17,6 +17,7 @@ pub mod model_cache;
 pub mod persist;
 pub mod ranking;
 pub mod sparse;
+pub mod tokenizer_cache;
 pub mod tokens;
 pub mod types;
 pub mod walker;

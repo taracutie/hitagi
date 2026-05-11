@@ -1,8 +1,7 @@
 use std::{
-    cell::OnceCell,
     collections::HashSet,
     path::{Component, Path, PathBuf},
-    sync::Mutex,
+    sync::{Mutex, OnceLock},
 };
 
 use ignore::{WalkBuilder, WalkState};
@@ -21,10 +20,12 @@ pub struct ResolvedPath {
 pub struct RepoRoot {
     root: PathBuf,
     /// Lazy gitignore-respected file/dir index used by suffix-resolution.
-    /// Built on first miss and reused for the rest of the command. `OnceCell`
-    /// gives us interior mutability without thread sync overhead ~ a single
-    /// command's resolve calls happen on the orchestrator thread.
-    file_index: OnceCell<RepoFileIndex>,
+    /// Built on first miss and reused for the rest of the command.
+    /// `OnceLock` adds an atomic load on read vs `OnceCell`'s plain pointer
+    /// check; in exchange `RepoRoot` is `Sync`, so the search command can
+    /// hand `&RepoRoot` to a rayon worker that runs the sparse-index walk
+    /// in parallel with encoder loading.
+    file_index: OnceLock<RepoFileIndex>,
 }
 
 /// Visible (gitignore-respected) repo paths held in memory so suffix-resolution
@@ -35,14 +36,14 @@ pub struct RepoRoot {
 /// fixture or a repo where gitignore filtered everything).
 struct RepoFileIndex {
     files: Vec<String>,
-    dirs: OnceCell<HashSet<String>>,
+    dirs: OnceLock<HashSet<String>>,
 }
 
 impl RepoFileIndex {
     fn from_files(files: Vec<String>) -> Self {
         Self {
             files,
-            dirs: OnceCell::new(),
+            dirs: OnceLock::new(),
         }
     }
 
@@ -119,7 +120,7 @@ impl RepoRoot {
     pub fn new(root: PathBuf) -> Self {
         Self {
             root,
-            file_index: OnceCell::new(),
+            file_index: OnceLock::new(),
         }
     }
 
