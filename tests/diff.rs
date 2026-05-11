@@ -10,7 +10,7 @@ use assert_cmd::Command;
 use hitagi::{
     commands::{
         self as app_commands, DiffBodyMode, DiffFileOptions, DiffOptions, DiffScope,
-        DiffSummaryOptions,
+        DiffSummaryOptions, MAX_FILE_BYTES,
     },
     repo::RepoRoot,
 };
@@ -76,6 +76,14 @@ impl DiffRepo {
     }
 
     fn write(&self, rel: &str, body: &str) {
+        let path = self.repo.join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, body).unwrap();
+    }
+
+    fn write_bytes(&self, rel: &str, body: &[u8]) {
         let path = self.repo.join(rel);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).unwrap();
@@ -431,8 +439,70 @@ fn overview_includes_untracked() {
         .find(|f| f["path"] == "notes.txt")
         .expect("untracked entry should appear");
     assert_eq!(entry["status"], "?");
+    assert_eq!(entry["added"], 1);
+    assert_eq!(entry["removed"], 0);
+}
+
+#[test]
+fn untracked_overview_multiline_added() {
+    let r = DiffRepo::new("untracked-multiline");
+    r.write("base.rs", "pub fn base() {}\n");
+    r.commit("base");
+    r.write("notes.txt", "alpha\nbeta\ngamma\n");
+
+    let v = r.run(&["diff"]);
+    let entry = v["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["path"] == "notes.txt")
+        .expect("untracked entry should appear");
+    assert_eq!(entry["status"], "?");
+    assert_eq!(entry["added"], 3);
+    assert_eq!(entry["removed"], 0);
+    assert!(entry.get("binary").is_none(), "text file should not be flagged binary");
+}
+
+#[test]
+fn untracked_overview_binary_emits_no_count() {
+    let r = DiffRepo::new("untracked-binary");
+    r.write("base.rs", "pub fn base() {}\n");
+    r.commit("base");
+    r.write_bytes("blob.bin", b"alpha\0beta\0gamma");
+
+    let v = r.run(&["diff"]);
+    let entry = v["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["path"] == "blob.bin")
+        .expect("untracked entry should appear");
+    assert_eq!(entry["status"], "?");
     assert!(entry.get("added").is_none());
     assert!(entry.get("removed").is_none());
+    assert_eq!(entry["binary"], true);
+}
+
+#[test]
+fn untracked_overview_oversize_emits_no_count() {
+    let r = DiffRepo::new("untracked-oversize");
+    r.write("base.rs", "pub fn base() {}\n");
+    r.commit("base");
+    // One byte over the limit so the metadata short-circuit triggers without
+    // pulling a full read into memory.
+    r.write_bytes("huge.txt", &vec![b'x'; MAX_FILE_BYTES + 1]);
+
+    let v = r.run(&["diff"]);
+    let entry = v["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["path"] == "huge.txt")
+        .expect("untracked entry should appear");
+    assert_eq!(entry["status"], "?");
+    assert!(entry.get("added").is_none());
+    assert!(entry.get("removed").is_none());
+    assert!(entry.get("binary").is_none(), "oversize is not the binary branch");
 }
 
 #[test]

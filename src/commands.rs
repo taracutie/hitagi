@@ -2084,16 +2084,18 @@ pub fn diff_overview(repo: &RepoRoot, opts: DiffOptions) -> AppResult<DiffOvervi
             filtered_count += 1;
             continue;
         };
+        let abs_path = repo.root().join(&repo_path);
+        let (added, removed, binary) = untracked_line_stats(&abs_path);
         summaries.push(DiffFileSummary {
             path: repo_path,
             status: UNTRACKED_STATUS.to_string(),
             old_path: None,
             old_path_needs_prefix: false,
-            added: None,
-            removed: None,
+            added,
+            removed,
             staged: false,
             unstaged: false,
-            binary: false,
+            binary,
             note: None,
         });
     }
@@ -3155,6 +3157,28 @@ fn count_added_lines(content: &str) -> usize {
     } else {
         content.lines().count()
     }
+}
+
+/// Returns `(added, removed, binary)` for an untracked file. IO error or
+/// oversize → `(None, None, false)` so the overview silently skips counts
+/// instead of failing the whole listing for one unreadable file.
+fn untracked_line_stats(abs_path: &Path) -> (Option<usize>, Option<usize>, bool) {
+    let Ok(metadata) = std::fs::metadata(abs_path) else {
+        return (None, None, false);
+    };
+    if metadata.len() > MAX_FILE_BYTES as u64 {
+        return (None, None, false);
+    }
+    let Ok(bytes) = std::fs::read(abs_path) else {
+        return (None, None, false);
+    };
+    if bytes.contains(&0) {
+        return (None, None, true);
+    }
+    let Ok(content) = std::str::from_utf8(&bytes) else {
+        return (None, None, true);
+    };
+    (Some(count_added_lines(content)), Some(0), false)
 }
 
 fn synthetic_added_body(content: &str) -> String {

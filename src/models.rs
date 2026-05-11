@@ -500,8 +500,10 @@ pub struct DiffFileSummary {
     /// stripped and needs it restored for display.
     #[serde(skip_serializing)]
     pub old_path_needs_prefix: bool,
-    /// Lines added (numstat). Omitted for binary files (numstat returns `-`),
-    /// untracked files, and cross-subtree-rename synthesized entries.
+    /// Lines added (numstat for tracked files, line count for untracked text
+    /// files). Omitted for binary files (numstat returns `-`), untracked
+    /// files that are binary / non-UTF-8 / oversize / unreadable, and
+    /// cross-subtree-rename synthesized entries.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub added: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
