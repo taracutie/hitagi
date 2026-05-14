@@ -1,28 +1,28 @@
 #!/usr/bin/env bash
-# End-to-end CLI benchmark harness for hitagi.
+# End-to-end CLI benchmark harness for mimi.
 #
-# For each scenario, runs the hitagi binary RUNS times under /usr/bin/time -v,
+# For each scenario, runs the mimi binary RUNS times under /usr/bin/time -v,
 # records elapsed seconds, peak RSS (kB), and stdout byte count per run, and
-# emits one JSON file per scenario into $HITAGI_BENCH_OUT.
+# emits one JSON file per scenario into $MIMI_BENCH_OUT.
 #
 # Usage:
-#   HITAGI_BENCH_OUT=target/bench-results/before bash scripts/bench.sh
+#   MIMI_BENCH_OUT=target/bench-results/before bash scripts/bench.sh
 #
 # Environment:
-#   HITAGI_BENCH_OUT   Output directory for JSON. Default: target/bench-results/run.
-#   HITAGI_BENCH_RUNS  Iterations per scenario. Default: 5.
-#   HITAGI_BENCH_BIN   Path to the hitagi binary. Default: target/release/hitagi.
-#   HITAGI_BENCH_CORPUS Repo to bench against. Default: tests/fixtures/sample_repo.
+#   MIMI_BENCH_OUT   Output directory for JSON. Default: target/bench-results/run.
+#   MIMI_BENCH_RUNS  Iterations per scenario. Default: 5.
+#   MIMI_BENCH_BIN   Path to the mimi binary. Default: target/release/mimi.
+#   MIMI_BENCH_CORPUS Repo to bench against. Default: tests/fixtures/sample_repo.
 
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$HERE"
 
-OUT="${HITAGI_BENCH_OUT:-target/bench-results/run}"
-RUNS="${HITAGI_BENCH_RUNS:-5}"
-BIN="${HITAGI_BENCH_BIN:-target/release/hitagi}"
-CORPUS="${HITAGI_BENCH_CORPUS:-tests/fixtures/sample_repo}"
+OUT="${MIMI_BENCH_OUT:-target/bench-results/run}"
+RUNS="${MIMI_BENCH_RUNS:-5}"
+BIN="${MIMI_BENCH_BIN:-target/release/mimi}"
+CORPUS="${MIMI_BENCH_CORPUS:-tests/fixtures/sample_repo}"
 
 if [[ ! -x "$BIN" ]]; then
     echo "building release binary..." >&2
@@ -39,7 +39,7 @@ ABS_BIN="$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")"
 
 # A synthetic git-initialized repo for the diff_overview scenario, so we
 # don't pollute the host repo and so it stays deterministic.
-DIFF_REPO="$(mktemp -d -t hitagi-bench-diff-XXXXXX)"
+DIFF_REPO="$(mktemp -d -t mimi-bench-diff-XXXXXX)"
 trap 'rm -rf "$DIFF_REPO"' EXIT
 (
     cd "$DIFF_REPO"
@@ -52,7 +52,7 @@ trap 'rm -rf "$DIFF_REPO"' EXIT
     printf 'pub struct New {}\n' > b.rs
 )
 
-# run_scenario <name> <pre-cmd-or-empty> <hitagi-args...>
+# run_scenario <name> <pre-cmd-or-empty> <mimi-args...>
 run_scenario() {
     local name="$1"
     shift
@@ -141,13 +141,13 @@ run_scenario() {
 }
 
 # A per-scenario tempdir for cache redirection; avoids polluting the
-# user's real ~/.cache/hitagi.
-COLD_CACHE="$(mktemp -d -t hitagi-bench-cold-XXXXXX)"
-WARM_CACHE="$(mktemp -d -t hitagi-bench-warm-XXXXXX)"
+# user's real ~/.cache/mimi.
+COLD_CACHE="$(mktemp -d -t mimi-bench-cold-XXXXXX)"
+WARM_CACHE="$(mktemp -d -t mimi-bench-warm-XXXXXX)"
 trap 'rm -rf "$DIFF_REPO" "$COLD_CACHE" "$WARM_CACHE"' EXIT
 
 # Pre-warm the warm cache by running each search mode once.
-export HITAGI_CACHE_DIR="$WARM_CACHE"
+export MIMI_CACHE_DIR="$WARM_CACHE"
 "$ABS_BIN" --repo "$ABS_CORPUS" search "config" --mode bm25 > /dev/null 2>&1 || true
 
 # Detect if the embedding model is available locally; only run hybrid/semantic
@@ -196,7 +196,7 @@ if $HAS_MODEL; then
         --json search "config schema" --mode hybrid --no-download
 
     run_scenario "cold_search_hybrid" \
-        "rm -rf \"$COLD_CACHE\"; mkdir -p \"$COLD_CACHE\"; export HITAGI_CACHE_DIR=\"$COLD_CACHE\"" \
+        "rm -rf \"$COLD_CACHE\"; mkdir -p \"$COLD_CACHE\"; export MIMI_CACHE_DIR=\"$COLD_CACHE\"" \
         "$ABS_CORPUS" \
         --json search "config schema" --mode hybrid --no-download
 else

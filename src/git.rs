@@ -1,5 +1,5 @@
 // Git subprocess wrappers + pure parsers for `--name-status -z`, `--numstat -z`,
-// and unified diff text. This is the only place in hitagi that shells out, and
+// and unified diff text. This is the only place in mimi that shells out, and
 // the only place that calls `std::process::Command` ~ keep it that way so the
 // command-layer code stays pure-Rust and easy to unit-test.
 //
@@ -17,7 +17,7 @@ use crate::error::{AppError, AppResult};
 pub struct GitRoot {
     /// Canonical absolute path to the git toplevel (parent of .git/).
     pub toplevel: PathBuf,
-    /// Hitagi repo root expressed relative to `toplevel`. Empty when the two
+    /// Mimi repo root expressed relative to `toplevel`. Empty when the two
     /// coincide. Always uses '/' separators so it composes cleanly with git's
     /// (also '/'-separated) path output.
     pub repo_subdir: String,

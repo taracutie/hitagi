@@ -39,7 +39,7 @@ use crate::cache::cache_root;
 /// Cache format identifier ~ bumped when the layout changes shape.
 const MAGIC: u32 = 0xB0CA_C0DE;
 const VERSION: u32 = 1;
-/// Versioned subdir under hitagi's cache root. Lives outside `<repo_hash>/`
+/// Versioned subdir under mimi's cache root. Lives outside `<repo_hash>/`
 /// because tokenizers are shared across every repo that uses the same
 /// embedding model.
 const SUBDIR: &str = "tokenizer_meta.v1";

@@ -773,7 +773,7 @@ fn render_cache_status(value: &CacheStatusResponse) -> String {
         value.entry_count, value.size_bytes
     );
     if value.disabled_via_env {
-        out.push_str("disabled via HITAGI_NO_CACHE\n");
+        out.push_str("disabled via MIMI_NO_CACHE\n");
     }
     let _ = writeln!(out, "version • current {}", value.current_version);
     if let Some(stored) = &value.stored_version {

@@ -9,8 +9,8 @@ use std::collections::{BTreeMap, HashMap};
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
-use hitagi::search::ranking::{apply_query_boost_in_place, rerank_topk, QueryIntent};
-use hitagi::search::types::IndexedChunk;
+use mimi::search::ranking::{apply_query_boost_in_place, rerank_topk, QueryIntent};
+use mimi::search::types::IndexedChunk;
 
 fn synth_chunk(id: usize) -> IndexedChunk {
     let file_idx = id % 60;

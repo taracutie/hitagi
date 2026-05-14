@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="hitagi.png" width="400" />
+  <img src="mimi.png" width="400" />
 </p>
 
-<h1 align="center">hitagi!</h1>
+<h1 align="center">mimi!</h1>
 
 <p align="center">
   <em>efficient code search~ ♡ 🎀</em>
@@ -10,7 +10,7 @@
 
 ---
 
-`hitagi` is a cli tool that allows coding agents (or humans) to efficiently query information about your codebase.
+`mimi` is a cli tool that allows coding agents (or humans) to efficiently query information about your codebase.
 Tree-sitter language support comes from `tree-sitter-language-pack`; no grammars are vendored in this repo.
 
 Commands:
@@ -27,7 +27,7 @@ Commands:
 - `diff [PATHS...]` ~ review uncommitted changes; overview by default, `--commit`/`--summary` for compact review, `--paths` for staging lists, structured hunks when file paths are given.
 - `cache [status|path|clear]` ~ inspect or manage the on-disk parse cache.
 - `index [status|build|clean]` ~ inspect or manage the search index (lives in the same SQLite file as the parse cache; `clean` drops just the search rows).
-- `install <claude|codex>` / `uninstall <claude|codex>` ~ add or remove hitagi's user-global agent prompt.
+- `install <claude|codex>` / `uninstall <claude|codex>` ~ add or remove mimi's user-global agent prompt.
 
 When a `find` walk has no positional [PATHS], it visits top-level subdirs round-robin so a `--limit` truncation produces a fair sample across the repo. `search` always indexes the whole repo (positional [PATHS] is a post-rank filter).
 
@@ -43,11 +43,11 @@ Supported languages are pack-driven:
 bun run install
 ```
 
-This builds the release binary and drops it at `~/.cargo/bin/hitagi`.
+This builds the release binary and drops it at `~/.cargo/bin/mimi`.
 
 ## Usage
 
-`hitagi` defaults to the current working directory as the repo root. Pass `--repo <PATH>` to override.
+`mimi` defaults to the current working directory as the repo root. Pass `--repo <PATH>` to override.
 
 Paths are repo-relative. If an exact repo-relative path isn't found, path-taking commands fall back to a unique repo-internal suffix ~ e.g. `src-tauri/src/main.rs` resolves to `apps/desktop/src-tauri/src/main.rs` if there's exactly one match. Ambiguous suffixes return an error listing the candidates.
 
@@ -56,11 +56,11 @@ Output is concise text to stdout. Errors go to stderr with a non-zero exit code.
 ### Agent prompts
 
 ```bash
-hitagi install codex
-hitagi install claude
+mimi install codex
+mimi install claude
 ```
 
-Installs a small managed instruction block into the agent's user-global prompt file so future sessions run `hitagi --help` first and use `hitagi` for codebase search/read/navigation before falling back to broader tools.
+Installs a small managed instruction block into the agent's user-global prompt file so future sessions run `mimi --help` first and use `mimi` for codebase search/read/navigation before falling back to broader tools.
 
 Targets:
 
@@ -68,17 +68,17 @@ Targets:
 - Codex: `$CODEX_HOME/AGENTS.md` when `CODEX_HOME` is set, otherwise `~/.codex/AGENTS.md`
 - Codex override: if `AGENTS.override.md` exists and is non-empty, install writes there because it shadows `AGENTS.md`
 
-Uninstall removes only hitagi's managed block and preserves the rest of the file:
+Uninstall removes only mimi's managed block and preserves the rest of the file:
 
 ```bash
-hitagi uninstall codex
-hitagi uninstall claude
+mimi uninstall codex
+mimi uninstall claude
 ```
 
 ### `outline <PATH>`
 
 ```bash
-hitagi outline src/cli.rs
+mimi outline src/cli.rs
 ```
 
 ```text
@@ -101,7 +101,7 @@ Flags:
 ### `symbol <PATH> <QUALNAME>`
 
 ```bash
-hitagi symbol src/lang.rs Language.detect
+mimi symbol src/lang.rs Language.detect
 ```
 
 `QUALNAME` accepts the full dotted form (e.g. `AuthService.handleAuth`) or just the leaf name (`handleAuth`) when it resolves uniquely within the file. Ambiguous leaves return an error listing the candidates; misses suggest near-miss qualnames.
@@ -111,7 +111,7 @@ Flags: `--bytes` (same as outline).
 ### `search <QUERY> [PATHS...]`
 
 ```bash
-hitagi search "where does cache invalidation happen"
+mimi search "where does cache invalidation happen"
 ```
 
 ```text
@@ -147,13 +147,13 @@ Flags:
 Pass positional `[PATHS]` to filter results to chunks under those subtrees:
 
 ```bash
-hitagi search "queue worker" packages/jobs
+mimi search "queue worker" packages/jobs
 ```
 
 ### `find-related <FILE> <LINE>`
 
 ```bash
-hitagi find-related src/cli.rs 600
+mimi find-related src/cli.rs 600
 ```
 
 Pass a `path:line` from a `search` result to get semantically similar chunks elsewhere in the repo. Reuses the persisted search index; first call rebuilds and may download the model just like `search` does.
@@ -163,9 +163,9 @@ Flags: same encoder / model flags as `search` (`--hashing`, `--no-download`, `--
 ### `index [status|build|clean]`
 
 ```bash
-hitagi index status
-hitagi index build --mode hybrid
-hitagi index clean
+mimi index status
+mimi index build --mode hybrid
+mimi index clean
 ```
 
 Inspect or manage the search index directly. `build` forces a rebuild (handy after a `--model X` swap or to warm a cache before a session). `clean` drops just the search rows (sparse + dense) ~ the parse cache for `outline`/`symbol`/`find` is left intact. Use `cache clear` to wipe both.
@@ -173,7 +173,7 @@ Inspect or manage the search index directly. `build` forces a rebuild (handy aft
 ### `read <PATH>`
 
 ```bash
-hitagi read src/lang.rs
+mimi read src/lang.rs
 ```
 
 Prints a short metadata header followed by the file content. For files with no recognised extension, `language` is `"plaintext"`.
@@ -186,7 +186,7 @@ Flags:
 ### `find <QUERY> [PATHS...]`
 
 ```bash
-hitagi find load_source --snippet
+mimi find load_source --snippet
 ```
 
 ```text
@@ -216,9 +216,9 @@ When matches span multiple top-level dirs with no shared prefix, text output swi
 ### `loc symbols|files`
 
 ```bash
-hitagi loc symbols --min-lines 80 --snippet
-hitagi loc symbols --min-lines 20 --max-lines 80 src
-hitagi loc files "**/*.rs" --min-lines 300
+mimi loc symbols --min-lines 80 --snippet
+mimi loc symbols --min-lines 20 --max-lines 80 src
+mimi loc files "**/*.rs" --min-lines 300
 ```
 
 Ranks parsed symbols or files by language-aware code lines. Code lines are nonblank, noncomment logical lines using the same counter as `langs` and `read --summary`.
@@ -244,7 +244,7 @@ Symbol-only flags:
 ### `files [GLOBS...]`
 
 ```bash
-hitagi files "src/**/*.rs" "**/*.toml"
+mimi files "src/**/*.rs" "**/*.toml"
 ```
 
 ```text
@@ -275,7 +275,7 @@ Flags:
 ### `langs`
 
 ```bash
-hitagi langs
+mimi langs
 ```
 
 ```text
@@ -293,7 +293,7 @@ One-shot orientation: walks the repo and tallies file count + line count per det
 Review uncommitted changes (working tree vs `HEAD` by default). Shells out to `git` ~ requires a git repo. With no `PATH`, prints a one-entry-per-file overview; with a file `PATH`, prints structured hunks annotated by enclosing symbol. Directory paths default to grouped compact summaries.
 
 ```bash
-hitagi diff
+mimi diff
 ```
 
 ```text
@@ -315,7 +315,7 @@ Status codes: `M` modified, `A` added, `D` deleted, `R` renamed, `C` copied, `?`
 Default text overview groups changes by the top-level parent folder in the current repo root and keeps status / staged-state markers on each file line.
 
 ```bash
-hitagi diff src/cli.rs
+mimi diff src/cli.rs
 ```
 
 ```text
@@ -329,31 +329,31 @@ M src/cli.rs +12 -0 • rust
 Each hunk's `symbol` / `kind` is the innermost parsed symbol that contains the hunk (Rust/TS/TSX/Python/Kotlin/Prisma only). Multi-symbol hunks include a `spans: [...]` field listing every overlapping qualname. Pure deletions still get annotated ~ the HEAD-side blob is fetched via `git show` and parsed in-memory (no cache write). Untracked text files are drillable too: they render as synthetic added-file diffs, with symbols parsed from the working-tree file.
 
 ```bash
-hitagi diff src/cli.rs src/output.rs
+mimi diff src/cli.rs src/output.rs
 ```
 
 Multi-file drilldown concatenates file sections in text mode.
 
 ```bash
-hitagi diff --summary --symbols
+mimi diff --summary --symbols
 ```
 
 `--summary` emits compact per-file output for commit review. Add `--symbols` to include touched symbol names without hunk bodies.
 
 ```bash
-hitagi diff --commit
+mimi diff --commit
 ```
 
 `--commit` is the token-efficient pre-commit preset: compact summary, touched symbols included, no hunk bodies, and grouped text sections for `staged+unstaged`, `staged`, `unstaged`, and `untracked`.
 
 ```bash
-hitagi diff --paths
+mimi diff --paths
 ```
 
 `--paths` prints one changed repo-relative path per line in text mode. `--names-only` is an alias.
 
 ```bash
-hitagi diff src tests
+mimi diff src tests
 ```
 
 When every positional path resolves to a directory, plain `diff` returns a grouped summary instead of hunk drilldown. `--summary` and `--commit` also use directory groups when directory paths are passed.
@@ -377,11 +377,11 @@ Flags:
 Path resolution in drilldown matches against the diff's own file list (not a filesystem walk), so suffix shorthand works the same as `outline`/`symbol`:
 
 ```bash
-hitagi diff Button.tsx           # resolves like outline does, but only against changed files
-hitagi diff deleted_file.rs      # works fine ~ deleted files are still in the diff list
+mimi diff Button.tsx           # resolves like outline does, but only against changed files
+mimi diff deleted_file.rs      # works fine ~ deleted files are still in the diff list
 ```
 
-Monorepo / repo-subdir scoping: `diff` only ever surfaces changes inside the hitagi `--repo` subtree. When `--repo` is a subdir of a larger git toplevel, sibling-project changes are silently filtered and a top-level `note` reports the count. **Cross-subtree renames are surfaced symmetrically:** the destination subtree sees the file as `A` with a per-file `note` naming the toplevel-relative origin; the source subtree sees a synthesized `D` with a `note` naming the toplevel-relative destination. Both halves are drillable.
+Monorepo / repo-subdir scoping: `diff` only ever surfaces changes inside the mimi `--repo` subtree. When `--repo` is a subdir of a larger git toplevel, sibling-project changes are silently filtered and a top-level `note` reports the count. **Cross-subtree renames are surfaced symmetrically:** the destination subtree sees the file as `A` with a per-file `note` naming the toplevel-relative origin; the source subtree sees a synthesized `D` with a `note` naming the toplevel-relative destination. Both halves are drillable.
 
 Token efficiency: a typical pre-commit review (overview ≈ 0.5 KB + one or two file drilldowns ≈ 2-6 KB each) lands well under raw `git diff HEAD` for the same change set ~ which is the main reason this command exists.
 
@@ -389,22 +389,22 @@ Token efficiency: a typical pre-commit review (overview ≈ 0.5 KB + one or two 
 
 `outline`, `symbol`, `search`, and `find` automatically persist the parsed symbols of every file they touch, keyed on `(repo-relative path, mtime, size, language)`. Subsequent invocations stat the same files, reuse cached symbols when nothing changed, and only re-read + re-parse the few files that actually moved. Single-file commands fetch just that file's cache row; full-repo walks reuse the same indexed store.
 
-Cache database lives at `${HITAGI_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}}/hitagi/<repo-hash>/index.v3.sqlite` (one SQLite database per repo; symbols are bincode-serialized per file row). Failures (missing dir, corrupt file, version mismatch) silently fall back to a cold parse ~ a stale cache will never break a command.
+Cache database lives at `${MIMI_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}}/mimi/<repo-hash>/index.v3.sqlite` (one SQLite database per repo; symbols are bincode-serialized per file row). Failures (missing dir, corrupt file, version mismatch) silently fall back to a cold parse ~ a stale cache will never break a command.
 
 ```bash
-hitagi cache              # alias for `cache status`
-hitagi cache status       # full info: size, entry count, language breakdown
-hitagi cache path         # just the cache directory for this repo
-hitagi cache clear        # delete this repo's cache subdir
-hitagi cache clear --all  # nuke every repo's cache
+mimi cache              # alias for `cache status`
+mimi cache status       # full info: size, entry count, language breakdown
+mimi cache path         # just the cache directory for this repo
+mimi cache clear        # delete this repo's cache subdir
+mimi cache clear --all  # nuke every repo's cache
 ```
 
 `version_match`/`repo_root_match` flag stale caches: bumping `Cargo.toml`'s version invalidates everything (cheapest proxy for "visitor logic might have changed"); a `false` `repo_root_match` means a hash collision (run `cache clear` and move on).
 
 Environment variables:
 
-- `HITAGI_NO_CACHE=1` ~ skip both the cache load and the cache save for this invocation. Use it to benchmark the cold path or as a safety hatch when the cache is suspect.
-- `HITAGI_CACHE_DIR=/path` ~ override where the cache lives entirely (skips the `XDG_CACHE_HOME`/`HOME` fallback chain). Useful for sandboxed CI runs.
+- `MIMI_NO_CACHE=1` ~ skip both the cache load and the cache save for this invocation. Use it to benchmark the cold path or as a safety hatch when the cache is suspect.
+- `MIMI_CACHE_DIR=/path` ~ override where the cache lives entirely (skips the `XDG_CACHE_HOME`/`HOME` fallback chain). Useful for sandboxed CI runs.
 
 ## Limits
 

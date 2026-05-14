@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-use hitagi::{
+use mimi::{
     commands::{self as app_commands, SearchModeArg, SearchOptions},
     repo::RepoRoot,
 };
@@ -36,7 +36,7 @@ fn shared_cache_dir() -> &'static Path {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     DIR.get_or_init(|| {
         let dir = std::env::temp_dir().join(format!(
-            "hitagi-search-relevance-{}-cache",
+            "mimi-search-relevance-{}-cache",
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
@@ -56,8 +56,8 @@ fn search(repo: &Path, query: &str, extra_args: &[&str]) -> Value {
     prewarm_language_pack();
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
-    let old = std::env::var_os("HITAGI_CACHE_DIR");
-    std::env::set_var("HITAGI_CACHE_DIR", shared_cache_dir());
+    let old = std::env::var_os("MIMI_CACHE_DIR");
+    std::env::set_var("MIMI_CACHE_DIR", shared_cache_dir());
 
     let mut options = SearchOptions {
         paths: Vec::new(),
@@ -86,8 +86,8 @@ fn search(repo: &Path, query: &str, extra_args: &[&str]) -> Value {
     let response = app_commands::search(&repo, query, options).unwrap();
 
     match old {
-        Some(old) => std::env::set_var("HITAGI_CACHE_DIR", old),
-        None => std::env::remove_var("HITAGI_CACHE_DIR"),
+        Some(old) => std::env::set_var("MIMI_CACHE_DIR", old),
+        None => std::env::remove_var("MIMI_CACHE_DIR"),
     }
     to_value(response)
 }

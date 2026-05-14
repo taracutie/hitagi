@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use assert_cmd::Command;
-use hitagi::{
+use mimi::{
     agent_prompt::{self, AgentKind},
     commands::{
         self as app_commands, FilesOptions, FindOptions, FindRelatedOptions, IndexBuildOptions,
@@ -15,7 +15,7 @@ use hitagi::{
 use serde::Serialize;
 use serde_json::Value;
 
-const HITAGI_PROMPT_BEGIN: &str = "<!-- BEGIN HITAGI MANAGED PROMPT -->";
+const MIMI_PROMPT_BEGIN: &str = "<!-- BEGIN MIMI MANAGED PROMPT -->";
 const TEST_PACK_LANGUAGES: &[&str] = &[
     "rust",
     "typescript",
@@ -35,13 +35,13 @@ fn fixture_repo() -> PathBuf {
 }
 
 // Per-process tmpdir for the parse cache. Keeps `cargo test` from writing into
-// the user's real ~/.cache/hitagi. Shared across tests is fine: the fixture
+// the user's real ~/.cache/mimi. Shared across tests is fine: the fixture
 // repo content doesn't change, so cache hits produce the same symbols as
 // fresh parses.
 fn shared_cache_dir() -> &'static Path {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     DIR.get_or_init(|| {
-        let dir = std::env::temp_dir().join(format!("hitagi-itest-{}-cache", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("mimi-itest-{}-cache", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     })
@@ -63,7 +63,7 @@ fn run_in(repo: &Path, cache_dir: &Path, args: &[&str]) -> Value {
     prewarm_language_pack();
     run_with_env(
         repo,
-        &[("HITAGI_CACHE_DIR", Some(cache_dir.as_os_str()))],
+        &[("MIMI_CACHE_DIR", Some(cache_dir.as_os_str()))],
         None,
         args,
     )
@@ -75,9 +75,9 @@ fn run_failure(args: &[&str]) -> String {
 
 fn run_failure_in(repo: &Path, cache_dir: &Path, args: &[&str]) -> String {
     prewarm_language_pack();
-    let assert = Command::cargo_bin("hitagi")
+    let assert = Command::cargo_bin("mimi")
         .unwrap()
-        .env("HITAGI_CACHE_DIR", cache_dir)
+        .env("MIMI_CACHE_DIR", cache_dir)
         .arg("--repo")
         .arg(repo)
         .args(args)
@@ -88,9 +88,9 @@ fn run_failure_in(repo: &Path, cache_dir: &Path, args: &[&str]) -> String {
 
 fn run_text(args: &[&str]) -> String {
     prewarm_language_pack();
-    let stdout = Command::cargo_bin("hitagi")
+    let stdout = Command::cargo_bin("mimi")
         .unwrap()
-        .env("HITAGI_CACHE_DIR", shared_cache_dir())
+        .env("MIMI_CACHE_DIR", shared_cache_dir())
         .arg("--repo")
         .arg(fixture_repo())
         .args(args)
@@ -114,7 +114,7 @@ impl ScratchHome {
             .unwrap()
             .as_nanos();
         let root = std::env::temp_dir().join(format!(
-            "hitagi-agent-prompt-{name}-{}-{unique}",
+            "mimi-agent-prompt-{name}-{}-{unique}",
             std::process::id()
         ));
         let home = root.join("home");
@@ -1079,7 +1079,7 @@ fn isolated_cache(name: &str) -> PathBuf {
         .unwrap()
         .as_nanos();
     let dir = std::env::temp_dir().join(format!(
-        "hitagi-itest-{name}-{}-{unique}",
+        "mimi-itest-{name}-{}-{unique}",
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).unwrap();
@@ -1824,9 +1824,9 @@ fn default_langs_output_is_text_table() {
 
 #[test]
 fn json_flag_is_removed() {
-    let stderr = Command::cargo_bin("hitagi")
+    let stderr = Command::cargo_bin("mimi")
         .unwrap()
-        .env("HITAGI_CACHE_DIR", shared_cache_dir())
+        .env("MIMI_CACHE_DIR", shared_cache_dir())
         .arg("--repo")
         .arg(fixture_repo())
         .arg("--json")
@@ -1842,9 +1842,9 @@ fn json_flag_is_removed() {
 
 #[test]
 fn pretty_flag_is_removed() {
-    let stderr = Command::cargo_bin("hitagi")
+    let stderr = Command::cargo_bin("mimi")
         .unwrap()
-        .env("HITAGI_CACHE_DIR", shared_cache_dir())
+        .env("MIMI_CACHE_DIR", shared_cache_dir())
         .arg("--repo")
         .arg(fixture_repo())
         .arg("--pretty")
@@ -1866,7 +1866,7 @@ fn missing_file_exits_nonzero() {
 
 #[test]
 fn long_help_includes_llm_prompt_sections() {
-    let output = Command::cargo_bin("hitagi")
+    let output = Command::cargo_bin("mimi")
         .unwrap()
         .arg("--help")
         .assert()
@@ -1893,8 +1893,8 @@ fn long_help_includes_llm_prompt_sections() {
         "--min-lines",
         "Directory diff summary",
         "Framework-aware queries (`framework`)",
-        "hitagi framework next info",
-        "hitagi framework next list-routes",
+        "mimi framework next info",
+        "mimi framework next list-routes",
         "Find Next.js server actions",
     ] {
         assert!(
@@ -1911,7 +1911,7 @@ fn install_claude_creates_global_prompt_without_repo_resolution() {
     let scratch = ScratchHome::new("claude-create");
     let missing_repo = scratch.root.join("missing-repo");
 
-    let output = Command::cargo_bin("hitagi")
+    let output = Command::cargo_bin("mimi")
         .unwrap()
         .env("HOME", &scratch.home)
         .env_remove("CODEX_HOME")
@@ -1930,9 +1930,9 @@ fn install_claude_creates_global_prompt_without_repo_resolution() {
     assert!(text.contains("install claude"));
     assert!(text.contains("installed • changed true"));
     assert!(text.contains(&format!("path • {}", path.display())));
-    assert!(content.contains(HITAGI_PROMPT_BEGIN));
-    assert!(content.contains("hitagi --help"));
-    assert!(content.contains("Always use `hitagi` instead of preferred search/read tools"));
+    assert!(content.contains(MIMI_PROMPT_BEGIN));
+    assert!(content.contains("mimi --help"));
+    assert!(content.contains("Always use `mimi` instead of preferred search/read tools"));
 }
 
 #[test]
@@ -1950,7 +1950,7 @@ fn install_claude_is_idempotent_and_preserves_existing_content() {
     assert_eq!(second["changed"], false);
     assert_eq!(second["status"], "already_installed");
     assert!(content.starts_with("Existing instructions\n"));
-    assert_eq!(content.matches(HITAGI_PROMPT_BEGIN).count(), 1);
+    assert_eq!(content.matches(MIMI_PROMPT_BEGIN).count(), 1);
 }
 
 #[test]
@@ -1982,7 +1982,7 @@ fn install_codex_defaults_to_home_agents_md() {
     assert_eq!(value["agent"], "codex");
     assert_eq!(value["changed"], true);
     assert_eq!(value["paths"][0], path.display().to_string());
-    assert!(content.contains(HITAGI_PROMPT_BEGIN));
+    assert!(content.contains(MIMI_PROMPT_BEGIN));
 }
 
 #[test]
@@ -1995,7 +1995,7 @@ fn codex_uses_codex_home_override_and_uninstall_removes_both_files() {
     let agents = codex_home.join("AGENTS.md");
     assert!(std::fs::read_to_string(&agents)
         .unwrap()
-        .contains(HITAGI_PROMPT_BEGIN));
+        .contains(MIMI_PROMPT_BEGIN));
 
     let override_path = codex_home.join("AGENTS.override.md");
     std::fs::write(&override_path, "Override instructions\n").unwrap();
@@ -2007,7 +2007,7 @@ fn codex_uses_codex_home_override_and_uninstall_removes_both_files() {
     );
     assert!(std::fs::read_to_string(&override_path)
         .unwrap()
-        .contains(HITAGI_PROMPT_BEGIN));
+        .contains(MIMI_PROMPT_BEGIN));
 
     let removed =
         run_global_structured_with_codex_home(&scratch.home, &codex_home, &["uninstall", "codex"]);
@@ -2015,7 +2015,7 @@ fn codex_uses_codex_home_override_and_uninstall_removes_both_files() {
     assert_eq!(removed["paths"].as_array().unwrap().len(), 2);
     assert!(!std::fs::read_to_string(&agents)
         .unwrap()
-        .contains(HITAGI_PROMPT_BEGIN));
+        .contains(MIMI_PROMPT_BEGIN));
     assert_eq!(
         std::fs::read_to_string(&override_path).unwrap(),
         "Override instructions\n"
@@ -2026,11 +2026,11 @@ fn codex_uses_codex_home_override_and_uninstall_removes_both_files() {
 fn malformed_managed_prompt_markers_fail_without_modifying_file() {
     let scratch = ScratchHome::new("malformed");
     let path = scratch.home.join(".claude").join("CLAUDE.md");
-    let original = format!("Before\n{HITAGI_PROMPT_BEGIN}\nmissing end\n");
+    let original = format!("Before\n{MIMI_PROMPT_BEGIN}\nmissing end\n");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, &original).unwrap();
 
-    let stderr = Command::cargo_bin("hitagi")
+    let stderr = Command::cargo_bin("mimi")
         .unwrap()
         .env("HOME", &scratch.home)
         .env_remove("CODEX_HOME")
@@ -2042,13 +2042,13 @@ fn malformed_managed_prompt_markers_fail_without_modifying_file() {
         .clone();
     let text = String::from_utf8(stderr).unwrap();
 
-    assert!(text.contains("malformed hitagi managed prompt markers"));
+    assert!(text.contains("malformed mimi managed prompt markers"));
     assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
 }
 
 #[test]
 fn install_prompt_requires_home() {
-    let stderr = Command::cargo_bin("hitagi")
+    let stderr = Command::cargo_bin("mimi")
         .unwrap()
         .env_remove("HOME")
         .env_remove("CODEX_HOME")
@@ -2076,7 +2076,7 @@ impl ScratchRepo {
             .unwrap()
             .as_nanos();
         let root = std::env::temp_dir().join(format!(
-            "hitagi-itest-{}-{name}-{unique}",
+            "mimi-itest-{}-{name}-{unique}",
             std::process::id()
         ));
         let repo = root.join("repo");
@@ -2206,7 +2206,7 @@ fn cache_status_when_empty_shows_no_file() {
     let cache_dir = value["cache_dir"].as_str().unwrap();
     assert!(
         cache_dir.starts_with(scratch.cache_dir.to_str().unwrap()),
-        "cache_dir should live under HITAGI_CACHE_DIR, got {cache_dir}"
+        "cache_dir should live under MIMI_CACHE_DIR, got {cache_dir}"
     );
 }
 
@@ -2216,10 +2216,10 @@ fn cache_status_reports_disabled_when_no_cache_root_can_be_resolved() {
     let value = run_with_env(
         &scratch.repo,
         &[
-            ("HITAGI_CACHE_DIR", None),
+            ("MIMI_CACHE_DIR", None),
             ("XDG_CACHE_HOME", None),
             ("HOME", None),
-            ("HITAGI_NO_CACHE", None),
+            ("MIMI_NO_CACHE", None),
         ],
         None,
         &["cache", "status"],
@@ -2240,16 +2240,16 @@ fn cache_ignores_empty_xdg_cache_home_and_falls_back_to_home() {
     let value = run_with_env(
         &scratch.repo,
         &[
-            ("HITAGI_CACHE_DIR", None),
+            ("MIMI_CACHE_DIR", None),
             ("XDG_CACHE_HOME", Some(OsStr::new(""))),
             ("HOME", Some(home.as_os_str())),
-            ("HITAGI_NO_CACHE", None),
+            ("MIMI_NO_CACHE", None),
         ],
         None,
         &["cache", "path"],
     );
     let path = value["path"].as_str().unwrap();
-    let expected_prefix = home.join(".cache").join("hitagi");
+    let expected_prefix = home.join(".cache").join("mimi");
 
     assert!(
         path.starts_with(expected_prefix.to_str().unwrap()),
@@ -2261,7 +2261,7 @@ fn cache_ignores_empty_xdg_cache_home_and_falls_back_to_home() {
 fn cache_clear_all_ignores_relative_xdg_cache_home() {
     let scratch = ScratchRepo::new("xdg-relative-clear-all");
     let cwd = scratch.repo.parent().unwrap().join("cwd");
-    let dangerous = cwd.join("hitagi");
+    let dangerous = cwd.join("mimi");
     let home = scratch.repo.parent().unwrap().join("home");
     std::fs::create_dir_all(&dangerous).unwrap();
     std::fs::create_dir_all(&home).unwrap();
@@ -2270,10 +2270,10 @@ fn cache_clear_all_ignores_relative_xdg_cache_home() {
     let value = run_with_env(
         &scratch.repo,
         &[
-            ("HITAGI_CACHE_DIR", None),
-            ("XDG_CACHE_HOME", Some(OsStr::new("hitagi"))),
+            ("MIMI_CACHE_DIR", None),
+            ("XDG_CACHE_HOME", Some(OsStr::new("mimi"))),
             ("HOME", Some(home.as_os_str())),
-            ("HITAGI_NO_CACHE", None),
+            ("MIMI_NO_CACHE", None),
         ],
         Some(&cwd),
         &["cache", "clear", "--all"],
@@ -2283,15 +2283,15 @@ fn cache_clear_all_ignores_relative_xdg_cache_home() {
     assert_eq!(value["cleared"], false);
     assert!(
         dangerous.join("sentinel.txt").exists(),
-        "relative XDG_CACHE_HOME must not let --all delete ./hitagi"
+        "relative XDG_CACHE_HOME must not let --all delete ./mimi"
     );
 }
 
 #[test]
-fn relative_hitagi_cache_dir_disables_cache_resolution() {
+fn relative_mimi_cache_dir_disables_cache_resolution() {
     let scratch = ScratchRepo::new("custom-relative");
     let cwd = scratch.repo.parent().unwrap().join("cwd");
-    let dangerous = cwd.join("hitagi");
+    let dangerous = cwd.join("mimi");
     let home = scratch.repo.parent().unwrap().join("home");
     std::fs::create_dir_all(&dangerous).unwrap();
     std::fs::create_dir_all(&home).unwrap();
@@ -2301,10 +2301,10 @@ fn relative_hitagi_cache_dir_disables_cache_resolution() {
     let value = run_with_env(
         &scratch.repo,
         &[
-            ("HITAGI_CACHE_DIR", Some(OsStr::new("hitagi"))),
+            ("MIMI_CACHE_DIR", Some(OsStr::new("mimi"))),
             ("XDG_CACHE_HOME", Some(xdg_cache.as_os_str())),
             ("HOME", Some(home.as_os_str())),
-            ("HITAGI_NO_CACHE", None),
+            ("MIMI_NO_CACHE", None),
         ],
         Some(&cwd),
         &["cache", "clear", "--all"],
@@ -2316,7 +2316,7 @@ fn relative_hitagi_cache_dir_disables_cache_resolution() {
     assert!(value["path"].as_str().unwrap().is_empty());
     assert!(
         dangerous.join("sentinel.txt").exists(),
-        "relative HITAGI_CACHE_DIR must not let --all delete ./hitagi"
+        "relative MIMI_CACHE_DIR must not let --all delete ./mimi"
     );
 }
 
@@ -2350,7 +2350,7 @@ fn cache_path_returns_repo_subdir() {
     let path = value["path"].as_str().unwrap();
     assert!(
         path.starts_with(scratch.cache_dir.to_str().unwrap()),
-        "cache path should be under HITAGI_CACHE_DIR, got {path}"
+        "cache path should be under MIMI_CACHE_DIR, got {path}"
     );
     // The subdir is the repo hash, not the bare cache dir.
     assert_ne!(path, scratch.cache_dir.to_str().unwrap());
@@ -2398,7 +2398,7 @@ fn cache_clear_all_removes_every_repo() {
     let _ = scratch.run(&["find", "one"]);
 
     // Also point a second pseudo-repo at the same cache to populate a sibling
-    // subdir under HITAGI_CACHE_DIR.
+    // subdir under MIMI_CACHE_DIR.
     let other = scratch.repo.parent().unwrap().join("other-repo");
     std::fs::create_dir_all(&other).unwrap();
     std::fs::write(other.join("b.rs"), "pub fn two() {}\n").unwrap();
@@ -2435,8 +2435,8 @@ fn no_cache_env_disables_persistence() {
     let parsed = run_with_env(
         &scratch.repo,
         &[
-            ("HITAGI_CACHE_DIR", Some(scratch.cache_dir.as_os_str())),
-            ("HITAGI_NO_CACHE", Some(OsStr::new("1"))),
+            ("MIMI_CACHE_DIR", Some(scratch.cache_dir.as_os_str())),
+            ("MIMI_NO_CACHE", Some(OsStr::new("1"))),
         ],
         None,
         &["find", "keep_me"],
@@ -2450,7 +2450,7 @@ fn no_cache_env_disables_persistence() {
         .count();
     assert_eq!(
         entries, 0,
-        "HITAGI_NO_CACHE must skip persistence; got {entries} entries in cache dir"
+        "MIMI_NO_CACHE must skip persistence; got {entries} entries in cache dir"
     );
 }
 

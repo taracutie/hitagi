@@ -24,7 +24,7 @@ use super::tokens::tokenize;
 use super::types::IndexedChunk;
 
 /// Cache file magic. Bump only when the byte layout changes shape; the
-/// cache filename carries the version separately for the wider hitagi
+/// cache filename carries the version separately for the wider mimi
 /// cache invalidation surface.
 const BM25_FORMAT_TAG: u32 = 0xB17A_5701;
 

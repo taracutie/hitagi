@@ -1,14 +1,14 @@
 [package]
-name = "hitagi"
+name = "mimi"
 version = "0.1.3"
 edition = "2021"
 
 [lib]
-name = "hitagi"
+name = "mimi"
 path = "src/lib.rs"
 
 [[bin]]
-name = "hitagi"
+name = "mimi"
 path = "src/main.rs"
 
 [dependencies]

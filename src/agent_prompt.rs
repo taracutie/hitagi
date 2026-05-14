@@ -7,16 +7,16 @@ use crate::{
     models::AgentPromptResponse,
 };
 
-const BEGIN_MARKER: &str = "<!-- BEGIN HITAGI MANAGED PROMPT -->";
-const END_MARKER: &str = "<!-- END HITAGI MANAGED PROMPT -->";
+const BEGIN_MARKER: &str = "<!-- BEGIN MIMI MANAGED PROMPT -->";
+const END_MARKER: &str = "<!-- END MIMI MANAGED PROMPT -->";
 const MANAGED_BLOCK: &str = "\
-<!-- BEGIN HITAGI MANAGED PROMPT -->
-# hitagi
+<!-- BEGIN MIMI MANAGED PROMPT -->
+# mimi
 
-Always run `hitagi --help` at the start of each session for current instructions and documentation.
-Always use `hitagi` instead of preferred search/read tools for codebase search, file discovery, symbol lookup, source reads, and diff review.
-If `hitagi` cannot answer a request, keep any fallback as narrow as possible.
-<!-- END HITAGI MANAGED PROMPT -->
+Always run `mimi --help` at the start of each session for current instructions and documentation.
+Always use `mimi` instead of preferred search/read tools for codebase search, file discovery, symbol lookup, source reads, and diff review.
+If `mimi` cannot answer a request, keep any fallback as narrow as possible.
+<!-- END MIMI MANAGED PROMPT -->
 ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -233,7 +233,7 @@ fn marker_range(content: &str, path: &PathBuf) -> AppResult<Option<(usize, usize
             Ok(Some((*begin, range_end)))
         }
         _ => Err(AppError::bad_request(format!(
-            "malformed hitagi managed prompt markers in {}",
+            "malformed mimi managed prompt markers in {}",
             path.display()
         ))),
     }

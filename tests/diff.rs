@@ -1,4 +1,4 @@
-// Integration tests for `hitagi diff`. Each test builds a real git repo in a
+// Integration tests for `mimi diff`. Each test builds a real git repo in a
 // tempdir (sealed off from the user's git config via GIT_CONFIG_GLOBAL=/dev/null
 // + GIT_CONFIG_SYSTEM=/dev/null) and shells out to the cargo-built binary.
 
@@ -7,7 +7,7 @@ use std::process::Command as StdCommand;
 use std::sync::{Mutex, OnceLock};
 
 use assert_cmd::Command;
-use hitagi::{
+use mimi::{
     commands::{
         self as app_commands, DiffBodyMode, DiffFileOptions, DiffOptions, DiffScope,
         DiffSummaryOptions, MAX_FILE_BYTES,
@@ -33,7 +33,7 @@ impl DiffRepo {
             .unwrap()
             .as_nanos();
         let root = std::env::temp_dir().join(format!(
-            "hitagi-difftest-{}-{name}-{unique}",
+            "mimi-difftest-{}-{name}-{unique}",
             std::process::id()
         ));
         let repo = root.join("repo");
@@ -114,9 +114,9 @@ impl DiffRepo {
 
     fn run_failure(&self, args: &[&str]) -> String {
         prewarm_language_pack();
-        let assert = Command::cargo_bin("hitagi")
+        let assert = Command::cargo_bin("mimi")
             .unwrap()
-            .env("HITAGI_CACHE_DIR", &self.cache_dir)
+            .env("MIMI_CACHE_DIR", &self.cache_dir)
             .arg("--repo")
             .arg(&self.repo)
             .args(args)
@@ -127,9 +127,9 @@ impl DiffRepo {
 
     fn run_text(&self, args: &[&str]) -> String {
         prewarm_language_pack();
-        let stdout = Command::cargo_bin("hitagi")
+        let stdout = Command::cargo_bin("mimi")
             .unwrap()
-            .env("HITAGI_CACHE_DIR", &self.cache_dir)
+            .env("MIMI_CACHE_DIR", &self.cache_dir)
             .arg("--repo")
             .arg(&self.repo)
             .args(args)
@@ -152,12 +152,12 @@ fn run_in(repo: &Path, cache_dir: &Path, args: &[&str]) -> Value {
     prewarm_language_pack();
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
-    let old = std::env::var_os("HITAGI_CACHE_DIR");
-    std::env::set_var("HITAGI_CACHE_DIR", cache_dir);
+    let old = std::env::var_os("MIMI_CACHE_DIR");
+    std::env::set_var("MIMI_CACHE_DIR", cache_dir);
     let value = run_diff_structured(repo, args);
     match old {
-        Some(old) => std::env::set_var("HITAGI_CACHE_DIR", old),
-        None => std::env::remove_var("HITAGI_CACHE_DIR"),
+        Some(old) => std::env::set_var("MIMI_CACHE_DIR", old),
+        None => std::env::remove_var("MIMI_CACHE_DIR"),
     }
     value
 }
@@ -631,7 +631,7 @@ fn overview_exclude_filters_files() {
 
 #[test]
 fn overview_outside_git_repo_errors_clearly() {
-    // Build a non-repo directory and point hitagi at it. Because the binary
+    // Build a non-repo directory and point mimi at it. Because the binary
     // canonicalises the repo root, we just need a real dir that's NOT inside
     // a git checkout. /tmp ~ but to be safe, build a sealed tmpdir.
     let unique = std::time::SystemTime::now()
@@ -639,14 +639,14 @@ fn overview_outside_git_repo_errors_clearly() {
         .unwrap()
         .as_nanos();
     let root = std::env::temp_dir().join(format!(
-        "hitagi-difftest-nogit-{}-{unique}",
+        "mimi-difftest-nogit-{}-{unique}",
         std::process::id()
     ));
     std::fs::create_dir_all(&root).unwrap();
 
-    let stderr = Command::cargo_bin("hitagi")
+    let stderr = Command::cargo_bin("mimi")
         .unwrap()
-        .env("HITAGI_CACHE_DIR", &root)
+        .env("MIMI_CACHE_DIR", &root)
         // GIT_CEILING_DIRECTORIES so git doesn't walk up out of the tempdir
         // and find some unrelated repo (the user's repo, in the worst case).
         .env("GIT_CEILING_DIRECTORIES", &root)
@@ -1159,7 +1159,7 @@ fn drilldown_spans_emitted_for_multi_symbol_hunk() {
 #[test]
 fn monorepo_subdir_filters_to_cwd_subtree_only() {
     // Build a monorepo with three sibling projects at the git toplevel, then
-    // point hitagi at one project's subdir. Changes outside that subdir must
+    // point mimi at one project's subdir. Changes outside that subdir must
     // NOT appear in the overview ~ they should be silently filtered with a
     // top-level `note` listing the count.
     let r = DiffRepo::new("monorepo");
@@ -1174,7 +1174,7 @@ fn monorepo_subdir_filters_to_cwd_subtree_only() {
     r.write("project-c/src/lib.rs", "pub fn c_v2() {}\n");
     r.write("shared/util.rs", "pub fn s_v2() {}\n");
 
-    // Invoke hitagi with --repo pointing at project-a/. The git toplevel is
+    // Invoke mimi with --repo pointing at project-a/. The git toplevel is
     // r.repo; project-a is a subdir.
     let v = run_in(&r.repo.join("project-a"), &r.cache_dir, &["diff"]);
     let paths: Vec<&str> = v["files"]
@@ -1251,9 +1251,9 @@ fn monorepo_subdir_drilldown_finds_path_via_repo_relative_form() {
 
     // Project-b's lib.rs is NOT addressable from project-a's cwd ~ it falls
     // outside the subtree and was filtered out of the candidate set.
-    let stderr = Command::cargo_bin("hitagi")
+    let stderr = Command::cargo_bin("mimi")
         .unwrap()
-        .env("HITAGI_CACHE_DIR", &r.cache_dir)
+        .env("MIMI_CACHE_DIR", &r.cache_dir)
         .arg("--repo")
         .arg(r.repo.join("project-a"))
         .args(["diff", "../project-b/src/lib.rs"])

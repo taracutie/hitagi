@@ -1,7 +1,7 @@
 //! Adapter over `RepoRoot::collect_search_files` ~ produces the file list
 //! that the index builder will chunk + tokenize + embed.
 //!
-//! Reuses hitagi's gitignore-aware walker (`repo.rs`), exclude-pattern
+//! Reuses mimi's gitignore-aware walker (`repo.rs`), exclude-pattern
 //! infrastructure (`commands::build_exclude_set`/`apply_excludes`), and
 //! language detection. Files whose extension we don't recognise still get
 //! included with `language = None`; the pack-only chunker will skip them.

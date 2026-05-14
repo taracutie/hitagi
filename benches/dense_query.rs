@@ -1,7 +1,7 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 use ndarray::{Array1, Array2};
 
-use hitagi::search::dense::DenseIndex;
+use mimi::search::dense::DenseIndex;
 
 fn deterministic_matrix(rows: usize, dim: usize) -> Array2<f32> {
     // Deterministic but cheap pseudo-random fill so two runs produce

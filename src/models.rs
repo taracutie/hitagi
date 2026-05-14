@@ -145,7 +145,7 @@ pub struct FindRelatedResponse {
     pub results: Vec<SearchHit>,
 }
 
-/// `hitagi index status` response. Reports what's persisted in the search
+/// `mimi index status` response. Reports what's persisted in the search
 /// portion of the SQLite cache without forcing a load.
 #[derive(Debug, Serialize)]
 pub struct IndexStatusResponse {
@@ -174,7 +174,7 @@ pub struct IndexStatusResponse {
     pub dense_size_bytes: Option<usize>,
 }
 
-/// `hitagi index build` response.
+/// `mimi index build` response.
 #[derive(Debug, Serialize)]
 pub struct IndexBuildResponse {
     pub mode: String,
@@ -186,7 +186,7 @@ pub struct IndexBuildResponse {
     pub warnings: Vec<String>,
 }
 
-/// `hitagi index clean` response.
+/// `mimi index clean` response.
 #[derive(Debug, Serialize)]
 pub struct IndexCleanResponse {
     /// True when at least one search row was deleted.
@@ -481,7 +481,7 @@ pub struct DiffOverviewResponse {
     /// consumer short-circuit a pre-commit review.
     #[serde(skip_serializing_if = "is_false")]
     pub clean: bool,
-    /// Hint emitted when the hitagi repo root is a subdir of a larger git
+    /// Hint emitted when the mimi repo root is a subdir of a larger git
     /// toplevel and changes outside it were silently filtered.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
@@ -493,7 +493,7 @@ pub struct DiffFileSummary {
     /// One of: "M", "A", "D", "R", "C", "T", "?" (untracked).
     pub status: String,
     /// Pre-rename path when `status == "R"` or `status == "C"` AND both
-    /// endpoints fall inside the hitagi repo subtree.
+    /// endpoints fall inside the mimi repo subtree.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub old_path: Option<String>,
     /// Text-rendering hint: true when `old_path` had the overview `prefix`

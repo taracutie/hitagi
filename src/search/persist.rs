@@ -408,7 +408,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let dir = std::env::temp_dir().join(format!(
-            "hitagi-dense-{name}-{}-{unique}",
+            "mimi-dense-{name}-{}-{unique}",
             std::process::id()
         ));
         fs::create_dir_all(&dir).unwrap();
@@ -417,7 +417,7 @@ mod tests {
 
     #[test]
     fn dense_tmp_paths_are_unique_for_same_target() {
-        let target = std::env::temp_dir().join("hitagi-cache/dense.v13.bin");
+        let target = std::env::temp_dir().join("mimi-cache/dense.v13.bin");
         let paths: HashSet<PathBuf> = (0..32).map(|_| dense_tmp_path(&target)).collect();
         assert_eq!(paths.len(), 32);
         assert!(paths.iter().all(|path| path.parent() == target.parent()));

@@ -214,7 +214,7 @@ fn enclosing_symbol<'a>(parsed: &'a ParsedFile, byte_offset: usize) -> Option<&'
 
 /// Symbols whose line range intersects `[lo, hi]` (1-indexed, inclusive on both ends).
 ///
-/// Used by `hitagi diff` to attach the enclosing symbol to each hunk. The
+/// Used by `mimi diff` to attach the enclosing symbol to each hunk. The
 /// `primary` is the innermost symbol that fully contains the target range; if
 /// no symbol contains it (e.g. a hunk straddles two top-level functions),
 /// fall back to the smallest range that merely overlaps. `overlapping` is the

@@ -4,14 +4,14 @@
 //!
 //! We can't populate via the public API without a real `Metadata` and
 //! `Language` value, and `open_at` is `#[cfg(test)]`. Instead this bench
-//! redirects `HITAGI_CACHE_DIR` to a tempdir and times the cold open
+//! redirects `MIMI_CACHE_DIR` to a tempdir and times the cold open
 //! itself, which is the dominant fixed cost on every CLI invocation.
 
 use std::path::PathBuf;
 
 use criterion::{criterion_group, criterion_main, Criterion};
 
-use hitagi::cache::ParseCache;
+use mimi::cache::ParseCache;
 
 fn fixture_repo() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -22,7 +22,7 @@ fn fixture_repo() -> PathBuf {
 
 fn fresh_cache_dir() -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
-        "hitagi-bench-cache-{}-{}",
+        "mimi-bench-cache-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -37,7 +37,7 @@ fn bench_cache_load(c: &mut Criterion) {
     let cache_dir = fresh_cache_dir();
     // SAFETY: bench runs single-threaded against this env var.
     unsafe {
-        std::env::set_var("HITAGI_CACHE_DIR", &cache_dir);
+        std::env::set_var("MIMI_CACHE_DIR", &cache_dir);
     }
     let repo = fixture_repo();
 

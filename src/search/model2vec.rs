@@ -54,7 +54,7 @@ impl ModelOptions {
         Self {
             model: model
                 .map(str::to_owned)
-                .or_else(|| std::env::var("HITAGI_MODEL").ok())
+                .or_else(|| std::env::var("MIMI_MODEL").ok())
                 .unwrap_or_else(|| DEFAULT_MODEL_NAME.to_owned()),
             policy,
         }
@@ -82,7 +82,7 @@ impl ModelStatus {
 pub fn model_status(model: Option<&str>) -> ModelStatus {
     let model = model
         .map(str::to_owned)
-        .or_else(|| std::env::var("HITAGI_MODEL").ok())
+        .or_else(|| std::env::var("MIMI_MODEL").ok())
         .unwrap_or_else(|| DEFAULT_MODEL_NAME.to_owned());
     let path = Path::new(&model);
     if path.exists() {

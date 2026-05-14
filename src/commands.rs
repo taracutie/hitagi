@@ -741,11 +741,11 @@ fn load_encoder_files(req: &EncoderRequest) -> AppResult<EncoderLoad> {
     ) && !model_status.available()
     {
         eprintln!(
-            "hitagi: index: downloading embedding model {} (first run may take a while)",
+            "mimi: index: downloading embedding model {} (first run may take a while)",
             options.model
         );
     } else {
-        eprintln!("hitagi: index: loading embedding model {}", options.model);
+        eprintln!("mimi: index: loading embedding model {}", options.model);
     }
     match search::model2vec::load_model(&options) {
         Ok(encoder) => {
@@ -859,11 +859,11 @@ fn load_encoder_with_policy(
         && !model_status.available()
     {
         eprintln!(
-            "hitagi: index: downloading embedding model {} (first run may take a while)",
+            "mimi: index: downloading embedding model {} (first run may take a while)",
             options.model
         );
     } else {
-        eprintln!("hitagi: index: loading embedding model {}", options.model);
+        eprintln!("mimi: index: loading embedding model {}", options.model);
     }
 
     match search::model2vec::load_model(&options) {
@@ -2133,7 +2133,7 @@ pub fn diff_overview(repo: &RepoRoot, opts: DiffOptions) -> AppResult<DiffOvervi
     };
     let note = if filtered_count > 0 {
         Some(format!(
-            "{} file(s) outside `{}/` filtered (hitagi repo root is a subdir of the git toplevel)",
+            "{} file(s) outside `{}/` filtered (mimi repo root is a subdir of the git toplevel)",
             filtered_count, &git_root.repo_subdir
         ))
     } else {
@@ -2680,7 +2680,7 @@ fn resolve_diff_summary_filter(
 
     match suffix_matches.len() {
         0 => Err(AppError::not_found(format!(
-            "path not found in diff: {path} (run `hitagi diff --paths` to list changed files)"
+            "path not found in diff: {path} (run `mimi diff --paths` to list changed files)"
         ))),
         1 => Ok(DiffSummaryFilter {
             path: suffix_matches[0].path.clone(),
@@ -2765,7 +2765,7 @@ fn diff_untracked_file(
             raw: None,
             hunks: None,
             note: Some(format!(
-                "untracked file exceeded size limit ({} bytes); use `hitagi read --lines` to inspect slices",
+                "untracked file exceeded size limit ({} bytes); use `mimi read --lines` to inspect slices",
                 bytes.len()
             )),
             binary: false,
@@ -2936,7 +2936,7 @@ fn collect_diff_candidates(
                 }
                 (None, Some(repo_relative), true) => {
                     // Cross-subtree rename departing ~ surface the old side as D
-                    // so `hitagi diff <old-path>` resolves and drills the deletion.
+                    // so `mimi diff <old-path>` resolves and drills the deletion.
                     let toplevel_relative = e.old_path.expect("rename has old_path");
                     candidates.push(DiffCandidate {
                         repo_relative,
@@ -2983,7 +2983,7 @@ fn resolve_diff_path<'a>(
 
     match suffix_matches.len() {
         0 => Err(AppError::not_found(format!(
-            "path not found in diff: {original} (run `hitagi diff` to list changed files)"
+            "path not found in diff: {original} (run `mimi diff` to list changed files)"
         ))),
         1 => Ok(suffix_matches[0]),
         _ => {
@@ -3920,7 +3920,7 @@ mod tests {
                 .unwrap()
                 .as_nanos();
             let root =
-                std::env::temp_dir().join(format!("hitagi-{name}-{}-{unique}", std::process::id()));
+                std::env::temp_dir().join(format!("mimi-{name}-{}-{unique}", std::process::id()));
             fs::create_dir_all(&root).unwrap();
             Self { root }
         }

@@ -168,7 +168,7 @@ pub fn ensure_sparse(repo: &RepoRoot, cache: &mut ParseCache) -> AppResult<Spars
 }
 
 /// Force a rebuild regardless of the persisted state. Used by
-/// `hitagi index build`.
+/// `mimi index build`.
 pub fn rebuild_sparse(repo: &RepoRoot, cache: &mut ParseCache) -> AppResult<SparsePayload> {
     progress("index: walking repository");
     let walked = walk_for_index(repo, &WalkOptions::default(), None)?;
@@ -524,7 +524,7 @@ pub fn ensure_dense_with_hint(
     )
 }
 
-/// Force a dense rebuild. Used by `hitagi index build --mode hybrid`.
+/// Force a dense rebuild. Used by `mimi index build --mode hybrid`.
 pub fn rebuild_dense(
     cache: &mut ParseCache,
     sparse: &SparsePayload,
@@ -651,5 +651,5 @@ pub fn _suppress_unused() {
 }
 
 fn progress(message: impl AsRef<str>) {
-    eprintln!("hitagi: {}", message.as_ref());
+    eprintln!("mimi: {}", message.as_ref());
 }

@@ -196,7 +196,7 @@ impl RepoRoot {
 
     /// Validate `relative_path` for traversal/escape and return a normalized
     /// repo-relative form. Unlike `resolve_file`, this does NOT require the
-    /// file to exist on disk ~ used by `hitagi diff` so deleted files (and
+    /// file to exist on disk ~ used by `mimi diff` so deleted files (and
     /// rename old paths) can still be addressed.
     pub fn validate_diff_path(&self, relative_path: &str) -> AppResult<String> {
         validate_requested_path(relative_path)?;
@@ -263,6 +263,7 @@ impl RepoRoot {
             builder
                 .hidden(true)
                 .git_ignore(true)
+                .require_git(false)
                 .git_global(false)
                 .git_exclude(true)
                 .follow_links(false);
@@ -359,6 +360,7 @@ impl RepoRoot {
             builder
                 .hidden(true)
                 .git_ignore(true)
+                .require_git(false)
                 .git_global(false)
                 .git_exclude(true)
                 .follow_links(false);
@@ -442,6 +444,7 @@ fn walk_visible_files(repo_root: &Path) -> Vec<String> {
     let walker = WalkBuilder::new(repo_root)
         .hidden(true)
         .git_ignore(true)
+        .require_git(false)
         .git_global(false)
         .git_exclude(true)
         .follow_links(false)
@@ -728,7 +731,7 @@ mod tests {
         // node_modules mirrors polluting the candidate list); new behavior
         // prefers the visible match and resolves uniquely.
         let root = std::env::temp_dir().join(format!(
-            "hitagi-suffix-prefers-visible-{}",
+            "mimi-suffix-prefers-visible-{}",
             std::process::id()
         ));
         if root.exists() {
@@ -753,7 +756,7 @@ mod tests {
         // agents can address files that are gitignored on purpose (build
         // outputs, fixtures inside an ignored vendor dir, etc.).
         let root =
-            std::env::temp_dir().join(format!("hitagi-suffix-falls-back-{}", std::process::id()));
+            std::env::temp_dir().join(format!("mimi-suffix-falls-back-{}", std::process::id()));
         if root.exists() {
             std::fs::remove_dir_all(&root).unwrap();
         }
@@ -773,7 +776,7 @@ mod tests {
         // Two visible matches ~ ambiguity is still real; both surface in the
         // error. (The fallback path doesn't hide real ambiguity.)
         let root = std::env::temp_dir().join(format!(
-            "hitagi-suffix-visible-ambiguity-{}",
+            "mimi-suffix-visible-ambiguity-{}",
             std::process::id()
         ));
         if root.exists() {
@@ -797,7 +800,7 @@ mod tests {
     #[test]
     fn reports_truncated_ambiguous_suffix_matches_as_sampled() {
         let root =
-            std::env::temp_dir().join(format!("hitagi-ambiguous-paths-{}", std::process::id()));
+            std::env::temp_dir().join(format!("mimi-ambiguous-paths-{}", std::process::id()));
         if root.exists() {
             std::fs::remove_dir_all(&root).unwrap();
         }

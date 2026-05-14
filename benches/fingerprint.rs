@@ -9,13 +9,13 @@ use std::path::PathBuf;
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
-use hitagi::search::model2vec::{
+use mimi::search::model2vec::{
     model_files_meta, model_fingerprint, ModelLoadPolicy, ModelOptions,
 };
 
 fn build_model_dir() -> (PathBuf, ModelOptions) {
     let dir = std::env::temp_dir().join(format!(
-        "hitagi-bench-model-{}-{}",
+        "mimi-bench-model-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

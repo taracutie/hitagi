@@ -12,7 +12,7 @@ unsafe extern "C" {
 }
 
 fn main() -> ! {
-    let code = match hitagi::cli::run() {
+    let code = match mimi::cli::run() {
         Ok(()) => 0,
         Err(err) => {
             eprintln!("error: {err}");

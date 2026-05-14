@@ -672,7 +672,7 @@ impl ParseCache {
     }
 
     /// Drop just the search-index rows (sparse + dense). Parse cache rows in
-    /// `files` are left intact. Used by `hitagi index clean`.
+    /// `files` are left intact. Used by `mimi index clean`.
     pub fn clear_search_index(&mut self) -> std::io::Result<bool> {
         if !self.enabled {
             return Ok(false);
@@ -874,7 +874,7 @@ impl ParseCache {
         Ok(CacheClearOutcome { path: dir, existed })
     }
 
-    /// Remove the entire hitagi cache root (all repos). Returns the path and
+    /// Remove the entire mimi cache root (all repos). Returns the path and
     /// the count of repo subdirs that were present before deletion.
     pub fn clear_all() -> std::io::Result<CacheClearAllOutcome> {
         let root = match cache_root() {
@@ -1092,7 +1092,7 @@ pub struct SearchDenseMetadataRow {
 }
 
 /// Read-only inspection of the search-index portion of the cache. Used by
-/// `hitagi index status` to report what's persisted without forcing a load.
+/// `mimi index status` to report what's persisted without forcing a load.
 #[derive(Debug, Clone, Default)]
 pub struct SearchIndexInspection {
     pub sparse_present: bool,
@@ -1117,7 +1117,7 @@ pub struct SearchIndexInspection {
 }
 
 fn env_disabled() -> bool {
-    matches!(std::env::var_os("HITAGI_NO_CACHE"), Some(value) if !value.is_empty() && value != "0")
+    matches!(std::env::var_os("MIMI_NO_CACHE"), Some(value) if !value.is_empty() && value != "0")
 }
 
 fn valid_cache_root(value: OsString) -> Option<PathBuf> {
@@ -1130,14 +1130,14 @@ fn valid_cache_root(value: OsString) -> Option<PathBuf> {
 }
 
 pub(crate) fn cache_root() -> Option<PathBuf> {
-    if let Some(custom) = std::env::var_os("HITAGI_CACHE_DIR") {
+    if let Some(custom) = std::env::var_os("MIMI_CACHE_DIR") {
         return valid_cache_root(custom);
     }
     if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME").and_then(valid_cache_root) {
-        return Some(xdg.join("hitagi"));
+        return Some(xdg.join("mimi"));
     }
     let home = std::env::var_os("HOME").and_then(valid_cache_root)?;
-    Some(home.join(".cache").join("hitagi"))
+    Some(home.join(".cache").join("mimi"))
 }
 
 fn resolve_cache_dir(repo_root: &str) -> Option<PathBuf> {
@@ -1586,7 +1586,7 @@ mod tests {
 
     impl CacheTmp {
         // Each test gets a unique tempdir based on pid+nanos. Tests do NOT touch
-        // shared env vars (HITAGI_CACHE_DIR, HITAGI_NO_CACHE) ~ they call
+        // shared env vars (MIMI_CACHE_DIR, MIMI_NO_CACHE) ~ they call
         // ParseCache::open_at directly so the cache module's env handling can
         // be exercised separately without races.
         fn new(name: &str) -> Self {
@@ -1595,7 +1595,7 @@ mod tests {
                 .unwrap()
                 .as_nanos();
             let dir = std::env::temp_dir().join(format!(
-                "hitagi-cachetest-{name}-{}-{unique}",
+                "mimi-cachetest-{name}-{}-{unique}",
                 std::process::id()
             ));
             let repo_root = dir.join("repo");
@@ -2224,8 +2224,8 @@ mod tests {
     #[test]
     fn siphash_is_stable() {
         // Regression: changing the hash function silently invalidates every user's cache dir.
-        let h1 = siphash13(b"/home/tara/Lab/urgf.online/hitagi", 0, 0);
-        let h2 = siphash13(b"/home/tara/Lab/urgf.online/hitagi", 0, 0);
+        let h1 = siphash13(b"/home/tara/Lab/urgf.online/mimi", 0, 0);
+        let h2 = siphash13(b"/home/tara/Lab/urgf.online/mimi", 0, 0);
         assert_eq!(h1, h2);
         assert_ne!(h1, siphash13(b"/home/tara/Lab/urgf.online/cassia", 0, 0));
     }

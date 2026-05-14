@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use assert_cmd::Command;
-use hitagi::{commands as app_commands, repo::RepoRoot};
+use mimi::{commands as app_commands, repo::RepoRoot};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -19,7 +19,7 @@ fn shared_cache_dir() -> &'static Path {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     DIR.get_or_init(|| {
         let dir =
-            std::env::temp_dir().join(format!("hitagi-framework-itest-{}", std::process::id()));
+            std::env::temp_dir().join(format!("mimi-framework-itest-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     })
@@ -71,9 +71,9 @@ fn to_value<T: Serialize>(value: T) -> Value {
 
 fn run_text(repo: &Path, args: &[&str]) -> String {
     prewarm();
-    let stdout = Command::cargo_bin("hitagi")
+    let stdout = Command::cargo_bin("mimi")
         .unwrap()
-        .env("HITAGI_CACHE_DIR", shared_cache_dir())
+        .env("MIMI_CACHE_DIR", shared_cache_dir())
         .arg("--repo")
         .arg(repo)
         .args(args)
@@ -87,9 +87,9 @@ fn run_text(repo: &Path, args: &[&str]) -> String {
 
 fn run_failure(repo: &Path, args: &[&str]) -> String {
     prewarm();
-    let assert = Command::cargo_bin("hitagi")
+    let assert = Command::cargo_bin("mimi")
         .unwrap()
-        .env("HITAGI_CACHE_DIR", shared_cache_dir())
+        .env("MIMI_CACHE_DIR", shared_cache_dir())
         .arg("--repo")
         .arg(repo)
         .args(args)
@@ -143,7 +143,7 @@ fn next_info_detects_pages_router() {
 
 #[test]
 fn next_info_errors_when_not_a_next_project() {
-    // hitagi's own repo has no `next` dep ~ so we use it as the negative case.
+    // mimi's own repo has no `next` dep ~ so we use it as the negative case.
     let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let stderr = run_failure(&repo, &["framework", "next", "info"]);
     assert!(
@@ -405,7 +405,7 @@ fn next_info_root_flag_scopes_to_subdirectory() {
     // has no package.json. `framework next info` at the root must fail; with
     // --root apps/web it must succeed and still emit repo-relative file paths.
     let scratch =
-        std::env::temp_dir().join(format!("hitagi-framework-monorepo-{}", std::process::id()));
+        std::env::temp_dir().join(format!("mimi-framework-monorepo-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&scratch);
     let app_dir = scratch.join("apps").join("web").join("app");
     std::fs::create_dir_all(&app_dir).unwrap();
@@ -499,7 +499,7 @@ fn next_info_root_flag_scopes_to_subdirectory() {
 fn next_info_detects_src_layout() {
     // Scratch project using src/app/ instead of app/ at the root.
     let scratch = std::env::temp_dir().join(format!(
-        "hitagi-framework-src-layout-{}",
+        "mimi-framework-src-layout-{}",
         std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&scratch);

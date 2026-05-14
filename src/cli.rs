@@ -23,7 +23,7 @@ const DEFAULT_FILES_LIMIT: usize = 2000;
 const DEFAULT_LOC_LIMIT: usize = 50;
 
 const LONG_ABOUT: &str = "\
-hitagi is a local CLI for tree-sitter-backed structural code queries, built for LLM \
+mimi is a local CLI for tree-sitter-backed structural code queries, built for LLM \
 coding agents (Claude Code, Codex, etc.) to navigate a codebase token-efficiently. \
 Every command parses on demand, prints concise text to stdout, and exits ~ no daemon, \
 no auth. The default `search` mode also runs a small embedding model locally for \
@@ -92,7 +92,7 @@ TIPS
 
   Embedding model
     First run downloads the default Model2Vec model (~30 MB) under
-    $HF_HOME (or $XDG_CACHE_HOME/hitagi/models if HF_HOME is unset). Subsequent
+    $HF_HOME (or $XDG_CACHE_HOME/mimi/models if HF_HOME is unset). Subsequent
     runs hit the local copy. Pass `--offline` to forbid network entirely and
     fall back to a deterministic hashing encoder (lower quality, no download).
     `--no-download` blocks downloads but allows a cached model. `--model PATH`
@@ -186,11 +186,11 @@ TIPS
 
   Parse cache
     find / outline / symbol persist parsed symbols at
-    $HITAGI_CACHE_DIR / $XDG_CACHE_HOME/hitagi / $HOME/.cache/hitagi, keyed by
+    $MIMI_CACHE_DIR / $XDG_CACHE_HOME/mimi / $HOME/.cache/mimi, keyed by
     (path, mtime, size, language). Warm runs skip the parse step entirely.
-    Set HITAGI_NO_CACHE=1 to bypass for one invocation. Use `hitagi cache
-    status` to inspect, `hitagi cache clear` to drop the current repo's cache,
-    `hitagi cache clear --all` to nuke all of them.
+    Set MIMI_NO_CACHE=1 to bypass for one invocation. Use `mimi cache
+    status` to inspect, `mimi cache clear` to drop the current repo's cache,
+    `mimi cache clear --all` to nuke all of them.
 
   Search index
     `search` and `find-related` persist their BM25 postings + chunk vector +
@@ -198,14 +198,14 @@ TIPS
     parse cache. Cold rebuild on first call (~hundreds of ms for 1000 files;
     longer if the model has to download); warm runs are ~100 ms. The sparse
     and dense rows have independent fingerprints ~ a model swap rebuilds dense
-    only; a single file change rebuilds both. Use `hitagi index status` to
-    inspect, `hitagi index clean` to drop just the search rows (parse cache
-    untouched), `hitagi index build [--mode hybrid]` to force a rebuild.
+    only; a single file change rebuilds both. Use `mimi index status` to
+    inspect, `mimi index clean` to drop just the search rows (parse cache
+    untouched), `mimi index build [--mode hybrid]` to force a rebuild.
 
   Framework-aware queries (`framework`)
     `framework` exposes framework-specific navigation that is cheaper than a
     repo-wide search when you know the stack. Next.js support is under
-    `hitagi framework next`: `info` detects Next.js, version, router type, and
+    `mimi framework next`: `info` detects Next.js, version, router type, and
     src/ layout; pass `--root apps/web` to scope detection inside a monorepo.
     `list-routes` reports app-router and pages-router pages/API routes with
     route kind, router, file, and HTTP methods for API handlers. It drops route
@@ -234,7 +234,7 @@ TIPS
     annotations still appear.
 
   Monorepo / repo-subdir scoping
-    `diff` only ever surfaces changes inside the hitagi `--repo` subtree. When
+    `diff` only ever surfaces changes inside the mimi `--repo` subtree. When
     `--repo` is itself a subdir of a larger git toplevel (e.g. monorepo with
     sibling projects), changes outside that subtree are silently filtered, and
     a top-level `note` reports the count. Cross-subtree renames are surfaced
@@ -243,63 +243,63 @@ TIPS
     sees a synthesized `D` (deleted) entry with a `note` naming the
     toplevel-relative destination. Both halves are drillable. PATH resolution
     in drilldown matches against the diff's own file list (not a filesystem
-    walk), so suffix shorthand works (`hitagi diff Button.tsx`) and deleted
+    walk), so suffix shorthand works (`mimi diff Button.tsx`) and deleted
     files resolve fine.
 
 COMMON PATTERNS
 
-  What languages are here?        hitagi langs
-  Where is symbol X?              hitagi find X --snippet
-  What's in this file?            hitagi outline FILE
-  Just top-level shapes?          hitagi outline FILE --kind function,struct,enum
-  Read this function/struct       hitagi symbol FILE Qualname.Or.Leaf
-  Conceptual / NLQ search?        hitagi search \"how does request validation work\"
-  Exact-symbol lookup (fast)      hitagi search Foo.bar --mode bm25
-  Search a single subtree         hitagi search \"queue worker\" packages/jobs
-  Filter to one language          hitagi search \"router\" --language rust
-  Sweep without vendor noise      hitagi search \"config\" --exclude vendor --exclude target
-  Find related code to a chunk    hitagi find-related src/auth.ts 47
-  Index status / lifecycle        hitagi index status / hitagi index clean / hitagi index build
-  Offline (no model download)     hitagi search foo --offline
-  Read a slice of a big file      hitagi read FILE --lines 1400-1510
-  Read structure without content  hitagi read FILE --summary
-  List all Rust + TOML files      hitagi files \"**/*.rs\" \"**/*.toml\"
-  Find Auth-related classes       hitagi find Auth --kind class,struct --snippet
-  Find inside one subtree         hitagi find Network --kind struct src/nnue
-  Find long methods               hitagi loc symbols --min-lines 80 --snippet
-  Find large Rust files            hitagi loc files \"**/*.rs\" --min-lines 300
-  Cheap top-level orientation     hitagi outline FILE --depth 1
-  Cheap sweep across the repo     hitagi find X --terse --limit 200
-  Diverse sweep (cap hot files)   hitagi find X --terse --per-file 3
-  Detect a Next.js app            hitagi framework next info
-  Next.js app in a monorepo       hitagi framework next info --root apps/web
-  List Next.js routes             hitagi framework next list-routes
-  List Next.js layouts/errors     hitagi framework next list-layouts
-  Find Next.js server actions     hitagi framework next list-server-actions
-  What's uncommitted?             hitagi diff
-  Changed paths only              hitagi diff --paths
-  Hunks for one file?             hitagi diff src/foo.rs
-  Hunks for several files?        hitagi diff src/foo.rs src/bar.rs
-  Directory diff summary          hitagi diff src tests
-  Diff for one symbol?            hitagi diff src/foo.rs --symbol Foo.bar
-  Commit-oriented summary?        hitagi diff --summary --symbols
-  Commit-review preset?           hitagi diff --commit
-  Ranges without hunk bodies?      hitagi diff src/foo.rs --body none --snippet
-  Just staged changes             hitagi diff --staged
-  Just untracked changes          hitagi diff --untracked
-  Compare against main            hitagi diff --against main
+  What languages are here?        mimi langs
+  Where is symbol X?              mimi find X --snippet
+  What's in this file?            mimi outline FILE
+  Just top-level shapes?          mimi outline FILE --kind function,struct,enum
+  Read this function/struct       mimi symbol FILE Qualname.Or.Leaf
+  Conceptual / NLQ search?        mimi search \"how does request validation work\"
+  Exact-symbol lookup (fast)      mimi search Foo.bar --mode bm25
+  Search a single subtree         mimi search \"queue worker\" packages/jobs
+  Filter to one language          mimi search \"router\" --language rust
+  Sweep without vendor noise      mimi search \"config\" --exclude vendor --exclude target
+  Find related code to a chunk    mimi find-related src/auth.ts 47
+  Index status / lifecycle        mimi index status / mimi index clean / mimi index build
+  Offline (no model download)     mimi search foo --offline
+  Read a slice of a big file      mimi read FILE --lines 1400-1510
+  Read structure without content  mimi read FILE --summary
+  List all Rust + TOML files      mimi files \"**/*.rs\" \"**/*.toml\"
+  Find Auth-related classes       mimi find Auth --kind class,struct --snippet
+  Find inside one subtree         mimi find Network --kind struct src/nnue
+  Find long methods               mimi loc symbols --min-lines 80 --snippet
+  Find large Rust files            mimi loc files \"**/*.rs\" --min-lines 300
+  Cheap top-level orientation     mimi outline FILE --depth 1
+  Cheap sweep across the repo     mimi find X --terse --limit 200
+  Diverse sweep (cap hot files)   mimi find X --terse --per-file 3
+  Detect a Next.js app            mimi framework next info
+  Next.js app in a monorepo       mimi framework next info --root apps/web
+  List Next.js routes             mimi framework next list-routes
+  List Next.js layouts/errors     mimi framework next list-layouts
+  Find Next.js server actions     mimi framework next list-server-actions
+  What's uncommitted?             mimi diff
+  Changed paths only              mimi diff --paths
+  Hunks for one file?             mimi diff src/foo.rs
+  Hunks for several files?        mimi diff src/foo.rs src/bar.rs
+  Directory diff summary          mimi diff src tests
+  Diff for one symbol?            mimi diff src/foo.rs --symbol Foo.bar
+  Commit-oriented summary?        mimi diff --summary --symbols
+  Commit-review preset?           mimi diff --commit
+  Ranges without hunk bodies?      mimi diff src/foo.rs --body none --snippet
+  Just staged changes             mimi diff --staged
+  Just untracked changes          mimi diff --untracked
+  Compare against main            mimi diff --against main
 
 ANTI-PATTERNS (token waste)
 
-  hitagi read big_file.rs                  # ~5K-line files cost a lot of tokens.
+  mimi read big_file.rs                  # ~5K-line files cost a lot of tokens.
                                            # Use `read --summary`, `outline` then
                                            # `symbol`, or `read --lines S-E`.
-  hitagi search \"the\"                      # rank quality drops for stopword-only
+  mimi search \"the\"                      # rank quality drops for stopword-only
                                            # queries; pass at least one content
                                            # token, or scope with [PATHS].
-  hitagi outline huge_file.rs              # add --kind to filter, or just `find`
+  mimi outline huge_file.rs              # add --kind to filter, or just `find`
                                            # the specific symbol you wanted.
-  hitagi outline FILE --bytes              # don't pass --bytes unless you actually
+  mimi outline FILE --bytes              # don't pass --bytes unless you actually
                                            # need byte offsets ~ they ~double the
                                            # output size.
 
@@ -316,7 +316,7 @@ ERRORS
 
 #[derive(Parser)]
 #[command(
-    name = "hitagi",
+    name = "mimi",
     version,
     about = "Local CLI for tree-sitter-backed structural code queries.",
     long_about = LONG_ABOUT,
@@ -487,7 +487,7 @@ enum Commands {
     },
     /// List files in the repo (gitignore-aware), optionally filtered by globs.
     ///
-    /// Multiple positional GLOBS are OR'd together: `hitagi files "**/*.rs" "**/*.toml"`.
+    /// Multiple positional GLOBS are OR'd together: `mimi files "**/*.rs" "**/*.toml"`.
     Files {
         /// Glob patterns. Multiple are OR'd. If omitted, lists everything.
         globs: Vec<String>,
@@ -514,15 +514,15 @@ enum Commands {
     Langs,
     /// Inspect or manage the on-disk parse cache.
     ///
-    /// The cache lives at $HITAGI_CACHE_DIR / $XDG_CACHE_HOME/hitagi /
-    /// $HOME/.cache/hitagi (in that resolution order), keyed by canonical repo
-    /// root. With no subcommand, prints `status`. Set HITAGI_NO_CACHE=1 in the
+    /// The cache lives at $MIMI_CACHE_DIR / $XDG_CACHE_HOME/mimi /
+    /// $HOME/.cache/mimi (in that resolution order), keyed by canonical repo
+    /// root. With no subcommand, prints `status`. Set MIMI_NO_CACHE=1 in the
     /// environment to bypass the cache for any command.
     Cache {
         #[command(subcommand)]
         action: Option<CacheAction>,
     },
-    /// Install the global hitagi prompt for an agent.
+    /// Install the global mimi prompt for an agent.
     ///
     /// Writes a small managed block to the agent's user-global instruction file:
     /// `~/.claude/CLAUDE.md` for Claude, `$CODEX_HOME/AGENTS.md` or
@@ -533,9 +533,9 @@ enum Commands {
         #[arg(value_enum)]
         agent: AgentKind,
     },
-    /// Remove the global hitagi prompt for an agent.
+    /// Remove the global mimi prompt for an agent.
     ///
-    /// Removes only hitagi's managed block, preserving surrounding user content.
+    /// Removes only mimi's managed block, preserving surrounding user content.
     /// Codex uninstall checks both `AGENTS.md` and `AGENTS.override.md`.
     Uninstall {
         /// Agent to configure.
@@ -787,7 +787,7 @@ enum IndexAction {
         model: Option<String>,
     },
     /// Drop the search-index portion of the SQLite cache. The parse cache
-    /// (used by outline/symbol/find) is left intact. Use `hitagi cache
+    /// (used by outline/symbol/find) is left intact. Use `mimi cache
     /// clear` to wipe both.
     Clean,
 }
@@ -819,7 +819,7 @@ enum CacheAction {
     /// Print just the resolved cache directory path for this repo.
     Path,
     /// Delete the cache for the current repo. Pass `--all` to delete the
-    /// entire hitagi cache root (every repo). Cache contents are fully
+    /// entire mimi cache root (every repo). Cache contents are fully
     /// regenerable ~ next find/search/outline rebuilds them.
     Clear {
         /// Delete every repo's cache, not just this one's.

@@ -1,6 +1,6 @@
-//! Bootstrap `HF_HOME` so hf-hub downloads land under hitagi's own cache
+//! Bootstrap `HF_HOME` so hf-hub downloads land under mimi's own cache
 //! root instead of `~/.cache/huggingface`. Keeps everything we manage under
-//! one dir; users can `hitagi cache clear --all` and actually wipe the
+//! one dir; users can `mimi cache clear --all` and actually wipe the
 //! model files too.
 
 use std::path::PathBuf;
@@ -10,7 +10,7 @@ use crate::cache::cache_root;
 
 static HF_HOME_INIT: Once = Once::new();
 
-/// Set `HF_HOME=$XDG_CACHE_HOME/hitagi/models/` if the user hasn't already
+/// Set `HF_HOME=$XDG_CACHE_HOME/mimi/models/` if the user hasn't already
 /// set it. Called from any command that may load an embedding model.
 ///
 /// Safety: env mutation is racy with concurrent reads from other threads.
@@ -21,7 +21,7 @@ pub fn ensure_hf_home() {
         if std::env::var_os("HF_HOME").is_some() {
             return;
         }
-        let Some(root) = hitagi_models_dir() else {
+        let Some(root) = mimi_models_dir() else {
             return;
         };
         // SAFETY: `Once` guarantees this is the only writer in this process,
@@ -32,6 +32,6 @@ pub fn ensure_hf_home() {
     });
 }
 
-pub fn hitagi_models_dir() -> Option<PathBuf> {
+pub fn mimi_models_dir() -> Option<PathBuf> {
     cache_root().map(|root| root.join("models"))
 }
